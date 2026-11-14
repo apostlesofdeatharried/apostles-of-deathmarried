@@ -1,0 +1,172 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --font-heading: 'Cormorant Garamond', Garamond, serif;
+    --font-title: 'Cormorant Garamond', Garamond, serif;
+    --font-display: 'Cormorant Garamond', Garamond, serif;
+    --font-editorial: 'Cormorant Garamond', Garamond, serif;
+    --font-body: 'Manrope', system-ui, -apple-system, sans-serif;
+    --font-sans: 'Manrope', system-ui, -apple-system, sans-serif;
+    --font-meta: 'Manrope', system-ui, -apple-system, sans-serif;
+    --color-bg-base: #08080a;
+    --color-bg-surface: #100f13;
+    --color-bg-card: #141318;
+    --color-border-subtle: rgba(255, 255, 255, 0.07);
+    --color-border-aged: rgba(140, 130, 118, 0.2);
+    --color-wine-muted: #5e1823;
+    --color-wine-deep: #420f18;
+    --color-silver-tarnished: #8c857b;
+    --color-silver-light: #b8b1a5;
+    --color-ivory: #f0ede6;
+    --color-bone: #ded8ce;
+    --color-ash: #9c968d;
+    font-family: 'Manrope', system-ui, -apple-system, sans-serif;
+  }
+
+  html,
+  body {
+    background-color: var(--color-bg-base);
+    color: var(--color-bone);
+    font-family: 'Manrope', system-ui, -apple-system, sans-serif;
+    overflow-x: hidden;
+  }
+
+  /* 1. Headings, Master brand title, release names, card titles, thread titles: Cormorant Garamond */
+  h1, h2, h3, h4, h5, h6,
+  .font-title,
+  .font-heading,
+  .font-display,
+  .font-editorial,
+  .font-serif {
+    font-family: 'Cormorant Garamond', Garamond, serif !important;
+  }
+
+  /* 2. Small descriptions, metadata, technical badges, dates, durations, player timestamps, inputs, buttons, settings, admin controls: Manrope */
+  p, span, div, a, button, input, textarea, select, label, table, td, th,
+  .font-body,
+  .font-sans,
+  .font-monostamp,
+  .font-mono,
+  .font-meta,
+  .font-ui {
+    font-family: 'Manrope', system-ui, -apple-system, sans-serif;
+  }
+
+  /* Re-assert Cormorant Garamond for specific title / heading classes when used on inline or container tags */
+  h1, h2, h3, h4, h5, h6,
+  .font-title,
+  .font-heading,
+  .font-display,
+  .font-editorial {
+    font-family: 'Cormorant Garamond', Garamond, serif !important;
+  }
+
+  .font-display {
+    letter-spacing: 0.12em;
+  }
+}
+
+/* Analog subtle film grain & archive vignette */
+.analog-vignette {
+  background: radial-gradient(circle at 50% 40%, rgba(13, 12, 16, 0.2) 0%, rgba(5, 5, 7, 0.85) 100%);
+}
+
+.archive-glow-subtle {
+  text-shadow: 0 0 20px rgba(184, 177, 165, 0.15);
+}
+
+.wine-subtle-glow {
+  text-shadow: 0 0 24px rgba(94, 24, 35, 0.25);
+}
+
+/* Subtle archival borders */
+.border-archival {
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.border-archival-hover:hover {
+  border-color: rgba(140, 130, 118, 0.35);
+}
+
+/* Sleek dark scrollbar */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+::-webkit-scrollbar-track {
+  background: #08080a;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #1c1a21;
+  border-radius: 2px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #383440;
+}
+
+@keyframes film-flicker {
+  0%, 100% { opacity: 0.98; }
+  50% { opacity: 1; }
+}
+
+.animate-film-flicker {
+  animation: film-flicker 5s ease-in-out infinite;
+}
+
+/* Hide scrollbar for clean horizontal tab lists while preserving touch scroll */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* Gothic Tulle & Lace Mesh Weave */
+.gothic-tulle-mesh {
+  background-image: 
+    radial-gradient(circle at 50% 50%, rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+    linear-gradient(0deg, rgba(255, 255, 255, 0.015) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.015) 1px, transparent 1px);
+  background-size: 16px 16px, 8px 8px, 8px 8px;
+}
+
+/* Translucent Fabric Drapery Fold Shadows */
+.gothic-fabric-folds {
+  background: 
+    repeating-linear-gradient(
+      115deg,
+      rgba(0, 0, 0, 0.4) 0px,
+      rgba(15, 14, 18, 0.1) 60px,
+      rgba(0, 0, 0, 0.5) 120px,
+      rgba(24, 21, 28, 0.08) 180px,
+      rgba(0, 0, 0, 0.45) 240px
+    );
+}
+
+/* Prevents long text from pushing past screen boundaries on mobile */
+.safe-text-wrap {
+  overflow-wrap: break-word;
+  word-wrap: break-word;
+  word-break: break-word;
+  hyphens: auto;
+}
+
+/* Accessible keyboard focus indicator */
+:focus-visible {
+  outline: 1px solid rgba(240, 237, 230, 0.55);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

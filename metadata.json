@@ -1,0 +1,6 @@
+{
+  "name": "Apostles of deathmarried",
+  "description": "The independent gothic archive, community platform, interactive music games, creations gallery, and player for artist deathmarried.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
