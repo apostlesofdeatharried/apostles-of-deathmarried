@@ -7,6 +7,11 @@ import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
 import { db, initDatabase } from './server/db.js';
 import {
+  ensureCloudDatabaseRestored,
+  pushDatabaseBackupNow,
+  getCloudSyncStatus,
+} from './server/cloudSync.js';
+import {
   calculateLevelFromXp,
   calculateQuizScore,
   validateNickname,
@@ -18,7 +23,11 @@ import {
 } from './src/utils/logic.js';
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
+const isVercel = Boolean(process.env.VERCEL);
+
+// Trust Vercel / reverse proxy headers for rate limiting & secure cookies
+app.set('trust proxy', 1);
 
 // Initialize SQLite database
 initDatabase();
@@ -34,6 +43,23 @@ app.use((_req: Request, res: Response, next: NextFunction) => {
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(cookieParser());
+
+// Cloud database cold-start restore & write-through snapshot sync middleware
+app.use(async (req: Request, res: Response, next: NextFunction) => {
+  if (req.path.startsWith('/api') || req.path.startsWith('/uploads')) {
+    try {
+      await ensureCloudDatabaseRestored();
+    } catch {}
+    if (['POST', 'PUT', 'DELETE', 'PATCH'].includes(req.method)) {
+      res.on('finish', () => {
+        if (res.statusCode >= 200 && res.statusCode < 400) {
+          void pushDatabaseBackupNow();
+        }
+      });
+    }
+  }
+  next();
+});
 
 // Lightweight in-memory rate limiter for auth & upload routes
 const rateBuckets = new Map<string, { count: number; resetAt: number }>();
@@ -59,21 +85,51 @@ function createRateLimiter(keyPrefix: string, maxRequests: number, windowMs: num
 const authRateLimit = createRateLimiter('auth', 40, 60 * 1000);
 const uploadRateLimit = createRateLimiter('upload', 30, 60 * 1000);
 
-// Static uploads folder
-const uploadDir = path.resolve('public/uploads');
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
+// Static uploads folder (uses /tmp/uploads on Vercel read-only filesystem)
+const uploadDir = isVercel
+  ? path.join('/tmp', 'uploads')
+  : path.resolve(process.cwd(), 'public', 'uploads');
+try {
+  if (!fs.existsSync(uploadDir)) {
+    fs.mkdirSync(uploadDir, { recursive: true });
+  }
+} catch (err) {
+  console.warn('[Uploads] Could not create uploadDir:', err);
 }
+
+const BUNDLED_AUDIO_FILES = new Set([
+  '/audio/crown_of_thorns.wav',
+  '/audio/midnight_rose.wav',
+  '/audio/cathedral_veil.wav',
+]);
 
 function localAudioExists(audioUrl?: string | null): boolean {
   if (!audioUrl || typeof audioUrl !== 'string') return false;
   const trimmed = audioUrl.trim();
   if (!trimmed) return false;
-  if (trimmed.startsWith('/audio/') || trimmed.startsWith('/uploads/')) {
+  if (BUNDLED_AUDIO_FILES.has(trimmed)) return true;
+
+  if (trimmed.startsWith('/audio/')) {
     if (trimmed.includes('..')) return false;
-    const diskPath = path.resolve('public', trimmed.slice(1));
-    return fs.existsSync(diskPath);
+    const rel = trimmed.slice(1);
+    const publicPath = path.resolve(process.cwd(), 'public', rel);
+    const distPath = path.resolve(process.cwd(), 'dist', rel);
+    return fs.existsSync(publicPath) || fs.existsSync(distPath);
   }
+
+  if (trimmed.startsWith('/uploads/')) {
+    if (trimmed.includes('..')) return false;
+    const filename = path.basename(trimmed);
+    const diskPath = path.join(uploadDir, filename);
+    const publicPath = path.resolve(process.cwd(), 'public', 'uploads', filename);
+    if (fs.existsSync(diskPath) || fs.existsSync(publicPath)) return true;
+    try {
+      const blobRow = db.prepare('SELECT 1 FROM uploaded_blobs WHERE filename = ?').get(filename);
+      if (blobRow) return true;
+    } catch {}
+    return false;
+  }
+
   return isSafeMediaUrl(trimmed);
 }
 
@@ -245,7 +301,8 @@ app.post('/api/auth/register', authRateLimit, (req: Request, res: Response) => {
   res.cookie('apostle_session', token, {
     httpOnly: true,
     sameSite: 'lax',
-    secure: process.env.NODE_ENV === 'production',
+    secure: process.env.NODE_ENV === 'production' || isVercel,
+    path: '/',
     maxAge: 30 * 24 * 60 * 60 * 1000,
   });
 
@@ -313,7 +370,8 @@ app.post('/api/auth/login', authRateLimit, (req: Request, res: Response) => {
   res.cookie('apostle_session', token, {
     httpOnly: true,
     sameSite: 'lax',
-    secure: process.env.NODE_ENV === 'production',
+    secure: process.env.NODE_ENV === 'production' || isVercel,
+    path: '/',
     maxAge: 30 * 24 * 60 * 60 * 1000,
   });
 
@@ -360,6 +418,7 @@ app.post('/api/admin/delete-file', requireAdminOrMod, (req: AuthRequest, res: Re
     }
     db.prepare('DELETE FROM audio_files WHERE storage_path = ?').run(url);
     db.prepare('DELETE FROM archive_images WHERE storage_path = ?').run(url);
+    db.prepare('DELETE FROM uploaded_blobs WHERE filename = ?').run(filename);
   }
   res.json({ ok: true });
 });
@@ -369,7 +428,7 @@ app.post('/api/auth/logout', (req: Request, res: Response) => {
   if (token) {
     db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
   }
-  res.clearCookie('apostle_session');
+  res.clearCookie('apostle_session', { path: '/' });
   res.json({ ok: true });
 });
 
@@ -2422,6 +2481,23 @@ app.post('/api/upload', uploadRateLimit, requireAuth, upload.single('file'), (re
   const isImage = req.file.mimetype.startsWith('image/') || Boolean(req.file.originalname.match(/\.(jpg|jpeg|png|webp|gif|svg|bmp)$/i));
   const isVideo = req.file.mimetype.startsWith('video/') || Boolean(req.file.originalname.match(/\.(mp4|webm|mov)$/i));
 
+  // Persist uploaded file binary in SQLite uploaded_blobs (up to 25MB) so serverless cold starts never lose uploads
+  try {
+    if (req.file.path && fs.existsSync(req.file.path) && req.file.size <= 25 * 1024 * 1024) {
+      const fileBuffer = fs.readFileSync(req.file.path);
+      db.prepare(`
+        INSERT INTO uploaded_blobs (filename, mime_type, byte_size, data)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(filename) DO UPDATE SET
+          mime_type = excluded.mime_type,
+          byte_size = excluded.byte_size,
+          data = excluded.data
+      `).run(req.file.filename, req.file.mimetype || 'application/octet-stream', req.file.size, fileBuffer);
+    }
+  } catch (err) {
+    console.warn('[Upload] Failed to store blob in SQLite fallback table:', err);
+  }
+
   if (isAudio) {
     try {
       db.prepare(`
@@ -2454,10 +2530,72 @@ app.post('/api/upload', uploadRateLimit, requireAuth, upload.single('file'), (re
   });
 });
 
+// Serve uploaded files from disk first, falling back to SQLite uploaded_blobs for serverless persistence
+app.get('/uploads/:filename', (req: Request, res: Response, next: NextFunction) => {
+  const filename = path.basename(req.params.filename || '');
+  if (!filename || filename.includes('..')) {
+    res.status(400).end();
+    return;
+  }
+
+  const diskCandidate = path.join(uploadDir, filename);
+  const publicCandidate = path.resolve(process.cwd(), 'public', 'uploads', filename);
+  if (fs.existsSync(diskCandidate) || fs.existsSync(publicCandidate)) {
+    next();
+    return;
+  }
+
+  try {
+    const row = db.prepare('SELECT mime_type, byte_size, data FROM uploaded_blobs WHERE filename = ?').get(filename) as
+      | { mime_type: string; byte_size: number; data: Buffer }
+      | undefined;
+    if (!row || !row.data) {
+      res.status(404).json({ error: 'Uploaded file not found' });
+      return;
+    }
+
+    const buffer = Buffer.isBuffer(row.data) ? row.data : Buffer.from(row.data);
+    const total = buffer.length;
+    res.setHeader('Content-Type', row.mime_type || 'application/octet-stream');
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+
+    const range = req.headers.range;
+    if (range) {
+      const parts = range.replace(/bytes=/, '').split('-');
+      const start = parseInt(parts[0], 10);
+      const end = parts[1] ? parseInt(parts[1], 10) : total - 1;
+      if (!isNaN(start) && !isNaN(end) && start >= 0 && end < total && start <= end) {
+        res.status(206);
+        res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
+        res.setHeader('Content-Length', String(end - start + 1));
+        res.end(buffer.subarray(start, end + 1));
+        return;
+      }
+    }
+
+    res.setHeader('Content-Length', String(total));
+    res.end(buffer);
+  } catch (err) {
+    console.error('[Uploads] Error serving blob from SQLite:', err);
+    res.status(500).end();
+  }
+});
+
 // Serve uploaded static files & audio/asset resources
 app.use('/uploads', express.static(uploadDir));
-app.use('/audio', express.static(path.resolve('public/audio')));
-app.use('/assets', express.static(path.resolve('public/assets')));
+app.use('/uploads', express.static(path.resolve(process.cwd(), 'public', 'uploads')));
+app.use('/audio', express.static(path.resolve(process.cwd(), 'public', 'audio')));
+app.use('/assets', express.static(path.resolve(process.cwd(), 'public', 'assets')));
+
+// Health & deployment diagnostic endpoint
+app.get('/api/health', (_req: Request, res: Response) => {
+  res.json({
+    ok: true,
+    service: 'Apostles of deathmarried API',
+    ...getCloudSyncStatus(),
+  });
+});
 
 // ----------------------------------------------------------------------------
 // API STRICT 404 & ERROR HANDLER (Ensures API routes NEVER return HTML <!DOCTYPE html>)
@@ -2485,9 +2623,9 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    app.use(express.static(path.resolve('dist')));
+    app.use(express.static(path.resolve(process.cwd(), 'dist')));
     app.get('*', (_req, res) => {
-      res.sendFile(path.resolve('dist/index.html'));
+      res.sendFile(path.resolve(process.cwd(), 'dist', 'index.html'));
     });
   }
 
@@ -2496,4 +2634,9 @@ async function startServer() {
   });
 }
 
-startServer();
+if (!isVercel && process.env.NODE_ENV !== 'test') {
+  startServer();
+}
+
+export { app };
+export default app;

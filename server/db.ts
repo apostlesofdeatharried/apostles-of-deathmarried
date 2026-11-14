@@ -3,17 +3,76 @@ import path from 'path';
 import fs from 'fs';
 import bcrypt from 'bcryptjs';
 
-const dbDir = path.resolve('data');
-if (!fs.existsSync(dbDir)) {
-  fs.mkdirSync(dbDir, { recursive: true });
+const isVercel = Boolean(process.env.VERCEL);
+const bundledDbPath = path.resolve(process.cwd(), 'data', 'apostles.db');
+
+function resolveWritableDbPath(): string {
+  if (isVercel) {
+    const tmpDbPath = path.join('/tmp', 'apostles.db');
+    if (!fs.existsSync(tmpDbPath) && fs.existsSync(bundledDbPath)) {
+      try {
+        fs.copyFileSync(bundledDbPath, tmpDbPath);
+      } catch (err) {
+        console.error('[DB] Failed to copy bundled database to /tmp:', err);
+      }
+    }
+    return tmpDbPath;
+  }
+
+  const dbDir = path.resolve(process.cwd(), 'data');
+  try {
+    if (!fs.existsSync(dbDir)) {
+      fs.mkdirSync(dbDir, { recursive: true });
+    }
+    return path.join(dbDir, 'apostles.db');
+  } catch {
+    // Fallback to /tmp if current directory is read-only
+    const tmpDbPath = path.join('/tmp', 'apostles.db');
+    if (!fs.existsSync(tmpDbPath) && fs.existsSync(bundledDbPath)) {
+      try {
+        fs.copyFileSync(bundledDbPath, tmpDbPath);
+      } catch {}
+    }
+    return tmpDbPath;
+  }
 }
 
-const dbPath = path.join(dbDir, 'apostles.db');
-export const db = new Database(dbPath);
+const activeDbPath = resolveWritableDbPath();
+export let db = new Database(activeDbPath);
 
 // Enable WAL mode & foreign keys
-db.pragma('journal_mode = WAL');
+try {
+  db.pragma('journal_mode = WAL');
+} catch {
+  // Fallback if WAL cannot be enabled on underlying mount
+}
 db.pragma('foreign_keys = ON');
+
+export function getDbPath(): string {
+  return activeDbPath;
+}
+
+export function serializeDatabase(): Buffer {
+  return db.serialize();
+}
+
+export function replaceDatabaseWithBuffer(buffer: Buffer): void {
+  if (!buffer || buffer.length < 100) return;
+  try {
+    db.close();
+  } catch {}
+  try {
+    if (fs.existsSync(`${activeDbPath}-wal`)) fs.unlinkSync(`${activeDbPath}-wal`);
+    if (fs.existsSync(`${activeDbPath}-shm`)) fs.unlinkSync(`${activeDbPath}-shm`);
+  } catch {}
+  fs.writeFileSync(activeDbPath, buffer);
+  db = new Database(activeDbPath);
+  try {
+    db.pragma('journal_mode = WAL');
+  } catch {}
+  db.pragma('foreign_keys = ON');
+  initDatabase();
+}
 
 export function initDatabase() {
   db.exec(`
@@ -355,6 +414,14 @@ export function initDatabase() {
       options_json TEXT NOT NULL,
       expires_at INTEGER NOT NULL,
       is_used INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS uploaded_blobs (
+      filename TEXT PRIMARY KEY,
+      mime_type TEXT NOT NULL,
+      byte_size INTEGER NOT NULL,
+      data BLOB NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
   `);
 
