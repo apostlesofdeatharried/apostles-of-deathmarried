@@ -1,26 +1,5 @@
 {
-  "version": 2,
-  "buildCommand": "npm run build",
-  "outputDirectory": "dist",
-  "framework": "vite",
-  "functions": {
-    "api/index.ts": {
-      "maxDuration": 30,
-      "includeFiles": "{data/**,public/audio/**}"
-    }
-  },
   "rewrites": [
-    {
-      "source": "/api/(.*)",
-      "destination": "/api/index"
-    },
-    {
-      "source": "/uploads/(.*)",
-      "destination": "/api/index"
-    },
-    {
-      "source": "/((?!api/|uploads/|assets/|audio/|favicon\\.ico).*)",
-      "destination": "/index.html"
-    }
+    { "source": "/(.*)", "destination": "/index.html" }
   ]
 }
