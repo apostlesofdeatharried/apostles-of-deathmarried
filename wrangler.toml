@@ -1,0 +1,8 @@
+name = "apostles-of-deathmarried"
+pages_build_output_dir = "dist"
+compatibility_date = "2024-11-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "apostles-db"
+database_id = "e6b77b97-2170-492e-97d2-1cd39a672173"
