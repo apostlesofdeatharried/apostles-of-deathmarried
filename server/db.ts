@@ -503,6 +503,18 @@ export function ensureSchemaAndMigrations() {
       data BLOB NOT NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+
+    CREATE TABLE IF NOT EXISTS email_verification_codes (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      email TEXT NOT NULL,
+      code_hash TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      max_attempts INTEGER NOT NULL DEFAULT 5,
+      used_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
   `);
 
   // Safe table schema migrations for existing databases
@@ -513,6 +525,10 @@ export function ensureSchemaAndMigrations() {
   try { db.exec("ALTER TABLE profiles ADD COLUMN equipped_banner TEXT;"); } catch {}
   try { db.exec("ALTER TABLE profiles ADD COLUMN equipped_name_style TEXT;"); } catch {}
   try { db.exec("ALTER TABLE profiles ADD COLUMN equipped_badge TEXT;"); } catch {}
+  try { db.exec("ALTER TABLE profiles ADD COLUMN equipped_theme TEXT;"); } catch {}
+  try { db.exec("ALTER TABLE profiles ADD COLUMN equipped_effect TEXT;"); } catch {}
+  try { db.exec("ALTER TABLE profiles ADD COLUMN featured_achievements_json TEXT;"); } catch {}
+  try { db.exec("ALTER TABLE profiles ADD COLUMN username_changed_at TEXT;"); } catch {}
   try { db.exec("ALTER TABLE tracks ADD COLUMN is_game_eligible INTEGER NOT NULL DEFAULT 1;"); } catch {}
   try { db.exec("ALTER TABLE singles ADD COLUMN is_game_eligible INTEGER NOT NULL DEFAULT 1;"); } catch {}
   try { db.exec("ALTER TABLE post_categories ADD COLUMN is_official INTEGER NOT NULL DEFAULT 0;"); } catch {}
@@ -523,6 +539,14 @@ export function ensureSchemaAndMigrations() {
   try { db.exec("ALTER TABLE creations ADD COLUMN status TEXT NOT NULL DEFAULT 'approved';"); } catch {}
   try { db.exec("ALTER TABLE creations ADD COLUMN rejection_reason TEXT;"); } catch {}
   try { db.exec("ALTER TABLE users ADD COLUMN email TEXT;"); } catch {}
+  try { db.exec("ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0;"); } catch {}
+  try { db.exec("ALTER TABLE users ADD COLUMN failed_login_attempts INTEGER NOT NULL DEFAULT 0;"); } catch {}
+  try { db.exec("ALTER TABLE users ADD COLUMN locked_until TEXT;"); } catch {}
+  try { db.exec("ALTER TABLE users ADD COLUMN password_changed_at TEXT;"); } catch {}
+  try { db.exec("ALTER TABLE achievements ADD COLUMN rarity TEXT NOT NULL DEFAULT 'common';"); } catch {}
+  try { db.exec("ALTER TABLE achievements ADD COLUMN category TEXT NOT NULL DEFAULT 'general';"); } catch {}
+  try { db.exec("ALTER TABLE achievements ADD COLUMN condition_ru TEXT;"); } catch {}
+  try { db.exec("ALTER TABLE achievements ADD COLUMN condition_en TEXT;"); } catch {}
   try { db.exec("ALTER TABLE albums ADD COLUMN streaming_links_json TEXT;"); } catch {}
   try { db.exec("ALTER TABLE albums ADD COLUMN verified_source TEXT;"); } catch {}
   try { db.exec("ALTER TABLE albums ADD COLUMN last_verified_at TEXT;"); } catch {}
@@ -531,9 +555,18 @@ export function ensureSchemaAndMigrations() {
   try { db.exec("ALTER TABLE singles ADD COLUMN last_verified_at TEXT;"); } catch {}
   try { db.exec("ALTER TABLE singles ADD COLUMN lyrics TEXT;"); } catch {}
 
-  // Sync total_xp with existing xp if total_xp is 0
+  // Sync total_xp with existing xp if total_xp is 0 (non-destructive)
   try {
     db.exec("UPDATE profiles SET total_xp = xp WHERE total_xp = 0 AND xp > 0;");
+  } catch {}
+
+  // Ensure legacy accounts with empty display_name gracefully inherit nickname
+  try {
+    db.exec(`
+      UPDATE profiles
+      SET display_name = (SELECT u.nickname FROM users u WHERE u.id = profiles.user_id)
+      WHERE display_name IS NULL OR trim(display_name) = '';
+    `);
   } catch {}
 }
 
@@ -618,28 +651,63 @@ function seedInitialData() {
     insertCategory.run(cat);
   }
 
-  // Seed clean music-centric Achievements
+  // Seed expanded 27 real mechanics-driven Achievements across categories and 4 rarities
   const achievements = [
-    { id: 'ach_first_blood', slug: 'first_blood', title_ru: 'Первый шаг', title_en: 'First Step', desc_ru: 'Сыграйте в любое интерактивное испытание архива', desc_en: 'Play your first interactive challenge', icon: 'play', xp_reward: 50 },
-    { id: 'ach_initiate_ritual', slug: 'initiate_ritual', title_ru: 'Чуткий слух', title_en: 'Musical Ear', desc_ru: 'Завершите 10 раундов в играх архива', desc_en: 'Complete 10 interactive game sessions', icon: 'headphones', xp_reward: 100 },
-    { id: 'ach_lore_scholar', slug: 'lore_scholar', title_ru: 'Знаток дискографии', title_en: 'Discography Connoisseur', desc_ru: 'Пройдите ежедневную викторину без ошибок', desc_en: 'Achieve a perfect score in Daily Quiz', icon: 'award', xp_reward: 150 },
-    { id: 'ach_devoted_acolyte', slug: 'devoted_acolyte', title_ru: 'Преданный слушатель', title_en: 'Devoted Listener', desc_ru: 'Поддерживайте серию активности 3 дня подряд', desc_en: 'Maintain a 3-day daily streak', icon: 'calendar', xp_reward: 100 },
-    { id: 'ach_eternal_vigil', slug: 'eternal_vigil', title_ru: 'Хранитель архива', title_en: 'Archive Keeper', desc_ru: 'Серия активности 7 дней подряд', desc_en: 'Maintain a 7-day daily streak', icon: 'shield', xp_reward: 250 },
-    { id: 'ach_gothic_artisan', slug: 'gothic_artisan', title_ru: 'Творец', title_en: 'Creator', desc_ru: 'Опубликуйте свою работу в творческой галерее', desc_en: 'Publish your work in the Creations gallery', icon: 'sparkles', xp_reward: 100 },
-    { id: 'ach_voice_of_abyss', slug: 'voice_of_abyss', title_ru: 'Голос сообщества', title_en: 'Community Voice', desc_ru: 'Создайте 3 записи на форуме сообщества', desc_en: 'Create 3 community forum discussions', icon: 'message-square', xp_reward: 150 },
-    { id: 'ach_dark_apostle', slug: 'dark_apostle', title_ru: 'Мастер звука', title_en: 'Sound Master', desc_ru: 'Наберите 500 очков опыта (XP)', desc_en: 'Attain 500 total XP', icon: 'trophy', xp_reward: 300 },
-    { id: 'ach_collector', slug: 'collector', title_ru: 'Коллекционер', title_en: 'Collector', desc_ru: 'Приобретите первый предмет в магазине кастомизации', desc_en: 'Acquire your first item in the XP Shop', icon: 'tag', xp_reward: 100 },
+    // Getting Started
+    { id: 'ach_archive_initiate', slug: 'archive_initiate', title_ru: 'Посвящённый архива', title_en: 'Archive Initiate', desc_ru: 'Создайте свой аккаунт в сообществе Apostles of deathmarried', desc_en: 'Create your Apostles of deathmarried account', condition_ru: 'Зарегистрироваться на сайте', condition_en: 'Register an account', category: 'getting_started', rarity: 'common', icon: 'moon', xp_reward: 0 },
+    { id: 'ach_shadow_identity', slug: 'shadow_identity', title_ru: 'Личный почерк', title_en: 'Personal Mark', desc_ru: 'Заполните описание профиля или личный статус', desc_en: 'Customize your profile bio or personal status', condition_ru: 'Добавить «О себе» или статус в профиле', condition_en: 'Set a profile bio or custom status', category: 'getting_started', rarity: 'common', icon: 'feather', xp_reward: 0 },
+    { id: 'ach_first_blood', slug: 'first_blood', title_ru: 'Первый шаг', title_en: 'First Step', desc_ru: 'Сыграйте в любое интерактивное испытание архива', desc_en: 'Play your first interactive challenge', condition_ru: 'Завершить 1 игру', condition_en: 'Complete 1 game', category: 'getting_started', rarity: 'common', icon: 'play', xp_reward: 0 },
+
+    // Music / Guess The Track
+    { id: 'ach_first_note', slug: 'first_note', title_ru: 'Узнанный аккорд', title_en: 'Recognized Chord', desc_ru: 'Впервые угадайте трек дня по 5-секундному отрывку', desc_en: 'Correctly guess a Daily Track from its 5-second snippet', condition_ru: '1 правильный ответ в «Угадай трек»', condition_en: '1 correct Guess The Track', category: 'music', rarity: 'common', icon: 'music', xp_reward: 0 },
+    { id: 'ach_vinyl_hunter', slug: 'vinyl_hunter', title_ru: 'Охотник за винилом', title_en: 'Vinyl Hunter', desc_ru: 'Угадайте 5 ежедневных композиций deathmarried', desc_en: 'Guess 5 daily deathmarried tracks correctly', condition_ru: '5 побед в «Угадай трек»', condition_en: '5 Guess The Track wins', category: 'music', rarity: 'rare', icon: 'disc', xp_reward: 0 },
+    { id: 'ach_phantom_ear', slug: 'phantom_ear', title_ru: 'Абсолютный слух', title_en: 'Phantom Ear', desc_ru: 'Угадайте 15 ежедневных композиций по 5-секундному фрагменту', desc_en: 'Guess 15 daily tracks from 5-second snippets', condition_ru: '15 побед в «Угадай трек»', condition_en: '15 Guess The Track wins', category: 'music', rarity: 'epic', icon: 'headphones', xp_reward: 0 },
+    { id: 'ach_initiate_ritual', slug: 'initiate_ritual', title_ru: 'Чуткий слух', title_en: 'Musical Ear', desc_ru: 'Завершите 10 раундов в ежедневных играх архива', desc_en: 'Complete 10 interactive game sessions', condition_ru: 'Сыграть 10 игр', condition_en: 'Play 10 games', category: 'music', rarity: 'rare', icon: 'headphones', xp_reward: 0 },
+    { id: 'ach_ritual_master', slug: 'ritual_master', title_ru: 'Мастер испытаний', title_en: 'Trial Master', desc_ru: 'Примите участие в 30 игровых испытаниях сообщества', desc_en: 'Complete 30 archive game trials', condition_ru: 'Сыграть 30 игр', condition_en: 'Play 30 games', category: 'music', rarity: 'epic', icon: 'zap', xp_reward: 0 },
+
+    // Quiz / Discography Knowledge
+    { id: 'ach_quiz_seeker', slug: 'quiz_seeker', title_ru: 'Искатель фактов', title_en: 'Lore Seeker', desc_ru: 'Завершите первую ежедневную викторину архива', desc_en: 'Complete your first Daily Quiz', condition_ru: 'Пройти 1 ежедневную викторину', condition_en: 'Complete 1 Daily Quiz', category: 'quiz', rarity: 'common', icon: 'book-open', xp_reward: 0 },
+    { id: 'ach_lore_scholar', slug: 'lore_scholar', title_ru: 'Знаток дискографии', title_en: 'Discography Connoisseur', desc_ru: 'Пройдите ежедневную викторину без единой ошибки', desc_en: 'Achieve a perfect score in Daily Quiz', condition_ru: '100% правильных ответов в викторине', condition_en: 'Perfect score in Daily Quiz', category: 'quiz', rarity: 'rare', icon: 'award', xp_reward: 0 },
+    { id: 'ach_obsidian_oracle', slug: 'obsidian_oracle', title_ru: 'Обсидиановый оракул', title_en: 'Obsidian Oracle', desc_ru: 'Пройдите ежедневную викторину без ошибок 3 раза', desc_en: 'Score 100% in Daily Quiz 3 times', condition_ru: '3 идеальных прохождения викторины', condition_en: '3 perfect Daily Quiz runs', category: 'quiz', rarity: 'epic', icon: 'eye', xp_reward: 0 },
+    { id: 'ach_cathedral_historian', slug: 'cathedral_historian', title_ru: 'Летописец свода', title_en: 'Cathedral Historian', desc_ru: 'Завершите 10 ежедневных викторин архива', desc_en: 'Complete 10 Daily Quizzes', condition_ru: 'Пройти 10 викторин', condition_en: 'Complete 10 Daily Quizzes', category: 'quiz', rarity: 'epic', icon: 'compass', xp_reward: 0 },
+
+    // Consistency / Streaks
+    { id: 'ach_devoted_acolyte', slug: 'devoted_acolyte', title_ru: 'Преданный слушатель', title_en: 'Devoted Listener', desc_ru: 'Поддерживайте серию активности 3 дня подряд', desc_en: 'Maintain a 3-day daily streak', condition_ru: 'Серия 3 дня подряд', condition_en: '3-day daily streak', category: 'consistency', rarity: 'common', icon: 'calendar', xp_reward: 0 },
+    { id: 'ach_eternal_vigil', slug: 'eternal_vigil', title_ru: 'Хранитель архива', title_en: 'Archive Keeper', desc_ru: 'Поддерживайте серию активности 7 дней подряд', desc_en: 'Maintain a 7-day daily streak', condition_ru: 'Серия 7 дней подряд', condition_en: '7-day daily streak', category: 'consistency', rarity: 'rare', icon: 'shield', xp_reward: 0 },
+    { id: 'ach_midnight_devotion', slug: 'midnight_devotion', title_ru: 'Полуночная вахта', title_en: 'Midnight Vigil', desc_ru: 'Возвращайтесь в архив 14 дней без перерыва', desc_en: 'Maintain a 14-day daily streak', condition_ru: 'Серия 14 дней подряд', condition_en: '14-day daily streak', category: 'consistency', rarity: 'epic', icon: 'flame', xp_reward: 0 },
+    { id: 'ach_immortal_flame', slug: 'immortal_flame', title_ru: 'Негасимое пламя', title_en: 'Immortal Flame', desc_ru: 'Выдержите серию активности 30 дней подряд', desc_en: 'Maintain a 30-day unbroken daily streak', condition_ru: 'Серия 30 дней подряд', condition_en: '30-day daily streak', category: 'consistency', rarity: 'legendary', icon: 'crown', xp_reward: 0 },
+
+    // Collector / Shop
+    { id: 'ach_collector', slug: 'collector', title_ru: 'Коллекционер', title_en: 'Collector', desc_ru: 'Приобретите первый предмет в магазине кастомизации', desc_en: 'Acquire your first item in the XP Shop', condition_ru: 'Купить 1 предмет в магазине', condition_en: 'Buy 1 shop item', category: 'collector', rarity: 'common', icon: 'tag', xp_reward: 0 },
+    { id: 'ach_relic_hoarder', slug: 'relic_hoarder', title_ru: 'Собиратель реликвий', title_en: 'Relic Curator', desc_ru: 'Соберите 5 предметов кастомизации в своей коллекции', desc_en: 'Own 5 customization items', condition_ru: 'Собрать 5 предметов коллекции', condition_en: 'Own 5 items', category: 'collector', rarity: 'rare', icon: 'gem', xp_reward: 0 },
+    { id: 'ach_gothic_treasury', slug: 'gothic_treasury', title_ru: 'Готическая сокровищница', title_en: 'Gothic Treasury', desc_ru: 'Соберите 10 редких и уникальных предметов оформления', desc_en: 'Own 10 customization items', condition_ru: 'Собрать 10 предметов коллекции', condition_en: 'Own 10 items', category: 'collector', rarity: 'legendary', icon: 'layers', xp_reward: 0 },
+    { id: 'ach_dressed_in_velvet', slug: 'dressed_in_velvet', title_ru: 'В бархате и серебре', title_en: 'Dressed in Velvet', desc_ru: 'Одновременно экипируйте 3 элемента оформления профиля', desc_en: 'Equip 3 customization layers simultaneously', condition_ru: 'Экипировать 3 предмета одновременно', condition_en: 'Equip 3 items at once', category: 'collector', rarity: 'rare', icon: 'sparkles', xp_reward: 0 },
+
+    // Community & Creations
+    { id: 'ach_first_chronicle', slug: 'first_chronicle', title_ru: 'Первая запись', title_en: 'First Chronicle', desc_ru: 'Создайте свою первую тему в сообществе', desc_en: 'Publish your first community forum topic', condition_ru: 'Создать 1 тему на форуме', condition_en: 'Create 1 forum topic', category: 'community', rarity: 'common', icon: 'message-square', xp_reward: 0 },
+    { id: 'ach_voice_of_abyss', slug: 'voice_of_abyss', title_ru: 'Голос сообщества', title_en: 'Community Voice', desc_ru: 'Создайте 3 записи на форуме сообщества', desc_en: 'Create 3 community forum discussions', condition_ru: 'Создать 3 темы на форуме', condition_en: 'Create 3 forum topics', category: 'community', rarity: 'rare', icon: 'message-square', xp_reward: 0 },
+    { id: 'ach_midnight_critic', slug: 'midnight_critic', title_ru: 'Ночной собеседник', title_en: 'Nocturnal Critic', desc_ru: 'Оставьте 5 комментариев в обсуждениях и галерее', desc_en: 'Post 5 comments across discussions and creations', condition_ru: 'Оставить 5 комментариев', condition_en: 'Write 5 comments', category: 'community', rarity: 'common', icon: 'feather', xp_reward: 0 },
+    { id: 'ach_gothic_artisan', slug: 'gothic_artisan', title_ru: 'Творец', title_en: 'Creator', desc_ru: 'Опубликуйте свою работу в творческой галерее', desc_en: 'Publish your work in the Creations gallery', condition_ru: 'Опубликовать 1 работу в галерее', condition_en: 'Publish 1 creation', category: 'community', rarity: 'rare', icon: 'sparkles', xp_reward: 0 },
+    { id: 'ach_coven_circle', slug: 'coven_circle', title_ru: 'Круг единомышленников', title_en: 'Inner Circle', desc_ru: 'Наберите 3 подписчиков или подпишитесь на 3 участников', desc_en: 'Reach 3 followers or follow 3 community members', condition_ru: '3 подписчика или 3 подписки', condition_en: '3 followers or following', category: 'community', rarity: 'rare', icon: 'users', xp_reward: 0 },
+
+    // Veteran & XP Milestones
+    { id: 'ach_dark_apostle', slug: 'dark_apostle', title_ru: 'Мастер звука', title_en: 'Sound Master', desc_ru: 'Наберите 500 суммарных очков опыта (Total XP)', desc_en: 'Attain 500 lifetime Total XP', condition_ru: 'Набрать 500 Total XP', condition_en: 'Reach 500 Total XP', category: 'veteran', rarity: 'epic', icon: 'trophy', xp_reward: 0 },
+    { id: 'ach_archon_of_sound', slug: 'archon_of_sound', title_ru: 'Архонт архива', title_en: 'Archive Archon', desc_ru: 'Достигните 1500 Total XP или 8-го уровня профиля', desc_en: 'Reach 1500 Total XP or Profile Level 8', condition_ru: '1500 Total XP или 8-й уровень', condition_en: '1500 Total XP or Level 8', category: 'veteran', rarity: 'legendary', icon: 'star', xp_reward: 0 },
   ];
 
   const insertAch = db.prepare(`
-    INSERT INTO achievements (id, slug, title_ru, title_en, desc_ru, desc_en, icon, xp_reward)
-    VALUES (@id, @slug, @title_ru, @title_en, @desc_ru, @desc_en, @icon, @xp_reward)
+    INSERT INTO achievements (id, slug, title_ru, title_en, desc_ru, desc_en, condition_ru, condition_en, category, rarity, icon, xp_reward)
+    VALUES (@id, @slug, @title_ru, @title_en, @desc_ru, @desc_en, @condition_ru, @condition_en, @category, @rarity, @icon, @xp_reward)
     ON CONFLICT(id) DO UPDATE SET
       slug = excluded.slug,
       title_ru = excluded.title_ru,
       title_en = excluded.title_en,
       desc_ru = excluded.desc_ru,
       desc_en = excluded.desc_en,
+      condition_ru = excluded.condition_ru,
+      condition_en = excluded.condition_en,
+      category = excluded.category,
+      rarity = excluded.rarity,
       icon = excluded.icon,
       xp_reward = excluded.xp_reward
   `);
@@ -647,26 +715,55 @@ function seedInitialData() {
     insertAch.run(ach);
   }
 
-  // Seed default XP Shop Items
+  // Seed expanded 36-item XP Customization Shop across 6 distinct categories & 5 rarities
   const shopItems = [
-    // Frames
-    { id: 'frame_silver_thorn', name_ru: 'Серебряный шип', name_en: 'Silver Thorn', description_ru: 'Элегантная серебристая окантовка с мягким свечением', description_en: 'Elegant silver border with subtle glow', category: 'frame', cost_xp: 120, rarity: 'rare', preview_value: 'border-2 border-[#c5c8cf] shadow-[0_0_14px_rgba(197,200,207,0.35)]' },
-    { id: 'frame_dark_velvet', name_ru: 'Чёрный бархат', name_en: 'Dark Velvet', description_ru: 'Глубокая бархатная рамка с бордовым отсветом', description_en: 'Deep velvet frame with dark crimson sheen', category: 'frame', cost_xp: 160, rarity: 'rare', preview_value: 'border-2 border-[#54121e] shadow-[0_0_16px_rgba(130,28,44,0.5)]' },
-    { id: 'frame_gothic_crown', name_ru: 'Венец терновника', name_en: 'Thorn Crown', description_ru: 'Готический венец с двойным контуром и сиянием', description_en: 'Gothic double contour with dark radiance', category: 'frame', cost_xp: 300, rarity: 'epic', preview_value: 'border-2 border-[#821c2c] ring-2 ring-white/20 shadow-[0_0_20px_rgba(130,28,44,0.7)]' },
+    // 1. Avatar Frames (7 items)
     { id: 'frame_graphite', name_ru: 'Графитовый контур', name_en: 'Graphite Contour', description_ru: 'Минималистичный холодный серый кант', description_en: 'Minimalist cool graphite contour', category: 'frame', cost_xp: 60, rarity: 'common', preview_value: 'border-2 border-white/30' },
-    // Banners
-    { id: 'banner_night_mist', name_ru: 'Ночной туман', name_en: 'Night Mist', description_ru: 'Атмосферный тёмно-графитовый фон с дымчатой глубиной', description_en: 'Dark graphite backdrop with smoky gradient', category: 'banner', cost_xp: 140, rarity: 'rare', preview_value: 'from-[#0e0d12] via-[#1a1722] to-[#0c0b0e]' },
-    { id: 'banner_cathedral_veil', name_ru: 'Готический свод', name_en: 'Gothic Vault', description_ru: 'Глубокий винный полумрак с архитектурной фактурой', description_en: 'Deep wine darkness with subtle architectural depth', category: 'banner', cost_xp: 220, rarity: 'epic', preview_value: 'from-[#1c0c14] via-[#2a101b] to-[#0c0b0e]' },
-    { id: 'banner_silver_silk', name_ru: 'Серебряная вуаль', name_en: 'Silver Veil', description_ru: 'Холодные стальные тона с полупрозрачным сиянием', description_en: 'Cold steel hues with ethereal sheen', category: 'banner', cost_xp: 180, rarity: 'rare', preview_value: 'from-[#14151b] via-[#21242e] to-[#0c0b0e]' },
+    { id: 'frame_ash_ring', name_ru: 'Пепельное кольцо', name_en: 'Ash Ring', description_ru: 'Матовый дымчатый ободок с тонкой обводкой', description_en: 'Matte smoky ring with subtle rim', category: 'frame', cost_xp: 90, rarity: 'uncommon', preview_value: 'border-2 border-[#7b746b] ring-2 ring-[#7b746b]/25' },
+    { id: 'frame_silver_thorn', name_ru: 'Серебряный шип', name_en: 'Silver Thorn', description_ru: 'Элегантная серебристая окантовка с мягким свечением', description_en: 'Elegant silver border with subtle glow', category: 'frame', cost_xp: 120, rarity: 'rare', preview_value: 'border-2 border-[#c5c8cf] shadow-[0_0_14px_rgba(197,200,207,0.35)]' },
+    { id: 'frame_dark_velvet', name_ru: 'Чёрный бархат', name_en: 'Dark Velvet', description_ru: 'Глубокая бархатная рамка с бордовым отсветом', description_en: 'Deep velvet frame with dark crimson sheen', category: 'frame', cost_xp: 160, rarity: 'rare', preview_value: 'border-2 border-[#721b2b] shadow-[0_0_16px_rgba(130,28,44,0.55)]' },
+    { id: 'frame_nocturne_amethyst', name_ru: 'Сумеречный аметист', name_en: 'Nocturne Amethyst', description_ru: 'Холодный фиолетовый ореол ночного эфира', description_en: 'Cold violet halo of midnight resonance', category: 'frame', cost_xp: 220, rarity: 'epic', preview_value: 'border-2 border-[#6e56a8] ring-2 ring-[#a38ee0]/25 shadow-[0_0_18px_rgba(110,86,168,0.55)]' },
+    { id: 'frame_gothic_crown', name_ru: 'Венец терновника', name_en: 'Thorn Crown', description_ru: 'Готический венец с двойным контуром и сиянием', description_en: 'Gothic double contour with dark radiance', category: 'frame', cost_xp: 300, rarity: 'epic', preview_value: 'border-2 border-[#821c2c] ring-2 ring-white/25 shadow-[0_0_20px_rgba(130,28,44,0.75)]' },
+    { id: 'frame_gilded_relic', name_ru: 'Позолота собора', name_en: 'Cathedral Gilding', description_ru: 'Античная золотая оправа с благородным отблеском', description_en: 'Antique gold reliquary frame with warm glow', category: 'frame', cost_xp: 480, rarity: 'legendary', preview_value: 'border-2 border-[#d4af68] ring-2 ring-[#f3dca6]/35 shadow-[0_0_24px_rgba(212,175,104,0.6)]' },
+
+    // 2. Profile Banners (7 items)
     { id: 'banner_abyss', name_ru: 'Тёмная материя', name_en: 'Dark Matter', description_ru: 'Абсолютный минималистичный чёрный градиент', description_en: 'Pure minimalist dark gradient', category: 'banner', cost_xp: 80, rarity: 'common', preview_value: 'from-[#060608] via-[#100f14] to-[#060608]' },
-    // Name Styles
-    { id: 'style_silver_glow', name_ru: 'Серебряный глянец', name_en: 'Silver Glow', description_ru: 'Светлое серебристое свечение символов никнейма', description_en: 'Luminous silver lettering', category: 'name_style', cost_xp: 110, rarity: 'rare', preview_value: 'text-[#e6e8ee] drop-shadow-[0_0_8px_rgba(255,255,255,0.45)] font-medium' },
-    { id: 'style_crimson_shade', name_ru: 'Бархатный оттенок', name_en: 'Crimson Shade', description_ru: 'Благородный винный оттенок с мягкой тенью', description_en: 'Muted wine tone with soft velvet shadow', category: 'name_style', cost_xp: 150, rarity: 'rare', preview_value: 'text-[#e58a96] drop-shadow-[0_0_8px_rgba(229,138,150,0.4)]' },
-    { id: 'style_monochrome', name_ru: 'Холодный графит', name_en: 'Cold Graphite', description_ru: 'Сдержанный матовый стиль с увеличенным трекингом', description_en: 'Matte cool font with expanded tracking', category: 'name_style', cost_xp: 50, rarity: 'common', preview_value: 'text-[#aaa59e] tracking-wider' },
-    // Badges
+    { id: 'banner_slate_rain', name_ru: 'Свинцовый дождь', name_en: 'Slate Rain', description_ru: 'Холодный графитовый горизонт осенней ночи', description_en: 'Cold slate horizon of autumn rain', category: 'banner', cost_xp: 110, rarity: 'uncommon', preview_value: 'from-[#0d1014] via-[#1b222c] to-[#0b0c10]' },
+    { id: 'banner_night_mist', name_ru: 'Ночной туман', name_en: 'Night Mist', description_ru: 'Атмосферный тёмно-графитовый фон с дымчатой глубиной', description_en: 'Dark graphite backdrop with smoky gradient', category: 'banner', cost_xp: 140, rarity: 'rare', preview_value: 'from-[#0e0d12] via-[#1a1722] to-[#0c0b0e]' },
+    { id: 'banner_silver_silk', name_ru: 'Серебряная вуаль', name_en: 'Silver Veil', description_ru: 'Холодные стальные тона с полупрозрачным сиянием', description_en: 'Cold steel hues with ethereal sheen', category: 'banner', cost_xp: 180, rarity: 'rare', preview_value: 'from-[#14151b] via-[#262a36] to-[#0c0b0e]' },
+    { id: 'banner_cathedral_veil', name_ru: 'Готический свод', name_en: 'Gothic Vault', description_ru: 'Глубокий винный полумрак с архитектурной фактурой', description_en: 'Deep wine darkness with subtle architectural depth', category: 'banner', cost_xp: 220, rarity: 'epic', preview_value: 'from-[#1c0c14] via-[#341120] to-[#0c0b0e]' },
+    { id: 'banner_midnight_choir', name_ru: 'Полуночный хор', name_en: 'Midnight Choir', description_ru: 'Глубокий индиго и бархатные тени собора', description_en: 'Deep indigo and velvet cathedral shadows', category: 'banner', cost_xp: 260, rarity: 'epic', preview_value: 'from-[#110d1e] via-[#251b3d] to-[#0c0b0e]' },
+    { id: 'banner_gilded_eclipse', name_ru: 'Золотое затмение', name_en: 'Gilded Eclipse', description_ru: 'Величественный чёрно-золотой градиент реликвии', description_en: 'Regal obsidian and antique gold eclipse gradient', category: 'banner', cost_xp: 440, rarity: 'legendary', preview_value: 'from-[#161108] via-[#362812] to-[#0b0a09]' },
+
+    // 3. Name Styles (6 items)
+    { id: 'style_monochrome', name_ru: 'Холодный графит', name_en: 'Cold Graphite', description_ru: 'Сдержанный матовый стиль с увеличенным трекингом', description_en: 'Matte cool font with expanded tracking', category: 'name_style', cost_xp: 50, rarity: 'common', preview_value: 'text-[#b5b0a8] tracking-wider' },
+    { id: 'style_bone_ivory', name_ru: 'Слоновая кость', name_en: 'Antique Ivory', description_ru: 'Тёплый винтажный тон старой бумаги и мягкий акцент', description_en: 'Warm vintage ivory tone with soft emphasis', category: 'name_style', cost_xp: 85, rarity: 'uncommon', preview_value: 'text-[#f2e8d5] tracking-wide font-medium' },
+    { id: 'style_silver_glow', name_ru: 'Серебряный глянец', name_en: 'Silver Glow', description_ru: 'Светлое серебристое свечение символов имени', description_en: 'Luminous silver lettering', category: 'name_style', cost_xp: 110, rarity: 'rare', preview_value: 'text-[#e6e8ee] drop-shadow-[0_0_8px_rgba(255,255,255,0.45)] font-medium' },
+    { id: 'style_crimson_shade', name_ru: 'Бархатный оттенок', name_en: 'Crimson Shade', description_ru: 'Благородный винный оттенок с мягкой тенью', description_en: 'Muted wine tone with soft velvet shadow', category: 'name_style', cost_xp: 150, rarity: 'rare', preview_value: 'text-[#eb909d] drop-shadow-[0_0_9px_rgba(229,138,150,0.45)] font-medium' },
+    { id: 'style_amethyst_whisper', name_ru: 'Лунный аметист', name_en: 'Moonlit Amethyst', description_ru: 'Призрачное сиренево-серебристое сияние шрифта', description_en: 'Spectral lavender-silver glow lettering', category: 'name_style', cost_xp: 230, rarity: 'epic', preview_value: 'text-[#d3c4f7] drop-shadow-[0_0_10px_rgba(167,140,235,0.5)] font-medium tracking-wide' },
+    { id: 'style_gilded_sovereign', name_ru: 'Золото архива', name_en: 'Archive Gold', description_ru: 'Античный золотой градиент с благородным сиянием', description_en: 'Antique gold luminous lettering', category: 'name_style', cost_xp: 380, rarity: 'legendary', preview_value: 'text-[#f0d599] drop-shadow-[0_0_12px_rgba(224,188,112,0.55)] font-semibold tracking-wide' },
+
+    // 4. Badges & Emblems (6 items)
+    { id: 'badge_wanderer', name_ru: 'Значок «Странник»', name_en: 'Wanderer Badge', description_ru: 'Символ ночного исследователя архива', description_en: 'Emblem of the nocturnal wanderer', category: 'badge', cost_xp: 80, rarity: 'common', preview_value: 'Sparkles' },
+    { id: 'badge_nocturne', name_ru: 'Значок «Полуночник»', name_en: 'Nocturne Badge', description_ru: 'Эмблема слушателя глубокой ночи', description_en: 'Emblem of the midnight listener', category: 'badge', cost_xp: 115, rarity: 'uncommon', preview_value: 'Moon' },
     { id: 'badge_archivist', name_ru: 'Значок «Хранитель»', name_en: 'Archivist Badge', description_ru: 'Особый знак исследователя дискографии', description_en: 'Emblem of the discography curator', category: 'badge', cost_xp: 150, rarity: 'rare', preview_value: 'Shield' },
     { id: 'badge_audiophile', name_ru: 'Значок «Аудиофил»', name_en: 'Audiophile Badge', description_ru: 'Отметка преданного ценителя звука', description_en: 'Badge of the devoted sound enthusiast', category: 'badge', cost_xp: 200, rarity: 'epic', preview_value: 'Disc' },
-    { id: 'badge_wanderer', name_ru: 'Значок «Странник»', name_en: 'Wanderer Badge', description_ru: 'Символ ночного исследователя', description_en: 'Emblem of the nocturnal wanderer', category: 'badge', cost_xp: 80, rarity: 'common', preview_value: 'Sparkles' },
+    { id: 'badge_ember', name_ru: 'Значок «Пламя»', name_en: 'Ember Badge', description_ru: 'Багровая печать неугасимой преданности', description_en: 'Crimson seal of unbroken devotion', category: 'badge', cost_xp: 260, rarity: 'epic', preview_value: 'Flame' },
+    { id: 'badge_night_crown', name_ru: 'Значок «Венец ночи»', name_en: 'Night Crown Badge', description_ru: 'Легендарный знак избранных мастеров архива', description_en: 'Legendary emblem of archive sovereigns', category: 'badge', cost_xp: 450, rarity: 'legendary', preview_value: 'Crown' },
+
+    // 5. Profile Themes (5 items)
+    { id: 'theme_obsidian_monolith', name_ru: 'Тема «Обсидиан»', name_en: 'Obsidian Monolith Theme', description_ru: 'Строгий угольно-чёрный корпус карточки с графитовым акцентом', description_en: 'Strict obsidian charcoal card surface with graphite bar', category: 'theme', cost_xp: 140, rarity: 'uncommon', preview_value: 'theme_obsidian_monolith' },
+    { id: 'theme_silver_cathedral', name_ru: 'Тема «Серебряный собор»', name_en: 'Silver Cathedral Theme', description_ru: 'Холодное серебристое окаймление и стальной прогресс-бар', description_en: 'Cold silver border sheen with metallic accent bar', category: 'theme', cost_xp: 210, rarity: 'rare', preview_value: 'theme_silver_cathedral' },
+    { id: 'theme_crimson_sanctum', name_ru: 'Тема «Багровый неф»', name_en: 'Crimson Sanctum Theme', description_ru: 'Глубокие винные акценты, бордовое свечение и тёмный бархат', description_en: 'Deep wine accents, crimson aura and dark velvet surfaces', category: 'theme', cost_xp: 280, rarity: 'epic', preview_value: 'theme_crimson_sanctum' },
+    { id: 'theme_midnight_violet', name_ru: 'Тема «Ночной винтаж»', name_en: 'Midnight Violet Theme', description_ru: 'Благородный сумеречный фиолет для всей карточки профиля', description_en: 'Refined nocturnal twilight violet across profile cards', category: 'theme', cost_xp: 310, rarity: 'epic', preview_value: 'theme_midnight_violet' },
+    { id: 'theme_gilded_reliquary', name_ru: 'Тема «Реликварий»', name_en: 'Gilded Reliquary Theme', description_ru: 'Легендарное тёмно-золотое оформление с античным свечением', description_en: 'Legendary dark-gold antique aesthetic with warm radiance', category: 'theme', cost_xp: 520, rarity: 'legendary', preview_value: 'theme_gilded_reliquary' },
+
+    // 6. Profile Atmospheric Effects & Decorations (5 items)
+    { id: 'effect_vinyl_grain', name_ru: 'Орнамент «Виниловые дорожки»', name_en: 'Vinyl Grooves Overlay', description_ru: 'Тонкие концентрические линии пластинки на шапке профиля', description_en: 'Subtle concentric vinyl grooves across the profile header', category: 'effect', cost_xp: 130, rarity: 'uncommon', preview_value: 'effect_vinyl_grain' },
+    { id: 'effect_silver_filigree', name_ru: 'Украшение «Серебряная филигрань»', name_en: 'Silver Filigree Corners', description_ru: 'Изящные готические уголки и двойная рамка на шапке профиля', description_en: 'Refined gothic corner filigree framing your profile banner', category: 'effect', cost_xp: 200, rarity: 'rare', preview_value: 'effect_silver_filigree' },
+    { id: 'effect_crimson_mist', name_ru: 'Эффект «Багровая дымка»', name_en: 'Crimson Mist Aura', description_ru: 'Мягкое винное сияние и тонкая светящаяся линия на баннере', description_en: 'Atmospheric crimson mist glow with illuminated hairline', category: 'effect', cost_xp: 260, rarity: 'epic', preview_value: 'effect_crimson_mist' },
+    { id: 'effect_cathedral_light', name_ru: 'Эффект «Свет витража»', name_en: 'Cathedral Light Rays', description_ru: 'Диагональные лучи приглушённого света сквозь тёмный фон', description_en: 'Diagonal muted light shafts across the dark banner', category: 'effect', cost_xp: 320, rarity: 'epic', preview_value: 'effect_cathedral_light' },
+    { id: 'effect_eclipse_halo', name_ru: 'Эффект «Ореол затмения»', name_en: 'Eclipse Halo', description_ru: 'Легендарный золотой нимб затмения и глубокая виньетка', description_en: 'Legendary golden eclipse ring and deep atmospheric vignette', category: 'effect', cost_xp: 500, rarity: 'legendary', preview_value: 'effect_eclipse_halo' },
   ];
 
   const insertShopItem = db.prepare(`

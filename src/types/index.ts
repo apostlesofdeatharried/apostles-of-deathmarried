@@ -1,9 +1,14 @@
 export type UserRole = 'guest' | 'user' | 'moderator' | 'admin';
 
+export type ShopCategory = 'frame' | 'banner' | 'name_style' | 'badge' | 'theme' | 'effect';
+export type ItemRarity = 'common' | 'uncommon' | 'rare' | 'epic' | 'legendary';
+export type AchievementRarity = 'common' | 'rare' | 'epic' | 'legendary';
+
 export interface UserProfile {
   id: string;
   nickname: string;
   email?: string;
+  email_verified?: number;
   role_id: UserRole;
   display_name: string;
   avatar_url: string;
@@ -12,10 +17,14 @@ export interface UserProfile {
   level: number;
   xp: number; // Current spendable XP
   total_xp?: number; // Lifetime XP earned
-  equipped_frame?: string;
-  equipped_banner?: string;
-  equipped_name_style?: string;
-  equipped_badge?: string;
+  equipped_frame?: string | null;
+  equipped_banner?: string | null;
+  equipped_name_style?: string | null;
+  equipped_badge?: string | null;
+  equipped_theme?: string | null;
+  equipped_effect?: string | null;
+  featured_achievements?: string[];
+  username_changed_at?: string | null;
   daily_streak?: number;
   followers_count?: number;
   following_count?: number;
@@ -101,8 +110,13 @@ export interface Achievement {
   title_en: string;
   desc_ru: string;
   desc_en: string;
+  condition_ru?: string;
+  condition_en?: string;
+  category?: string;
+  rarity?: AchievementRarity;
   icon: string;
-  unlocked_at?: string;
+  unlocked_at?: string | null;
+  is_unlocked?: boolean;
   xp_reward?: number;
 }
 
@@ -225,9 +239,9 @@ export interface ShopItem {
   name_en: string;
   description_ru?: string;
   description_en?: string;
-  category: 'frame' | 'banner' | 'name_style' | 'badge';
+  category: ShopCategory;
   cost_xp: number;
-  rarity: 'common' | 'rare' | 'epic' | 'legendary';
+  rarity: ItemRarity;
   preview_value: string;
   is_active: number;
   requires_achievement_id?: string | null;
@@ -238,9 +252,12 @@ export interface ShopItem {
 export interface UserInventoryItem {
   id: string;
   item_id: string;
-  category: 'frame' | 'banner' | 'name_style' | 'badge';
+  category: ShopCategory;
   name_ru: string;
   name_en: string;
+  description_ru?: string;
+  description_en?: string;
+  rarity?: ItemRarity;
   preview_value: string;
   is_equipped: boolean;
   purchased_at: string;

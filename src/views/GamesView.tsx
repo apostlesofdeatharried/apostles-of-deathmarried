@@ -4,6 +4,7 @@ import { useAuth, authFetch } from '../context/AuthContext.js';
 import { QuizQuestion, LeaderboardEntry } from '../types/index.js';
 import { ShopModal } from '../components/ShopModal.js';
 import { safeJson } from '../utils/logic.js';
+import { formatHandle, renderEquippedBadge } from '../utils/cosmetics.js';
 import confetti from 'canvas-confetti';
 import {
   Trophy,
@@ -1050,20 +1051,25 @@ export const GamesView: React.FC = () => {
                           />
                         </div>
 
-                        {/* Name with equipped name style */}
-                        <span className={`truncate font-medium ${lead.equipped_name_style || 'text-white'}`}>
-                          {lead.display_name || lead.nickname}
-                        </span>
-
-                        {/* Equipped badge cosmetic */}
-                        {lead.equipped_badge && (
-                          <span className="hidden sm:inline-block text-[10px] px-1.5 py-0.2 rounded bg-white/[0.06] border border-white/15 text-[#ded8ce]">
-                            {lead.equipped_badge}
+                        {/* Name with equipped name style + @username */}
+                        <div className="min-w-0 flex flex-col">
+                          <div className="flex items-center gap-1.5 min-w-0">
+                            <span className={`truncate font-medium ${lead.equipped_name_style || 'text-white'}`}>
+                              {lead.display_name || lead.nickname}
+                            </span>
+                            {lead.equipped_badge && (
+                              <span className="hidden sm:inline-flex">
+                                {renderEquippedBadge(lead.equipped_badge, lang, true)}
+                              </span>
+                            )}
+                          </div>
+                          <span className="text-[10px] text-[#736c64] truncate">
+                            {formatHandle(lead.nickname)}
                           </span>
-                        )}
+                        </div>
 
                         {Boolean(lead.daily_streak && lead.daily_streak >= 3) && (
-                          <span className="text-[10px] text-[#8e877e] flex items-center gap-0.5">
+                          <span className="text-[10px] text-[#8e877e] flex items-center gap-0.5 shrink-0">
                             <Flame className="w-3 h-3 text-[#821c2c]" />
                             {lead.daily_streak}
                           </span>

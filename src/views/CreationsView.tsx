@@ -3,6 +3,7 @@ import { useI18n } from '../context/I18nContext.js';
 import { useAuth, authFetch } from '../context/AuthContext.js';
 import { Creation } from '../types/index.js';
 import { safeJson } from '../utils/logic.js';
+import { formatHandle } from '../utils/cosmetics.js';
 import {
   Sparkles,
   Heart,
@@ -553,8 +554,11 @@ export const CreationsView: React.FC = () => {
                         className="w-full h-full object-cover"
                       />
                     </div>
-                    <span className={`truncate text-xs ${creation.author_name_style || 'text-[#a39b8b]'}`}>
-                      {creation.author_name}
+                    <span className={`truncate text-xs ${creation.author_name_style || 'text-[#c5beb2]'}`}>
+                      {creation.author_name || creation.author_nickname}
+                    </span>
+                    <span className="truncate text-[10px] text-[#736c64]">
+                      {formatHandle(creation.author_nickname)}
                     </span>
                   </button>
 
@@ -595,10 +599,15 @@ export const CreationsView: React.FC = () => {
                   />
                 </div>
                 <div>
-                  <h3 className={`text-xs font-semibold ${activeCreation.author_name_style || 'text-white'}`}>
-                    {activeCreation.author_name}
-                  </h3>
-                  <span className="text-[10px] font-mono text-[#8e877e]">
+                  <div className="flex items-center gap-1.5">
+                    <h3 className={`text-xs font-semibold ${activeCreation.author_name_style || 'text-white'}`}>
+                      {activeCreation.author_name || activeCreation.author_nickname}
+                    </h3>
+                    <span className="text-[10px] font-mono text-[#8e877e]">
+                      {formatHandle(activeCreation.author_nickname)}
+                    </span>
+                  </div>
+                  <span className="text-[10px] font-mono text-[#736c64]">
                     {formatCreationDate(activeCreation.created_at)}
                   </span>
                 </div>
@@ -784,9 +793,10 @@ export const CreationsView: React.FC = () => {
                                   setActiveCreation(null);
                                   goToProfile(cm.author_nickname);
                                 }}
-                                className={`font-semibold hover:underline cursor-pointer ${cm.author_name_style || 'text-white'}`}
+                                className={`font-semibold hover:underline cursor-pointer flex items-center gap-1.5 ${cm.author_name_style || 'text-white'}`}
                               >
-                                {cm.author_name}
+                                <span>{cm.author_name || cm.author_nickname}</span>
+                                <span className="text-[10px] font-normal text-[#736c64]">{formatHandle(cm.author_nickname)}</span>
                               </button>
                               <div className="flex items-center gap-2">
                                 <span className="text-[10px] text-[#736c64]">
@@ -833,9 +843,10 @@ export const CreationsView: React.FC = () => {
                                         setActiveCreation(null);
                                         goToProfile(rep.author_nickname);
                                       }}
-                                      className={`font-semibold hover:underline cursor-pointer ${rep.author_name_style || 'text-white'}`}
+                                      className={`font-semibold hover:underline cursor-pointer flex items-center gap-1.5 ${rep.author_name_style || 'text-white'}`}
                                     >
-                                      {rep.author_name}
+                                      <span>{rep.author_name || rep.author_nickname}</span>
+                                      <span className="text-[10px] font-normal text-[#736c64]">{formatHandle(rep.author_nickname)}</span>
                                     </button>
                                     <div className="flex items-center gap-2">
                                       <span className="text-[10px] text-[#736c64]">

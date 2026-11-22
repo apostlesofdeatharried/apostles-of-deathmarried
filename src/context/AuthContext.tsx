@@ -12,6 +12,16 @@ export const getStoredToken = (): string => {
   }
 };
 
+export const setStoredToken = (token: string): void => {
+  try {
+    if (token) {
+      localStorage.setItem(TOKEN_KEY, token);
+    } else {
+      localStorage.removeItem(TOKEN_KEY);
+    }
+  } catch {}
+};
+
 export const authFetch = async (url: string, options: RequestInit = {}): Promise<Response> => {
   const token = getStoredToken();
   const headers = new Headers(options.headers || {});
@@ -21,12 +31,20 @@ export const authFetch = async (url: string, options: RequestInit = {}): Promise
   return fetch(url, { credentials: 'include', cache: 'no-store', ...options, headers });
 };
 
+export interface RegisterPayload {
+  username: string;
+  display_name: string;
+  email: string;
+  password: string;
+  confirm_password: string;
+}
+
 interface AuthContextType {
   user: UserProfile | null;
   loading: boolean;
   token: string | null;
-  login: (nickname: string, password: string) => Promise<{ success: boolean; error?: string }>;
-  register: (nickname: string, password: string) => Promise<{ success: boolean; error?: string }>;
+  login: (loginInput: string, password: string) => Promise<{ success: boolean; error?: string }>;
+  register: (payload: RegisterPayload) => Promise<{ success: boolean; error?: string }>;
   bindAdmin: () => Promise<{ success: boolean; error?: string }>;
   logout: () => Promise<void>;
   refresh: () => Promise<void>;
@@ -66,9 +84,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setUser(data.user);
         if (data.user && data.token) {
           setToken(data.token);
-          try {
-            localStorage.setItem(TOKEN_KEY, data.token);
-          } catch {}
+          setStoredToken(data.token);
         }
       } else {
         setUser(null);
@@ -87,52 +103,50 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const saveSession = (authToken?: string, userData?: UserProfile) => {
     if (authToken) {
       setToken(authToken);
-      try {
-        localStorage.setItem(TOKEN_KEY, authToken);
-      } catch {}
+      setStoredToken(authToken);
     }
     if (userData) {
       setUser(userData);
     }
   };
 
-  const login = async (nickname: string, password: string) => {
+  const login = async (loginInput: string, password: string) => {
     try {
       const res = await fetch('/api/auth/login', {
         method: 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ nickname, password }),
+        body: JSON.stringify({ login: loginInput, nickname: loginInput, password }),
       });
-      const data = await safeJson(res, { error: 'Invalid response from server' });
+      const data = await safeJson(res, { error: 'Ошибка ответа сервера.' });
       if (!res.ok) {
-        return { success: false, error: data.error || 'Login failed' };
+        return { success: false, error: data.error || 'Неверный логин или пароль.' };
       }
       saveSession(data.token, data.user);
       setAuthModalOpen(false);
       return { success: true };
     } catch (e: any) {
-      return { success: false, error: e.message || 'Connection error' };
+      return { success: false, error: e.message || 'Ошибка соединения.' };
     }
   };
 
-  const register = async (nickname: string, password: string) => {
+  const register = async (payload: RegisterPayload) => {
     try {
       const res = await fetch('/api/auth/register', {
         method: 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ nickname, password }),
+        body: JSON.stringify(payload),
       });
-      const data = await safeJson(res, { error: 'Invalid response from server' });
+      const data = await safeJson(res, { error: 'Ошибка ответа сервера.' });
       if (!res.ok) {
-        return { success: false, error: data.error || 'Registration failed' };
+        return { success: false, error: data.error || 'Не удалось создать аккаунт.' };
       }
       saveSession(data.token, data.user);
       setAuthModalOpen(false);
       return { success: true };
     } catch (e: any) {
-      return { success: false, error: e.message || 'Connection error' };
+      return { success: false, error: e.message || 'Ошибка соединения.' };
     }
   };
 
@@ -154,9 +168,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     try {
       await authFetch('/api/auth/logout', { method: 'POST' });
     } catch {}
-    try {
-      localStorage.removeItem(TOKEN_KEY);
-    } catch {}
+    setStoredToken('');
     setToken(null);
     setUser(null);
   };
@@ -191,4 +203,3 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 };
 
 export const useAuth = () => useContext(AuthContext);
-

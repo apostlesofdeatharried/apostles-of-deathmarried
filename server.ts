@@ -52,6 +52,21 @@ import {
   type RawQuizQuestion,
   type ValidatedQuizQuestion,
 } from './server/dailyGames.js';
+import {
+  normalizeUsername,
+  validateUsername,
+  validateDisplayName,
+  validateEmail,
+  validateRegistrationPassword,
+  computeLoginLockout,
+  isAccountLocked,
+  canChangeUsername,
+  isSameOriginRequest,
+  evaluateAchievementSlugs,
+  MAX_FEATURED_ACHIEVEMENTS,
+} from './server/accountSecurity.js';
+
+const DUMMY_PASSWORD_HASH = bcrypt.hashSync('apostles_dummy_timing_guard_2026', 12);
 
 const app = express();
 const PORT = resolveServerPort(process.argv, process.env);
@@ -82,6 +97,25 @@ app.use('/api', (_req: Request, res: Response, next: NextFunction) => {
   res.setHeader('Expires', '0');
   res.setHeader('CDN-Cache-Control', 'no-store');
   res.setHeader('Vercel-CDN-Cache-Control', 'no-store');
+  next();
+});
+
+// CSRF / Origin defense-in-depth for cookie-only mutating API requests
+app.use('/api', (req: Request, res: Response, next: NextFunction) => {
+  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
+    const authHeader = req.headers.authorization;
+    const hasBearer = typeof authHeader === 'string' && authHeader.startsWith('Bearer ');
+    const hasCookie = Boolean(req.cookies?.apostle_session);
+    if (!hasBearer && hasCookie) {
+      const host = String(req.headers['x-forwarded-host'] || req.headers.host || '');
+      const origin = typeof req.headers.origin === 'string' ? req.headers.origin : undefined;
+      const referer = typeof req.headers.referer === 'string' ? req.headers.referer : undefined;
+      if (!isSameOriginRequest(origin, referer, host)) {
+        res.status(403).json({ error: 'Cross-origin request rejected.' });
+        return;
+      }
+    }
+  }
   next();
 });
 
@@ -344,6 +378,30 @@ function extractRequestTokens(req: Request): {
   return { bearerToken, cookieToken, candidates };
 }
 
+function parseFeaturedAchievements(raw: unknown): string[] {
+  if (typeof raw !== 'string' || !raw.trim()) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      return parsed.filter((s) => typeof s === 'string').slice(0, MAX_FEATURED_ACHIEVEMENTS);
+    }
+  } catch {}
+  return [];
+}
+
+function hydrateSessionUserRow(row: any) {
+  if (!row) return null;
+  const { password_changed_at, featured_achievements_json, ...safeRow } = row;
+  return {
+    ...safeRow,
+    display_name: safeRow.display_name && String(safeRow.display_name).trim()
+      ? safeRow.display_name
+      : safeRow.nickname,
+    total_xp: safeRow.total_xp ?? safeRow.xp ?? 0,
+    featured_achievements: parseFeaturedAchievements(featured_achievements_json),
+  };
+}
+
 function resolveUserFromToken(token: string) {
   // Path A: Stateless HMAC-SHA256 signed token (survives all Vercel serverless cold starts & multi-instance routing)
   if (isSignedSessionToken(token)) {
@@ -358,8 +416,12 @@ function resolveUserFromToken(token: string) {
     } catch {}
 
     const userRow = db.prepare(`
-      SELECT u.id as user_id, u.id, u.nickname, u.email, u.role_id, u.is_banned,
-             p.display_name, p.avatar_url, p.bio, p.level, p.xp, p.daily_streak
+      SELECT u.id as user_id, u.id, u.nickname, u.email, u.email_verified, u.role_id, u.is_banned,
+             u.password_changed_at, u.created_at as registered_at,
+             p.display_name, p.avatar_url, p.bio, p.custom_status, p.level, p.xp, p.total_xp,
+             p.daily_streak, p.is_private, p.equipped_frame, p.equipped_banner,
+             p.equipped_name_style, p.equipped_badge, p.equipped_theme, p.equipped_effect,
+             p.featured_achievements_json, p.username_changed_at
       FROM users u
       JOIN profiles p ON p.user_id = u.id
       WHERE u.id = ? OR u.nickname = ? COLLATE NOCASE
@@ -370,13 +432,30 @@ function resolveUserFromToken(token: string) {
     if (!userRow || userRow.is_banned) {
       return null;
     }
-    return userRow;
+
+    // Invalidate tokens issued prior to a password reset
+    if (userRow.password_changed_at) {
+      const changedMs = Date.parse(
+        userRow.password_changed_at.endsWith('Z')
+          ? userRow.password_changed_at
+          : `${userRow.password_changed_at.replace(' ', 'T')}Z`
+      );
+      if (!Number.isNaN(changedMs) && payload.iat * 1000 < changedMs - 1000) {
+        return null;
+      }
+    }
+
+    return hydrateSessionUserRow(userRow);
   }
 
   // Path B: Legacy opaque session token stored in SQLite sessions table
   const session = db.prepare(`
-    SELECT s.user_id, s.expires_at, u.id, u.nickname, u.email, u.role_id, u.is_banned,
-           p.display_name, p.avatar_url, p.bio, p.level, p.xp, p.daily_streak
+    SELECT s.user_id, s.expires_at, u.id, u.nickname, u.email, u.email_verified, u.role_id, u.is_banned,
+           u.password_changed_at, u.created_at as registered_at,
+           p.display_name, p.avatar_url, p.bio, p.custom_status, p.level, p.xp, p.total_xp,
+           p.daily_streak, p.is_private, p.equipped_frame, p.equipped_banner,
+           p.equipped_name_style, p.equipped_badge, p.equipped_theme, p.equipped_effect,
+           p.featured_achievements_json, p.username_changed_at
     FROM sessions s
     JOIN users u ON u.id = s.user_id
     JOIN profiles p ON p.user_id = u.id
@@ -386,7 +465,7 @@ function resolveUserFromToken(token: string) {
   if (!session || session.is_banned) {
     return null;
   }
-  return session;
+  return hydrateSessionUserRow(session);
 }
 
 function getSessionUser(req: Request) {
@@ -433,115 +512,213 @@ function requireAdmin(req: AuthRequest, res: Response, next: NextFunction) {
 // ----------------------------------------------------------------------------
 
 app.post('/api/auth/register', authRateLimit, (req: Request, res: Response) => {
-  const { nickname, password } = req.body;
-  const nickCheck = validateNickname(nickname);
-  if (!nickCheck.valid) {
-    res.status(400).json({ error: nickCheck.error });
+  const rawUsername = req.body?.username ?? req.body?.nickname ?? '';
+  const rawDisplayName = req.body?.display_name ?? '';
+  const rawEmail = req.body?.email ?? '';
+  const password = req.body?.password ?? '';
+  const confirmPassword = req.body?.confirm_password;
+
+  const usernameCheck = validateUsername(String(rawUsername));
+  if (!usernameCheck.valid) {
+    res.status(400).json({ error: usernameCheck.error });
     return;
   }
-  const passCheck = validatePassword(password);
+
+  const displayNameCheck = validateDisplayName(String(rawDisplayName || usernameCheck.normalized));
+  if (!displayNameCheck.valid) {
+    res.status(400).json({ error: displayNameCheck.error });
+    return;
+  }
+
+  const emailCheck = validateEmail(String(rawEmail));
+  if (!emailCheck.valid) {
+    res.status(400).json({ error: emailCheck.error });
+    return;
+  }
+
+  const passCheck = validateRegistrationPassword(
+    String(password),
+    confirmPassword !== undefined ? String(confirmPassword) : undefined
+  );
   if (!passCheck.valid) {
     res.status(400).json({ error: passCheck.error });
     return;
   }
 
-  const trimmedNick = nickname.trim();
-  const normalizedNick = trimmedNick.toLowerCase();
-  if (normalizedNick === 'sushkanov097' || normalizedNick === 'deathmarried_admin') {
-    res.status(403).json({ error: 'This administrator nickname is reserved.' });
+  const normalizedUsername = usernameCheck.normalized;
+  if (normalizedUsername === 'sushkanov097' || normalizedUsername === 'deathmarried_admin') {
+    res.status(403).json({ error: 'Этот @username зарезервирован администрацией.' });
     return;
   }
 
-  const existing = db.prepare('SELECT id FROM users WHERE nickname = ?').get(trimmedNick);
-  if (existing) {
-    res.status(409).json({ error: 'Nickname already taken.' });
+  const existingNick = db
+    .prepare('SELECT id FROM users WHERE nickname = ? COLLATE NOCASE')
+    .get(normalizedUsername);
+  if (existingNick) {
+    res.status(409).json({ error: 'Этот @username уже занят. Выберите другой.' });
+    return;
+  }
+
+  const existingEmail = db
+    .prepare('SELECT id FROM users WHERE email = ? COLLATE NOCASE')
+    .get(emailCheck.normalized);
+  if (existingEmail) {
+    res.status(409).json({ error: 'Аккаунт с этим адресом электронной почты уже существует.' });
     return;
   }
 
   const userId = 'usr_' + crypto.randomUUID().slice(0, 8);
-  const hash = bcrypt.hashSync(password, 10);
+  const hash = bcrypt.hashSync(String(password), 12);
   const assignedRole = 'user';
-
-  const insertUser = db.prepare(`
-    INSERT INTO users (id, nickname, password_hash, role_id)
-    VALUES (?, ?, ?, ?)
-  `);
-  const insertProfile = db.prepare(`
-    INSERT INTO profiles (user_id, display_name, avatar_url, bio, level, xp)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `);
+  const defaultAvatar = '/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg';
 
   db.transaction(() => {
-    insertUser.run(userId, trimmedNick, hash, assignedRole);
-    insertProfile.run(
+    db.prepare(`
+      INSERT INTO users (id, nickname, email, email_verified, password_hash, role_id, failed_login_attempts)
+      VALUES (?, ?, ?, 0, ?, ?, 0)
+    `).run(userId, normalizedUsername, emailCheck.normalized, hash, assignedRole);
+
+    // CRITICAL: New accounts always start with strictly 0 XP, 0 total_xp, Level 1, 0 streak
+    db.prepare(`
+      INSERT INTO profiles (user_id, display_name, avatar_url, bio, level, xp, total_xp, daily_streak)
+      VALUES (?, ?, ?, ?, 1, 0, 0, 0)
+    `).run(
       userId,
-      trimmedNick,
-      '/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg',
-      'deathmarried archive member.',
-      1,
-      0
+      displayNameCheck.normalized,
+      defaultAvatar,
+      ''
     );
   })();
 
+  // Award 0-XP registration milestone badge without touching XP
+  unlockAchievement(userId, 'archive_initiate');
+
   const token = issueSessionForUser(res, {
     id: userId,
-    nickname: trimmedNick,
+    nickname: normalizedUsername,
     role_id: assignedRole,
   });
 
-  res.json({
+  res.status(201).json({
     user: {
       id: userId,
-      nickname: trimmedNick,
-      email: null,
+      nickname: normalizedUsername,
+      email: emailCheck.normalized,
+      email_verified: 0,
       role_id: assignedRole,
-      display_name: trimmedNick,
-      avatar_url: '/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg',
-      bio: 'deathmarried archive member.',
+      display_name: displayNameCheck.normalized,
+      avatar_url: defaultAvatar,
+      bio: '',
+      custom_status: null,
       level: 1,
       xp: 0,
+      total_xp: 0,
       daily_streak: 0,
+      equipped_frame: null,
+      equipped_banner: null,
+      equipped_name_style: null,
+      equipped_badge: null,
+      equipped_theme: null,
+      equipped_effect: null,
+      featured_achievements: [],
+      registered_at: new Date().toISOString(),
     },
     token,
   });
 });
 
 app.post('/api/auth/login', authRateLimit, (req: Request, res: Response) => {
-  const { nickname, password } = req.body || {};
-  if (typeof nickname !== 'string' || typeof password !== 'string' || !nickname.trim() || !password) {
-    res.status(400).json({ error: 'Nickname and password are required.' });
+  const rawLogin = req.body?.login ?? req.body?.nickname ?? req.body?.username ?? '';
+  const password = req.body?.password ?? '';
+  if (typeof rawLogin !== 'string' || typeof password !== 'string' || !rawLogin.trim() || !password) {
+    res.status(400).json({ error: 'Введите @username или email и пароль.' });
     return;
   }
+
+  const trimmedInput = rawLogin.trim();
+  const normalizedHandle = normalizeUsername(trimmedInput);
+  const normalizedMail = trimmedInput.toLowerCase();
 
   const user = db.prepare(`
-    SELECT u.id, u.nickname, u.email, u.password_hash, u.role_id, u.is_banned, u.ban_reason,
-           p.display_name, p.avatar_url, p.bio, p.level, p.xp, p.daily_streak
+    SELECT u.id, u.nickname, u.email, u.email_verified, u.password_hash, u.role_id, u.is_banned, u.ban_reason,
+           u.failed_login_attempts, u.locked_until, u.created_at as registered_at,
+           p.display_name, p.avatar_url, p.bio, p.custom_status, p.level, p.xp, p.total_xp,
+           p.daily_streak, p.equipped_frame, p.equipped_banner, p.equipped_name_style,
+           p.equipped_badge, p.equipped_theme, p.equipped_effect, p.featured_achievements_json,
+           p.username_changed_at
     FROM users u
     JOIN profiles p ON p.user_id = u.id
-    WHERE (u.nickname = ? COLLATE NOCASE OR u.email = ? COLLATE NOCASE)
-  `).get(nickname.trim(), nickname.trim()) as any;
+    WHERE u.nickname = ? COLLATE NOCASE
+       OR u.nickname = ? COLLATE NOCASE
+       OR u.email = ? COLLATE NOCASE
+    LIMIT 1
+  `).get(trimmedInput, normalizedHandle, normalizedMail) as any;
 
+  // Anti-enumeration: run constant-cost bcrypt check even when account is not found
   if (!user) {
-    res.status(401).json({ error: 'Invalid nickname or password.' });
+    bcrypt.compareSync(password, DUMMY_PASSWORD_HASH);
+    res.status(401).json({ error: 'Неверный логин или пароль.' });
     return;
   }
 
-  if (user.is_banned) {
-    res.status(403).json({ error: `Account suspended: ${user.ban_reason || 'Violation of sanctuary rules.'}` });
+  // Brute-force lockout check
+  const lockCheck = isAccountLocked(user.locked_until);
+  if (lockCheck.locked) {
+    const mins = Math.max(1, Math.ceil(lockCheck.retryAfterSeconds / 60));
+    res.status(429).json({
+      error: `Слишком много неудачных попыток входа. Попробуйте снова через ${mins} мин.`,
+      retry_after_seconds: lockCheck.retryAfterSeconds,
+    });
     return;
   }
 
   const match = bcrypt.compareSync(password, user.password_hash);
   if (!match) {
-    res.status(401).json({ error: 'Invalid nickname or password.' });
+    const nextAttempts = Number(user.failed_login_attempts || 0) + 1;
+    const lockout = computeLoginLockout(nextAttempts);
+    db.prepare(`
+      UPDATE users
+      SET failed_login_attempts = ?, locked_until = ?, updated_at = datetime('now')
+      WHERE id = ?
+    `).run(nextAttempts, lockout.lockedUntil, user.id);
+
+    if (lockout.shouldLock) {
+      res.status(429).json({
+        error: `Аккаунт временно заблокирован после серии неудачных попыток входа. Повторите через ${lockout.lockoutMinutes} мин.`,
+        retry_after_seconds: lockout.lockoutMinutes * 60,
+      });
+      return;
+    }
+
+    // Generic error message — never reveal whether login existed or password was wrong
+    res.status(401).json({ error: 'Неверный логин или пароль.' });
     return;
   }
 
+  if (user.is_banned) {
+    res.status(403).json({ error: `Аккаунт заблокирован: ${user.ban_reason || 'Нарушение правил сообщества.'}` });
+    return;
+  }
+
+  // Reset failed login counter on successful authentication
+  if (user.failed_login_attempts || user.locked_until) {
+    db.prepare(`
+      UPDATE users SET failed_login_attempts = 0, locked_until = NULL WHERE id = ?
+    `).run(user.id);
+  }
+
   // Auto-elevate sushkanov097 to admin if needed
-  if ((user.nickname.toLowerCase() === 'sushkanov097' || (user.email && user.email.toLowerCase() === 'sushkanov097@gmail.com')) && user.role_id !== 'admin') {
+  if (
+    (user.nickname.toLowerCase() === 'sushkanov097' ||
+      (user.email && user.email.toLowerCase() === 'sushkanov097@gmail.com')) &&
+    user.role_id !== 'admin'
+  ) {
     db.prepare("UPDATE users SET role_id = 'admin', email = 'sushkanov097@gmail.com' WHERE id = ?").run(user.id);
     user.role_id = 'admin';
   }
+
+  // Sync earned achievements server-side (never modifies XP)
+  evaluateUserAchievements(user.id);
 
   const token = issueSessionForUser(res, {
     id: user.id,
@@ -549,8 +726,25 @@ app.post('/api/auth/login', authRateLimit, (req: Request, res: Response) => {
     role_id: user.role_id,
   });
 
-  const { password_hash, ...cleanUser } = user;
-  res.json({ user: cleanUser, token });
+  const {
+    password_hash,
+    failed_login_attempts,
+    locked_until,
+    featured_achievements_json,
+    ...cleanUser
+  } = user;
+
+  res.json({
+    user: {
+      ...cleanUser,
+      display_name: cleanUser.display_name && String(cleanUser.display_name).trim()
+        ? cleanUser.display_name
+        : cleanUser.nickname,
+      total_xp: cleanUser.total_xp ?? cleanUser.xp ?? 0,
+      featured_achievements: parseFeaturedAchievements(featured_achievements_json),
+    },
+    token,
+  });
 });
 
 // Verify/sync admin email binding (restricted strictly to existing administrators)
@@ -644,9 +838,10 @@ app.get('/api/auth/me', (req: Request, res: Response) => {
     });
   }
 
-  // Fetch unlocked achievements
+  // Fetch unlocked achievements with rarity and category
   const achievements = db.prepare(`
-    SELECT a.slug, a.title_ru, a.title_en, a.desc_ru, a.desc_en, a.icon, ua.unlocked_at
+    SELECT a.id, a.slug, a.title_ru, a.title_en, a.desc_ru, a.desc_en,
+           a.condition_ru, a.condition_en, a.category, a.rarity, a.icon, ua.unlocked_at
     FROM user_achievements ua
     JOIN achievements a ON a.id = ua.achievement_id
     WHERE ua.user_id = ?
@@ -1800,13 +1995,8 @@ app.post('/api/games/guess-track/verify', (req: AuthRequest, res: Response) => {
           WHERE user_id = ?
         `).run(xpEarned, nextTotalXp, level, nextStreak, today, user.id);
 
-        // Check achievements
-        const attemptsCount = (db.prepare('SELECT COUNT(*) as c FROM game_attempts WHERE user_id = ?').get(user.id) as any).c;
-        if (attemptsCount >= 1) unlockAchievement(user.id, 'first_blood');
-        if (attemptsCount >= 10) unlockAchievement(user.id, 'initiate_ritual');
-        if (nextStreak >= 3) unlockAchievement(user.id, 'devoted_acolyte');
-        if (nextStreak >= 7) unlockAchievement(user.id, 'eternal_vigil');
-        if (nextTotalXp >= 500) unlockAchievement(user.id, 'dark_apostle');
+        // Evaluate all eligible achievements server-side
+        evaluateUserAchievements(user.id);
       })();
     } catch (err: any) {
       if (String(err?.message || '').includes('UNIQUE')) {
@@ -1985,16 +2175,8 @@ app.post('/api/games/quiz/submit', (req: AuthRequest, res: Response) => {
           WHERE user_id = ?
         `).run(totalXp, nextTotalXp, level, nextStreak, today, user.id);
 
-        // Check achievements
-        unlockAchievement(user.id, 'first_blood');
-        if (nextStreak >= 3) unlockAchievement(user.id, 'devoted_acolyte');
-        if (nextStreak >= 7) unlockAchievement(user.id, 'eternal_vigil');
-        if (correctCount === total && total >= 3) {
-          unlockAchievement(user.id, 'lore_scholar');
-        }
-        if (nextTotalXp >= 500) {
-          unlockAchievement(user.id, 'dark_apostle');
-        }
+        // Evaluate all eligible achievements server-side
+        evaluateUserAchievements(user.id);
       })();
     } catch (err: any) {
       if (String(err?.message || '').includes('UNIQUE')) {
@@ -2017,7 +2199,7 @@ app.post('/api/games/quiz/submit', (req: AuthRequest, res: Response) => {
   });
 });
 
-// Helper for unlocking achievements safely
+// Helper for unlocking achievements safely (idempotent, never grants unrequested XP)
 function unlockAchievement(userId: string, achievementSlug: string) {
   const ach = db.prepare('SELECT id FROM achievements WHERE slug = ?').get(achievementSlug) as any;
   if (!ach) return;
@@ -2025,6 +2207,64 @@ function unlockAchievement(userId: string, achievementSlug: string) {
     INSERT OR IGNORE INTO user_achievements (id, user_id, achievement_id)
     VALUES (?, ?, ?)
   `).run('uach_' + crypto.randomUUID().slice(0, 8), userId, ach.id);
+}
+
+// Authoritative server-side achievement evaluator using real database records
+function evaluateUserAchievements(userId: string): string[] {
+  try {
+    const row = db.prepare(`
+      SELECT
+        p.total_xp, p.level, p.daily_streak, p.bio, p.custom_status,
+        (SELECT COUNT(*) FROM game_attempts WHERE user_id = ?) as games_played,
+        (SELECT COUNT(*) FROM game_attempts WHERE user_id = ? AND game_id = 'guess-track') as guess_played,
+        (SELECT COUNT(*) FROM game_attempts WHERE user_id = ? AND game_id = 'guess-track' AND score > 0) as guess_wins,
+        (SELECT COUNT(*) FROM game_attempts WHERE user_id = ? AND game_id = 'daily-quiz') as quiz_played,
+        (SELECT COUNT(*) FROM game_attempts WHERE user_id = ? AND game_id = 'daily-quiz' AND details_json IS NOT NULL AND json_valid(details_json) = 1 AND CAST(json_extract(details_json, '$.total') AS INTEGER) > 0 AND CAST(json_extract(details_json, '$.correctCount') AS INTEGER) >= CAST(json_extract(details_json, '$.total') AS INTEGER)) as quiz_perfect,
+        (SELECT COUNT(*) FROM user_inventory WHERE user_id = ?) as purchases_count,
+        (SELECT COUNT(*) FROM user_inventory WHERE user_id = ? AND is_equipped = 1) as equipped_count,
+        (SELECT COUNT(*) FROM posts WHERE user_id = ?) as posts_count,
+        (SELECT COUNT(*) FROM comments WHERE user_id = ?) as comments_count,
+        (SELECT COUNT(*) FROM creations WHERE user_id = ?) as creations_count,
+        (SELECT COUNT(*) FROM follows WHERE following_id = ?) as followers_count,
+        (SELECT COUNT(*) FROM follows WHERE follower_id = ?) as following_count
+      FROM profiles p
+      WHERE p.user_id = ?
+    `).get(
+      userId, userId, userId, userId, userId,
+      userId, userId, userId, userId, userId,
+      userId, userId, userId
+    ) as any;
+
+    if (!row) return [];
+
+    const eligibleSlugs = evaluateAchievementSlugs({
+      isRegistered: true,
+      hasCustomProfile: Boolean((row.bio && String(row.bio).trim()) || (row.custom_status && String(row.custom_status).trim())),
+      gamesPlayed: Number(row.games_played || 0),
+      guessTrackPlayed: Number(row.guess_played || 0),
+      guessTrackWins: Number(row.guess_wins || 0),
+      quizPlayed: Number(row.quiz_played || 0),
+      quizPerfectRuns: Number(row.quiz_perfect || 0),
+      dailyStreak: Number(row.daily_streak || 0),
+      totalXp: Number(row.total_xp || 0),
+      level: Number(row.level || 1),
+      purchasesCount: Number(row.purchases_count || 0),
+      equippedItemsCount: Number(row.equipped_count || 0),
+      postsCount: Number(row.posts_count || 0),
+      commentsCount: Number(row.comments_count || 0),
+      creationsCount: Number(row.creations_count || 0),
+      followersCount: Number(row.followers_count || 0),
+      followingCount: Number(row.following_count || 0),
+    });
+
+    for (const slug of eligibleSlugs) {
+      unlockAchievement(userId, slug);
+    }
+    return eligibleSlugs;
+  } catch (err) {
+    console.warn('[Achievements] Failed to evaluate achievements for user:', userId, err);
+    return [];
+  }
 }
 
 // 3. Leaderboard (All-Time, Weekly, Monthly + optional Game filter)
@@ -2141,78 +2381,105 @@ app.get('/api/shop/items', (req: Request, res: Response) => {
   res.json({ items: enriched });
 });
 
+const SHOP_CATEGORY_COLUMN_MAP: Record<string, string> = {
+  frame: 'equipped_frame',
+  banner: 'equipped_banner',
+  name_style: 'equipped_name_style',
+  badge: 'equipped_badge',
+  theme: 'equipped_theme',
+  effect: 'equipped_effect',
+};
+
 app.post('/api/shop/buy', requireAuth, (req: AuthRequest, res: Response) => {
-  const { item_id } = req.body;
-  if (!item_id) {
+  const { item_id } = req.body || {};
+  if (!item_id || typeof item_id !== 'string') {
     res.status(400).json({ error: 'Item ID is required.' });
     return;
   }
 
   const item = db.prepare('SELECT * FROM shop_items WHERE id = ? AND is_active = 1').get(item_id) as any;
   if (!item) {
-    res.status(404).json({ error: 'Item not found in catalog.' });
+    res.status(404).json({ error: 'Предмет не найден в каталоге магазина.' });
     return;
   }
 
-  const user = db.prepare(`
-    SELECT p.xp, p.total_xp FROM profiles p WHERE p.user_id = ?
-  `).get(req.user!.id) as any;
-
-  if (user.xp < item.cost_xp) {
-    res.status(400).json({ error: `Недостаточно XP. Требуется: ${item.cost_xp} XP, у вас: ${user.xp} XP.` });
-    return;
-  }
-
-  const alreadyOwned = db.prepare('SELECT id FROM user_inventory WHERE user_id = ? AND item_id = ?').get(req.user!.id, item_id);
-  if (alreadyOwned) {
-    res.status(400).json({ error: 'Этот предмет уже есть в вашем инвентаре.' });
-    return;
-  }
+  const userId = req.user!.id;
+  let purchaseError: { status: number; message: string } | null = null;
 
   db.transaction(() => {
-    // Deduct spendable XP only (total_xp remains untouched so level never decreases!)
-    db.prepare('UPDATE profiles SET xp = xp - ?, updated_at = datetime(\'now\') WHERE user_id = ?').run(item.cost_xp, req.user!.id);
+    const alreadyOwned = db
+      .prepare('SELECT id FROM user_inventory WHERE user_id = ? AND item_id = ?')
+      .get(userId, item_id);
+    if (alreadyOwned) {
+      purchaseError = { status: 400, message: 'Этот предмет уже есть в вашей коллекции.' };
+      return;
+    }
 
-    // Insert into user_inventory
+    const currentProfile = db
+      .prepare('SELECT xp, total_xp FROM profiles WHERE user_id = ?')
+      .get(userId) as any;
+    if (!currentProfile || currentProfile.xp < item.cost_xp) {
+      purchaseError = {
+        status: 400,
+        message: `Недостаточно XP. Требуется: ${item.cost_xp} XP, доступно: ${currentProfile?.xp ?? 0} XP.`,
+      };
+      return;
+    }
+
+    // Atomic conditional deduction of spendable XP only (total_xp & level never decrease!)
+    const updateRes = db
+      .prepare("UPDATE profiles SET xp = xp - ?, updated_at = datetime('now') WHERE user_id = ? AND xp >= ?")
+      .run(item.cost_xp, userId, item.cost_xp);
+    if (updateRes.changes === 0) {
+      purchaseError = { status: 400, message: 'Недостаточно XP для покупки.' };
+      return;
+    }
+
     db.prepare(`
       INSERT INTO user_inventory (id, user_id, item_id, is_equipped)
       VALUES (?, ?, ?, 0)
-    `).run('inv_' + crypto.randomUUID().slice(0, 8), req.user!.id, item_id);
+    `).run('inv_' + crypto.randomUUID().slice(0, 8), userId, item_id);
 
-    // Record transaction
     db.prepare(`
       INSERT INTO xp_transactions (id, user_id, amount, source, details)
       VALUES (?, ?, ?, 'shop_purchase', ?)
-    `).run('xpt_' + crypto.randomUUID().slice(0, 8), req.user!.id, -item.cost_xp, `Purchased ${item.name_ru}`);
-
-    // Unlock collector achievement
-    unlockAchievement(req.user!.id, 'collector');
+    `).run('xpt_' + crypto.randomUUID().slice(0, 8), userId, -item.cost_xp, `Покупка: ${item.name_ru}`);
   })();
 
-  const updatedProfile = db.prepare('SELECT xp, total_xp, level FROM profiles WHERE user_id = ?').get(req.user!.id) as any;
+  if (purchaseError) {
+    const errObj = purchaseError as { status: number; message: string };
+    res.status(errObj.status).json({ error: errObj.message });
+    return;
+  }
+
+  evaluateUserAchievements(userId);
+
+  const updatedProfile = db.prepare('SELECT xp, total_xp, level FROM profiles WHERE user_id = ?').get(userId) as any;
   res.json({ ok: true, new_xp: updatedProfile.xp, profile: updatedProfile });
 });
 
 app.post('/api/shop/equip', requireAuth, (req: AuthRequest, res: Response) => {
-  const { item_id, equip } = req.body;
-  if (!item_id) {
+  const { item_id, equip } = req.body || {};
+  if (!item_id || typeof item_id !== 'string') {
     res.status(400).json({ error: 'Item ID is required.' });
     return;
   }
 
+  const userId = req.user!.id;
   const owned = db.prepare(`
     SELECT ui.*, si.category, si.preview_value
     FROM user_inventory ui
     JOIN shop_items si ON si.id = ui.item_id
     WHERE ui.user_id = ? AND ui.item_id = ?
-  `).get(req.user!.id, item_id) as any;
+  `).get(userId, item_id) as any;
 
   if (!owned) {
-    res.status(403).json({ error: 'You do not own this item.' });
+    res.status(403).json({ error: 'Этот предмет не принадлежит вам.' });
     return;
   }
 
   const shouldEquip = equip !== undefined ? Boolean(equip) : !owned.is_equipped;
+  const column = SHOP_CATEGORY_COLUMN_MAP[owned.category] || '';
 
   db.transaction(() => {
     if (shouldEquip) {
@@ -2221,38 +2488,27 @@ app.post('/api/shop/equip', requireAuth, (req: AuthRequest, res: Response) => {
         UPDATE user_inventory
         SET is_equipped = 0
         WHERE user_id = ? AND item_id IN (SELECT id FROM shop_items WHERE category = ?)
-      `).run(req.user!.id, owned.category);
+      `).run(userId, owned.category);
 
-      // Equip this item
-      db.prepare('UPDATE user_inventory SET is_equipped = 1 WHERE user_id = ? AND item_id = ?').run(req.user!.id, item_id);
-
-      // Update profile column
-      let column = '';
-      if (owned.category === 'frame') column = 'equipped_frame';
-      else if (owned.category === 'banner') column = 'equipped_banner';
-      else if (owned.category === 'name_style') column = 'equipped_name_style';
-      else if (owned.category === 'badge') column = 'equipped_badge';
+      db.prepare('UPDATE user_inventory SET is_equipped = 1 WHERE user_id = ? AND item_id = ?').run(userId, item_id);
 
       if (column) {
-        db.prepare(`UPDATE profiles SET ${column} = ? WHERE user_id = ?`).run(owned.preview_value, req.user!.id);
+        db.prepare(`UPDATE profiles SET ${column} = ?, updated_at = datetime('now') WHERE user_id = ?`).run(
+          owned.preview_value,
+          userId
+        );
       }
     } else {
-      // Unequip item
-      db.prepare('UPDATE user_inventory SET is_equipped = 0 WHERE user_id = ? AND item_id = ?').run(req.user!.id, item_id);
-
-      let column = '';
-      if (owned.category === 'frame') column = 'equipped_frame';
-      else if (owned.category === 'banner') column = 'equipped_banner';
-      else if (owned.category === 'name_style') column = 'equipped_name_style';
-      else if (owned.category === 'badge') column = 'equipped_badge';
+      db.prepare('UPDATE user_inventory SET is_equipped = 0 WHERE user_id = ? AND item_id = ?').run(userId, item_id);
 
       if (column) {
-        db.prepare(`UPDATE profiles SET ${column} = NULL WHERE user_id = ?`).run(req.user!.id);
+        db.prepare(`UPDATE profiles SET ${column} = NULL, updated_at = datetime('now') WHERE user_id = ?`).run(userId);
       }
     }
   })();
 
-  res.json({ ok: true, is_equipped: shouldEquip });
+  evaluateUserAchievements(userId);
+  res.json({ ok: true, is_equipped: shouldEquip, category: owned.category });
 });
 
 app.get('/api/shop/inventory', requireAuth, (req: AuthRequest, res: Response) => {
@@ -2445,13 +2701,7 @@ app.post('/api/community/posts', requireAuth, (req: AuthRequest, res: Response) 
       VALUES (?, ?, 20, 'community_post', ?)
     `).run('xpt_' + crypto.randomUUID().slice(0, 8), req.user!.id, `Created post: ${cleanTitle.slice(0, 30)}`);
 
-    const postCount = (db.prepare('SELECT COUNT(*) as c FROM posts WHERE user_id = ?').get(req.user!.id) as any).c;
-    if (postCount >= 3) {
-      unlockAchievement(req.user!.id, 'voice_of_abyss');
-    }
-    if (updated.total_xp >= 500) {
-      unlockAchievement(req.user!.id, 'dark_apostle');
-    }
+    evaluateUserAchievements(req.user!.id);
   })();
 
   res.json({ ok: true, id, status });
@@ -2582,9 +2832,7 @@ app.post('/api/community/posts/:id/comments', requireAuth, (req: AuthRequest, re
       VALUES (?, ?, 5, 'comment', 'Posted a comment')
     `).run('xpt_' + crypto.randomUUID().slice(0, 8), req.user!.id);
 
-    if (updated.total_xp >= 500) {
-      unlockAchievement(req.user!.id, 'dark_apostle');
-    }
+    evaluateUserAchievements(req.user!.id);
   })();
 
   res.json({ ok: true, id });
@@ -2814,9 +3062,7 @@ app.post('/api/creations/:id/comments', requireAuth, (req: AuthRequest, res: Res
       VALUES (?, ?, 5, 'comment', 'Commented on gallery creation')
     `).run('xpt_' + crypto.randomUUID().slice(0, 8), req.user!.id);
 
-    if (updated.total_xp >= 500) {
-      unlockAchievement(req.user!.id, 'dark_apostle');
-    }
+    evaluateUserAchievements(req.user!.id);
   })();
 
   res.json({ ok: true, id });
@@ -2862,10 +3108,7 @@ app.post('/api/creations', requireAuth, (req: AuthRequest, res: Response) => {
       VALUES (?, ?, 50, 'creation_upload', ?)
     `).run('xpt_' + crypto.randomUUID().slice(0, 8), req.user!.id, `Uploaded work: ${cleanTitle.slice(0, 30)}`);
 
-    unlockAchievement(req.user!.id, 'gothic_artisan');
-    if (updated.total_xp >= 500) {
-      unlockAchievement(req.user!.id, 'dark_apostle');
-    }
+    evaluateUserAchievements(req.user!.id);
   })();
 
   res.json({ ok: true, id, status });
@@ -3000,45 +3243,91 @@ app.delete('/api/creations/:id', requireAuth, (req: AuthRequest, res: Response) 
 
 app.get('/api/profiles/:nickname', (req: Request, res: Response) => {
   const currentUser = getSessionUser(req);
+  const rawLookup = String(req.params.nickname || '').trim();
+  const cleanLookup = normalizeUsername(rawLookup);
+
   const profile = db.prepare(`
-    SELECT u.id, u.nickname, u.role_id, u.is_banned, u.created_at as registered_at,
+    SELECT u.id, u.nickname, u.email, u.email_verified, u.role_id, u.is_banned, u.created_at as registered_at,
            p.display_name, p.avatar_url, p.bio, p.level, p.xp, p.total_xp, p.daily_streak, p.is_private,
-           p.custom_status, p.equipped_frame, p.equipped_banner, p.equipped_name_style, p.equipped_badge
+           p.custom_status, p.equipped_frame, p.equipped_banner, p.equipped_name_style, p.equipped_badge,
+           p.equipped_theme, p.equipped_effect, p.featured_achievements_json, p.username_changed_at
     FROM users u
     JOIN profiles p ON p.user_id = u.id
-    WHERE u.nickname = ? COLLATE NOCASE
-  `).get(req.params.nickname) as any;
+    WHERE u.nickname = ? COLLATE NOCASE OR u.nickname = ? COLLATE NOCASE
+    LIMIT 1
+  `).get(rawLookup, cleanLookup) as any;
 
   if (!profile) {
-    res.status(404).json({ error: 'Profile not found' });
+    res.status(404).json({ error: 'Профиль не найден.' });
     return;
   }
 
-  // Follower counts
+  const isOwnProfile = Boolean(currentUser && currentUser.id === profile.id);
+
+  // Detailed counts & game stats
   const counts = db.prepare(`
     SELECT
       (SELECT COUNT(*) FROM follows WHERE following_id = ?) as followers_count,
       (SELECT COUNT(*) FROM follows WHERE follower_id = ?) as following_count,
       (SELECT COUNT(*) FROM posts WHERE user_id = ?) as posts_count,
       (SELECT COUNT(*) FROM creations WHERE user_id = ?) as creations_count,
-      (SELECT COUNT(*) FROM game_attempts WHERE user_id = ?) as games_played
-  `).get(profile.id, profile.id, profile.id, profile.id, profile.id) as any;
+      (SELECT COUNT(*) FROM comments WHERE user_id = ?) as comments_count,
+      (SELECT COUNT(*) FROM game_attempts WHERE user_id = ?) as games_played,
+      (SELECT COUNT(*) FROM game_attempts WHERE user_id = ? AND game_id = 'guess-track') as guess_track_played,
+      (SELECT COUNT(*) FROM game_attempts WHERE user_id = ? AND game_id = 'guess-track' AND score > 0) as guess_track_wins,
+      (SELECT COUNT(*) FROM game_attempts WHERE user_id = ? AND game_id = 'daily-quiz') as quiz_played,
+      (SELECT COUNT(*) FROM game_attempts WHERE user_id = ? AND game_id = 'daily-quiz' AND details_json IS NOT NULL AND json_valid(details_json) = 1 AND CAST(json_extract(details_json, '$.total') AS INTEGER) > 0 AND CAST(json_extract(details_json, '$.correctCount') AS INTEGER) >= CAST(json_extract(details_json, '$.total') AS INTEGER)) as quiz_perfect_runs,
+      (SELECT COALESCE(MAX(score), 0) FROM game_attempts WHERE user_id = ? AND game_id = 'daily-quiz') as quiz_best_score
+  `).get(
+    profile.id, profile.id, profile.id, profile.id, profile.id,
+    profile.id, profile.id, profile.id, profile.id, profile.id, profile.id
+  ) as any;
 
   // Is following?
   let isFollowing = false;
   if (currentUser && currentUser.id !== profile.id) {
-    const f = db.prepare('SELECT id FROM follows WHERE follower_id = ? AND following_id = ?').get(currentUser.id, profile.id);
+    const f = db
+      .prepare('SELECT id FROM follows WHERE follower_id = ? AND following_id = ?')
+      .get(currentUser.id, profile.id);
     isFollowing = Boolean(f);
   }
 
-  // Achievements
-  const achievements = db.prepare(`
-    SELECT a.slug, a.title_ru, a.title_en, a.desc_ru, a.desc_en, a.icon, ua.unlocked_at
+  // Unlocked achievements
+  const unlockedRows = db.prepare(`
+    SELECT a.id, a.slug, a.title_ru, a.title_en, a.desc_ru, a.desc_en,
+           a.condition_ru, a.condition_en, a.category, a.rarity, a.icon, ua.unlocked_at
     FROM user_achievements ua
     JOIN achievements a ON a.id = ua.achievement_id
     WHERE ua.user_id = ?
     ORDER BY ua.unlocked_at DESC
-  `).all(profile.id);
+  `).all(profile.id) as any[];
+
+  const unlockedMap = new Map<string, string>();
+  for (const row of unlockedRows) {
+    unlockedMap.set(row.slug, row.unlocked_at);
+  }
+
+  // Full achievements catalog (unlocked + locked with conditions & rarities)
+  const allAchievementsCatalog = db.prepare(`
+    SELECT id, slug, title_ru, title_en, desc_ru, desc_en, condition_ru, condition_en, category, rarity, icon
+    FROM achievements
+    ORDER BY CASE rarity WHEN 'legendary' THEN 1 WHEN 'epic' THEN 2 WHEN 'rare' THEN 3 ELSE 4 END, title_ru ASC
+  `).all() as any[];
+
+  const allAchievements = allAchievementsCatalog.map((a) => ({
+    ...a,
+    is_unlocked: unlockedMap.has(a.slug),
+    unlocked_at: unlockedMap.get(a.slug) || null,
+  }));
+
+  // Featured showcase achievements (verified to be unlocked by this user)
+  const savedFeatured = parseFeaturedAchievements(profile.featured_achievements_json);
+  const validFeaturedSlugs = savedFeatured.filter((slug) => unlockedMap.has(slug));
+  const featuredAchievements = validFeaturedSlugs.length > 0
+    ? validFeaturedSlugs
+        .map((slug) => allAchievements.find((a) => a.slug === slug))
+        .filter(Boolean)
+    : unlockedRows.slice(0, 3);
 
   // User's recent creations and posts
   const recentCreations = db.prepare(`
@@ -3053,13 +3342,13 @@ app.get('/api/profiles/:nickname', (req: Request, res: Response) => {
     ORDER BY p.created_at DESC LIMIT 6
   `).all(profile.id, currentUser?.id || '');
 
-  // User inventory
+  // User inventory (collection)
   const inventory = db.prepare(`
-    SELECT ui.*, si.name_ru, si.name_en, si.category, si.preview_value, si.rarity
+    SELECT ui.*, si.name_ru, si.name_en, si.description_ru, si.description_en, si.category, si.preview_value, si.rarity
     FROM user_inventory ui
     JOIN shop_items si ON si.id = ui.item_id
     WHERE ui.user_id = ?
-    ORDER BY ui.purchased_at DESC
+    ORDER BY ui.is_equipped DESC, ui.purchased_at DESC
   `).all(profile.id);
 
   // User's favorite creations
@@ -3074,12 +3363,32 @@ app.get('/api/profiles/:nickname', (req: Request, res: Response) => {
     LIMIT 12
   `).all(profile.id);
 
+  // Privacy: never leak email or username cooldown metadata to other users
+  const { email, email_verified, featured_achievements_json, username_changed_at, ...publicProfile } = profile;
+  const usernameCooldown = isOwnProfile ? canChangeUsername(username_changed_at) : null;
+
   res.json({
     profile: {
-      ...profile,
+      ...publicProfile,
+      display_name: publicProfile.display_name && String(publicProfile.display_name).trim()
+        ? publicProfile.display_name
+        : publicProfile.nickname,
+      total_xp: publicProfile.total_xp ?? publicProfile.xp ?? 0,
+      ...(isOwnProfile
+        ? {
+            email: email || null,
+            email_verified: Number(email_verified || 0),
+            username_change_allowed: usernameCooldown?.allowed ?? true,
+            username_next_allowed_at: usernameCooldown?.nextAllowedAt ?? null,
+            username_cooldown_days: usernameCooldown?.remainingDays ?? 0,
+          }
+        : {}),
       ...counts,
       isFollowing,
-      achievements,
+      achievements: unlockedRows,
+      allAchievements,
+      featuredAchievements,
+      featured_achievements: validFeaturedSlugs,
       recentCreations,
       recentPosts,
       favoriteCreations,
@@ -3089,25 +3398,33 @@ app.get('/api/profiles/:nickname', (req: Request, res: Response) => {
 });
 
 app.get('/api/profiles/:nickname/history', (req: Request, res: Response) => {
-  const user = db.prepare('SELECT id FROM users WHERE nickname = ? COLLATE NOCASE').get(req.params.nickname) as any;
+  const rawLookup = String(req.params.nickname || '').trim();
+  const cleanLookup = normalizeUsername(rawLookup);
+  const user = db
+    .prepare('SELECT id FROM users WHERE nickname = ? COLLATE NOCASE OR nickname = ? COLLATE NOCASE')
+    .get(rawLookup, cleanLookup) as any;
   if (!user) {
     res.status(404).json({ error: 'User not found' });
     return;
   }
 
   const xpTransactions = db.prepare(`
-    SELECT * FROM xp_transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 20
+    SELECT * FROM xp_transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 25
   `).all(user.id);
 
   const gameAttempts = db.prepare(`
-    SELECT * FROM game_attempts WHERE user_id = ? ORDER BY created_at DESC LIMIT 20
+    SELECT * FROM game_attempts WHERE user_id = ? ORDER BY created_at DESC LIMIT 25
   `).all(user.id);
 
   res.json({ xpTransactions, gameAttempts });
 });
 
 app.post('/api/profiles/:nickname/follow', requireAuth, (req: AuthRequest, res: Response) => {
-  const target = db.prepare('SELECT id FROM users WHERE nickname = ? COLLATE NOCASE').get(req.params.nickname) as any;
+  const rawLookup = String(req.params.nickname || '').trim();
+  const cleanLookup = normalizeUsername(rawLookup);
+  const target = db
+    .prepare('SELECT id FROM users WHERE nickname = ? COLLATE NOCASE OR nickname = ? COLLATE NOCASE')
+    .get(rawLookup, cleanLookup) as any;
   if (!target) {
     res.status(404).json({ error: 'Target user not found' });
     return;
@@ -3127,35 +3444,154 @@ app.post('/api/profiles/:nickname/follow', requireAuth, (req: AuthRequest, res: 
       req.user!.id,
       target.id
     );
+    evaluateUserAchievements(req.user!.id);
+    evaluateUserAchievements(target.id);
     res.json({ following: true });
   }
 });
 
 app.put('/api/profiles/me', requireAuth, (req: AuthRequest, res: Response) => {
-  const { display_name, bio, avatar_url, is_private, custom_status } = req.body;
+  const userId = req.user!.id;
+  const {
+    display_name,
+    bio,
+    avatar_url,
+    is_private,
+    custom_status,
+    featured_achievements,
+    username,
+  } = req.body || {};
+
+  let nextDisplayName: string | null = null;
+  if (display_name !== undefined) {
+    const check = validateDisplayName(String(display_name));
+    if (!check.valid) {
+      res.status(400).json({ error: check.error });
+      return;
+    }
+    nextDisplayName = check.normalized;
+  }
+
   if (avatar_url && !isSafeMediaUrl(String(avatar_url))) {
-    res.status(400).json({ error: 'Invalid avatar URL.' });
+    res.status(400).json({ error: 'Некорректная ссылка на аватар.' });
     return;
   }
-  db.prepare(`
-    UPDATE profiles SET
-      display_name = COALESCE(?, display_name),
-      bio = COALESCE(?, bio),
-      avatar_url = COALESCE(?, avatar_url),
-      is_private = COALESCE(?, is_private),
-      custom_status = COALESCE(?, custom_status),
-      updated_at = datetime('now')
-    WHERE user_id = ?
-  `).run(
-    display_name !== undefined ? String(display_name).trim().slice(0, 60) : null,
-    bio !== undefined ? String(bio).slice(0, 500) : null,
-    avatar_url !== undefined ? (avatar_url ? String(avatar_url).trim() : null) : null,
-    is_private !== undefined ? (is_private ? 1 : 0) : null,
-    custom_status !== undefined ? String(custom_status).slice(0, 120) : null,
-    req.user!.id
-  );
 
-  res.json({ ok: true });
+  let nextFeaturedJson: string | null = null;
+  if (featured_achievements !== undefined) {
+    if (!Array.isArray(featured_achievements)) {
+      res.status(400).json({ error: 'featured_achievements must be an array.' });
+      return;
+    }
+    // Verify user actually unlocked every selected showcase achievement
+    const unlockedSlugs = new Set(
+      (
+        db
+          .prepare(`
+            SELECT a.slug FROM user_achievements ua
+            JOIN achievements a ON a.id = ua.achievement_id
+            WHERE ua.user_id = ?
+          `)
+          .all(userId) as any[]
+      ).map((r) => r.slug)
+    );
+    const cleaned = featured_achievements
+      .filter((s) => typeof s === 'string' && unlockedSlugs.has(s))
+      .slice(0, MAX_FEATURED_ACHIEVEMENTS);
+    nextFeaturedJson = JSON.stringify(Array.from(new Set(cleaned)));
+  }
+
+  // Optional controlled @username change with uniqueness + 14-day cooldown
+  let changedUsername: string | null = null;
+  if (username !== undefined && typeof username === 'string' && username.trim()) {
+    const currentRow = db
+      .prepare(`
+        SELECT u.nickname, u.role_id, p.username_changed_at
+        FROM users u
+        JOIN profiles p ON p.user_id = u.id
+        WHERE u.id = ?
+      `)
+      .get(userId) as any;
+
+    const uCheck = validateUsername(username);
+    if (!uCheck.valid) {
+      res.status(400).json({ error: uCheck.error });
+      return;
+    }
+
+    if (currentRow && uCheck.normalized !== String(currentRow.nickname).toLowerCase()) {
+      const isMaster = String(currentRow.nickname).toLowerCase() === 'sushkanov097';
+      if (isMaster) {
+        res.status(403).json({ error: 'Главный @username администратора нельзя изменить.' });
+        return;
+      }
+
+      const cooldown = canChangeUsername(currentRow.username_changed_at);
+      if (!cooldown.allowed) {
+        res.status(429).json({
+          error: `Сменить @username можно раз в 14 дней. Осталось дней: ${cooldown.remainingDays}.`,
+        });
+        return;
+      }
+
+      const collision = db
+        .prepare('SELECT id FROM users WHERE nickname = ? COLLATE NOCASE AND id != ?')
+        .get(uCheck.normalized, userId);
+      if (collision) {
+        res.status(409).json({ error: 'Этот @username уже занят другим пользователем.' });
+        return;
+      }
+
+      changedUsername = uCheck.normalized;
+    }
+  }
+
+  db.transaction(() => {
+    if (changedUsername) {
+      db.prepare("UPDATE users SET nickname = ?, updated_at = datetime('now') WHERE id = ?").run(
+        changedUsername,
+        userId
+      );
+      db.prepare("UPDATE profiles SET username_changed_at = datetime('now') WHERE user_id = ?").run(userId);
+    }
+
+    db.prepare(`
+      UPDATE profiles SET
+        display_name = COALESCE(?, display_name),
+        bio = COALESCE(?, bio),
+        avatar_url = COALESCE(?, avatar_url),
+        is_private = COALESCE(?, is_private),
+        custom_status = COALESCE(?, custom_status),
+        featured_achievements_json = COALESCE(?, featured_achievements_json),
+        updated_at = datetime('now')
+      WHERE user_id = ?
+    `).run(
+      nextDisplayName,
+      bio !== undefined ? String(bio).slice(0, 500) : null,
+      avatar_url !== undefined ? (avatar_url ? String(avatar_url).trim() : null) : null,
+      is_private !== undefined ? (is_private ? 1 : 0) : null,
+      custom_status !== undefined ? String(custom_status).slice(0, 120) : null,
+      nextFeaturedJson,
+      userId
+    );
+  })();
+
+  evaluateUserAchievements(userId);
+
+  let refreshedToken: string | undefined;
+  if (changedUsername) {
+    refreshedToken = issueSessionForUser(res, {
+      id: userId,
+      nickname: changedUsername,
+      role_id: req.user!.role_id,
+    });
+  }
+
+  res.json({
+    ok: true,
+    nickname: changedUsername || req.user!.nickname,
+    ...(refreshedToken ? { token: refreshedToken } : {}),
+  });
 });
 
 // Admin Game Pool management (Automatic audio linking)
@@ -3209,17 +3645,219 @@ app.post('/api/admin/game-tracks/:id/toggle', requireAdminOrMod, (req: AuthReque
 // API: ADMINISTRATION & MODERATION
 // ----------------------------------------------------------------------------
 
-app.get('/api/admin/users', requireAdminOrMod, (_req: Request, res: Response) => {
-  const users = db.prepare(`
-    SELECT u.id, u.nickname, u.email, u.role_id, u.is_banned, u.ban_reason, u.created_at as registered_at,
-           p.display_name, p.level, p.xp,
+app.get('/api/admin/users', requireAdminOrMod, (req: Request, res: Response) => {
+  const rawSearch = String(req.query.search || '').trim();
+  const cleanSearch = normalizeUsername(rawSearch);
+  const likeParam = `%${rawSearch}%`;
+  const cleanLike = `%${cleanSearch}%`;
+
+  const users = rawSearch
+    ? db.prepare(`
+        SELECT u.id, u.nickname, u.email, u.email_verified, u.role_id, u.is_banned, u.ban_reason,
+               u.failed_login_attempts, u.locked_until, u.created_at as registered_at,
+               p.display_name, p.avatar_url, p.level, p.xp, p.total_xp, p.daily_streak,
+               (SELECT COUNT(*) FROM posts WHERE user_id = u.id) as posts_count,
+               (SELECT COUNT(*) FROM creations WHERE user_id = u.id) as creations_count,
+               (SELECT COUNT(*) FROM game_attempts WHERE user_id = u.id) as games_played,
+               (SELECT COUNT(*) FROM user_achievements WHERE user_id = u.id) as achievements_count,
+               (SELECT COUNT(*) FROM user_inventory WHERE user_id = u.id) as inventory_count
+        FROM users u
+        JOIN profiles p ON p.user_id = u.id
+        WHERE u.nickname LIKE ? COLLATE NOCASE
+           OR u.nickname LIKE ? COLLATE NOCASE
+           OR p.display_name LIKE ? COLLATE NOCASE
+           OR COALESCE(u.email, '') LIKE ? COLLATE NOCASE
+        ORDER BY u.created_at DESC
+      `).all(likeParam, cleanLike, likeParam, likeParam)
+    : db.prepare(`
+        SELECT u.id, u.nickname, u.email, u.email_verified, u.role_id, u.is_banned, u.ban_reason,
+               u.failed_login_attempts, u.locked_until, u.created_at as registered_at,
+               p.display_name, p.avatar_url, p.level, p.xp, p.total_xp, p.daily_streak,
+               (SELECT COUNT(*) FROM posts WHERE user_id = u.id) as posts_count,
+               (SELECT COUNT(*) FROM creations WHERE user_id = u.id) as creations_count,
+               (SELECT COUNT(*) FROM game_attempts WHERE user_id = u.id) as games_played,
+               (SELECT COUNT(*) FROM user_achievements WHERE user_id = u.id) as achievements_count,
+               (SELECT COUNT(*) FROM user_inventory WHERE user_id = u.id) as inventory_count
+        FROM users u
+        JOIN profiles p ON p.user_id = u.id
+        ORDER BY u.created_at DESC
+      `).all();
+  res.json({ users });
+});
+
+app.get('/api/admin/users/:id/details', requireAdminOrMod, (req: Request, res: Response) => {
+  const userId = req.params.id;
+  const target = db.prepare(`
+    SELECT u.id, u.nickname, u.email, u.email_verified, u.role_id, u.is_banned, u.ban_reason,
+           u.failed_login_attempts, u.locked_until, u.created_at as registered_at,
+           p.display_name, p.avatar_url, p.bio, p.custom_status, p.level, p.xp, p.total_xp, p.daily_streak,
+           p.equipped_frame, p.equipped_banner, p.equipped_name_style, p.equipped_badge,
+           p.equipped_theme, p.equipped_effect,
+           (SELECT COUNT(*) FROM game_attempts WHERE user_id = u.id) as games_played,
+           (SELECT COUNT(*) FROM game_attempts WHERE user_id = u.id AND game_id = 'guess-track' AND score > 0) as guess_track_wins,
+           (SELECT COUNT(*) FROM game_attempts WHERE user_id = u.id AND game_id = 'daily-quiz') as quiz_played,
            (SELECT COUNT(*) FROM posts WHERE user_id = u.id) as posts_count,
            (SELECT COUNT(*) FROM creations WHERE user_id = u.id) as creations_count
     FROM users u
     JOIN profiles p ON p.user_id = u.id
-    ORDER BY u.created_at DESC
-  `).all();
-  res.json({ users });
+    WHERE u.id = ?
+  `).get(userId) as any;
+
+  if (!target) {
+    res.status(404).json({ error: 'Пользователь не найден.' });
+    return;
+  }
+
+  const unlockedAchIds = new Set(
+    (db.prepare('SELECT achievement_id FROM user_achievements WHERE user_id = ?').all(userId) as any[]).map(
+      (r) => r.achievement_id
+    )
+  );
+  const achievements = (
+    db.prepare('SELECT id, slug, title_ru, title_en, category, rarity, icon FROM achievements ORDER BY category ASC, rarity ASC').all() as any[]
+  ).map((a) => ({
+    ...a,
+    is_unlocked: unlockedAchIds.has(a.id),
+  }));
+
+  const ownedItemsMap = new Map<string, boolean>();
+  for (const row of db.prepare('SELECT item_id, is_equipped FROM user_inventory WHERE user_id = ?').all(userId) as any[]) {
+    ownedItemsMap.set(row.item_id, Boolean(row.is_equipped));
+  }
+  const items = (
+    db.prepare('SELECT id, name_ru, name_en, category, cost_xp, rarity FROM shop_items WHERE is_active = 1 ORDER BY category ASC, cost_xp ASC').all() as any[]
+  ).map((it) => ({
+    ...it,
+    is_owned: ownedItemsMap.has(it.id),
+    is_equipped: ownedItemsMap.get(it.id) || false,
+  }));
+
+  res.json({ user: target, achievements, items });
+});
+
+app.post('/api/admin/users/:id/reset-password', requireAdmin, (req: AuthRequest, res: Response) => {
+  const adminId = req.user!.id;
+  const targetId = req.params.id;
+  const { new_password } = req.body || {};
+
+  const passCheck = validateRegistrationPassword(String(new_password || ''));
+  if (!passCheck.valid) {
+    res.status(400).json({ error: passCheck.error });
+    return;
+  }
+
+  const targetUser = db.prepare('SELECT id, nickname, email, role_id FROM users WHERE id = ?').get(targetId) as any;
+  if (!targetUser) {
+    res.status(404).json({ error: 'Пользователь не найден.' });
+    return;
+  }
+
+  const isTargetMaster =
+    String(targetUser.nickname || '').toLowerCase() === 'sushkanov097' ||
+    String(targetUser.email || '').toLowerCase() === 'sushkanov097@gmail.com';
+  if (isTargetMaster && targetUser.id !== adminId) {
+    res.status(403).json({ error: 'Пароль главного администратора нельзя сбросить из другого аккаунта.' });
+    return;
+  }
+
+  const nextHash = bcrypt.hashSync(String(new_password), 12);
+  const nowIso = new Date().toISOString();
+
+  db.transaction(() => {
+    db.prepare(`
+      UPDATE users
+      SET password_hash = ?,
+          failed_login_attempts = 0,
+          locked_until = NULL,
+          password_changed_at = ?,
+          updated_at = datetime('now')
+      WHERE id = ?
+    `).run(nextHash, nowIso, targetId);
+
+    // Revoke all active sessions for the target user
+    db.prepare('DELETE FROM sessions WHERE user_id = ?').run(targetId);
+
+    // Audit log (never stores plaintext password!)
+    db.prepare(`
+      INSERT INTO moderation_actions (id, moderator_id, target_user_id, action_type, details)
+      VALUES (?, ?, ?, 'password_reset', ?)
+    `).run(
+      'mod_' + crypto.randomUUID().slice(0, 8),
+      adminId,
+      targetId,
+      `Admin password reset for @${targetUser.nickname}`
+    );
+  })();
+
+  res.json({
+    ok: true,
+    message: `Новый пароль для @${targetUser.nickname} установлен. Предыдущие сессии завершены.`,
+  });
+});
+
+app.post('/api/admin/users/:id/achievements', requireAdmin, (req: AuthRequest, res: Response) => {
+  const targetId = req.params.id;
+  const { achievement_id, action } = req.body || {};
+  if (!achievement_id || (action !== 'grant' && action !== 'revoke')) {
+    res.status(400).json({ error: 'Specify achievement_id and action (grant | revoke).' });
+    return;
+  }
+
+  const target = db.prepare('SELECT id FROM users WHERE id = ?').get(targetId);
+  const ach = db.prepare('SELECT id, slug FROM achievements WHERE id = ?').get(achievement_id) as any;
+  if (!target || !ach) {
+    res.status(404).json({ error: 'Пользователь или достижение не найдены.' });
+    return;
+  }
+
+  if (action === 'grant') {
+    db.prepare(`
+      INSERT OR IGNORE INTO user_achievements (id, user_id, achievement_id)
+      VALUES (?, ?, ?)
+    `).run('uach_' + crypto.randomUUID().slice(0, 8), targetId, ach.id);
+  } else {
+    db.prepare('DELETE FROM user_achievements WHERE user_id = ? AND achievement_id = ?').run(targetId, ach.id);
+  }
+
+  res.json({ ok: true, action, achievement_id: ach.id });
+});
+
+app.post('/api/admin/users/:id/items', requireAdmin, (req: AuthRequest, res: Response) => {
+  const targetId = req.params.id;
+  const { item_id, action } = req.body || {};
+  if (!item_id || (action !== 'grant' && action !== 'revoke')) {
+    res.status(400).json({ error: 'Specify item_id and action (grant | revoke).' });
+    return;
+  }
+
+  const target = db.prepare('SELECT id FROM users WHERE id = ?').get(targetId);
+  const item = db.prepare('SELECT id, category, preview_value FROM shop_items WHERE id = ?').get(item_id) as any;
+  if (!target || !item) {
+    res.status(404).json({ error: 'Пользователь или предмет не найдены.' });
+    return;
+  }
+
+  if (action === 'grant') {
+    db.prepare(`
+      INSERT OR IGNORE INTO user_inventory (id, user_id, item_id, is_equipped)
+      VALUES (?, ?, ?, 0)
+    `).run('inv_' + crypto.randomUUID().slice(0, 8), targetId, item.id);
+  } else {
+    db.transaction(() => {
+      const existing = db
+        .prepare('SELECT is_equipped FROM user_inventory WHERE user_id = ? AND item_id = ?')
+        .get(targetId, item.id) as any;
+      db.prepare('DELETE FROM user_inventory WHERE user_id = ? AND item_id = ?').run(targetId, item.id);
+      if (existing?.is_equipped) {
+        const col = SHOP_CATEGORY_COLUMN_MAP[item.category];
+        if (col) {
+          db.prepare(`UPDATE profiles SET ${col} = NULL WHERE user_id = ?`).run(targetId);
+        }
+      }
+    })();
+  }
+
+  res.json({ ok: true, action, item_id: item.id });
 });
 
 app.post('/api/admin/users/:id/ban', requireAdminOrMod, (req: AuthRequest, res: Response) => {

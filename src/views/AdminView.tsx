@@ -5,6 +5,7 @@ import { useI18n } from '../context/I18nContext.js';
 import { usePlayer } from '../context/PlayerContext.js';
 import { CoverArt } from '../components/CoverArt.js';
 import { formatDuration, safeJson } from '../utils/logic.js';
+import { formatHandle, RARITY_CONFIG, CATEGORY_LABELS } from '../utils/cosmetics.js';
 import {
   Shield,
   Users,
@@ -36,6 +37,11 @@ import {
   Trophy,
   Search,
   Clock,
+  Eye,
+  EyeOff,
+  Award,
+  Package,
+  Sliders,
 } from 'lucide-react';
 
 interface DeleteModalState {
@@ -78,6 +84,19 @@ export const AdminView: React.FC = () => {
   const [moderationSection, setModerationSection] = useState<'posts' | 'creations' | 'reports'>('posts');
   const [moderationStatusFilter, setModerationStatusFilter] = useState<'pending' | 'all'>('pending');
   const [loading, setLoading] = useState(true);
+
+  // User Management Expansion State
+  const [userSearch, setUserSearch] = useState('');
+  const [usersLoading, setUsersLoading] = useState(false);
+  const [resetPassModal, setResetPassModal] = useState<{ id: string; nickname: string; display_name?: string } | null>(null);
+  const [resetPassValue, setResetPassValue] = useState('');
+  const [resetPassConfirm, setResetPassConfirm] = useState('');
+  const [showResetPass, setShowResetPass] = useState(false);
+  const [resettingPass, setResettingPass] = useState(false);
+  const [userDetailsModal, setUserDetailsModal] = useState<{ user: any; achievements: any[]; items: any[] } | null>(null);
+  const [loadingUserDetails, setLoadingUserDetails] = useState(false);
+  const [userDetailsTab, setUserDetailsTab] = useState<'overview' | 'achievements' | 'items'>('overview');
+  const [togglingAssetId, setTogglingAssetId] = useState<string | null>(null);
 
   // Quiz Question Form State
   const [editingQuizId, setEditingQuizId] = useState<string | null>(null);
@@ -241,6 +260,141 @@ export const AdminView: React.FC = () => {
     }, 150);
     return () => window.clearTimeout(timer);
   }, [activeTab, lbTimeframe, lbGameFilter, lbSearch]);
+
+  const fetchAdminUsers = async (searchQuery: string = userSearch) => {
+    setUsersLoading(true);
+    try {
+      const qs = searchQuery.trim() ? `?search=${encodeURIComponent(searchQuery.trim())}` : '';
+      const res = await authFetch(`/api/admin/users${qs}`, { cache: 'no-store' });
+      const data = await safeJson<any>(res, null);
+      if (res.ok && data) {
+        setUsersList(data.users || []);
+      }
+    } catch (e: any) {
+      setErrorMessage(e?.message || 'Failed to load users');
+    } finally {
+      setUsersLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (activeTab !== 'users') return;
+    const timer = window.setTimeout(() => {
+      fetchAdminUsers(userSearch);
+    }, 180);
+    return () => window.clearTimeout(timer);
+  }, [activeTab, userSearch]);
+
+  const openUserDetails = async (userId: string) => {
+    setLoadingUserDetails(true);
+    setUserDetailsTab('overview');
+    try {
+      const res = await authFetch(`/api/admin/users/${userId}/details`, { cache: 'no-store' });
+      const data = await safeJson<any>(res, null);
+      if (res.ok && data?.user) {
+        setUserDetailsModal(data);
+      } else {
+        setErrorMessage(data?.error || (lang === 'ru' ? 'Не удалось загрузить профиль пользователя' : 'Failed to load user details'));
+      }
+    } catch (e: any) {
+      setErrorMessage(e?.message || 'Network error');
+    } finally {
+      setLoadingUserDetails(false);
+    }
+  };
+
+  const handleResetUserPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!resetPassModal || resettingPass) return;
+    if (resetPassValue.length < 8) {
+      setErrorMessage(lang === 'ru' ? 'Новый пароль должен содержать минимум 8 символов.' : 'New password must be at least 8 characters.');
+      return;
+    }
+    if (resetPassValue !== resetPassConfirm) {
+      setErrorMessage(lang === 'ru' ? 'Пароли не совпадают.' : 'Passwords do not match.');
+      return;
+    }
+
+    setResettingPass(true);
+    try {
+      const res = await authFetch(`/api/admin/users/${resetPassModal.id}/reset-password`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ new_password: resetPassValue }),
+      });
+      const data = await safeJson<any>(res, {});
+      if (res.ok) {
+        setStatusMessage(data.message || (lang === 'ru' ? 'Пароль пользователя обновлён.' : 'User password updated.'));
+        setResetPassModal(null);
+        setResetPassValue('');
+        setResetPassConfirm('');
+        setShowResetPass(false);
+        fetchAdminUsers(userSearch);
+      } else {
+        setErrorMessage(data.error || (lang === 'ru' ? 'Не удалось сбросить пароль.' : 'Failed to reset password.'));
+      }
+    } catch (err: any) {
+      setErrorMessage(err?.message || 'Network error');
+    } finally {
+      setResettingPass(false);
+    }
+  };
+
+  const handleToggleUserAchievement = async (targetUserId: string, achievementId: string, currentlyUnlocked: boolean) => {
+    setTogglingAssetId(achievementId);
+    try {
+      const action = currentlyUnlocked ? 'revoke' : 'grant';
+      const res = await authFetch(`/api/admin/users/${targetUserId}/achievements`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ achievement_id: achievementId, action }),
+      });
+      const data = await safeJson<any>(res, {});
+      if (res.ok) {
+        setStatusMessage(
+          action === 'grant'
+            ? lang === 'ru' ? 'Достижение выдано пользователю' : 'Achievement granted'
+            : lang === 'ru' ? 'Достижение отозвано у пользователя' : 'Achievement revoked'
+        );
+        await openUserDetails(targetUserId);
+        fetchAdminUsers(userSearch);
+      } else {
+        setErrorMessage(data.error || 'Failed to update achievement');
+      }
+    } catch (err: any) {
+      setErrorMessage(err?.message || 'Network error');
+    } finally {
+      setTogglingAssetId(null);
+    }
+  };
+
+  const handleToggleUserItem = async (targetUserId: string, itemId: string, currentlyOwned: boolean) => {
+    setTogglingAssetId(itemId);
+    try {
+      const action = currentlyOwned ? 'revoke' : 'grant';
+      const res = await authFetch(`/api/admin/users/${targetUserId}/items`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ item_id: itemId, action }),
+      });
+      const data = await safeJson<any>(res, {});
+      if (res.ok) {
+        setStatusMessage(
+          action === 'grant'
+            ? lang === 'ru' ? 'Предмет выдан в коллекцию пользователя' : 'Item granted'
+            : lang === 'ru' ? 'Предмет удалён из коллекции пользователя' : 'Item revoked'
+        );
+        await openUserDetails(targetUserId);
+        fetchAdminUsers(userSearch);
+      } else {
+        setErrorMessage(data.error || 'Failed to update item');
+      }
+    } catch (err: any) {
+      setErrorMessage(err?.message || 'Network error');
+    } finally {
+      setTogglingAssetId(null);
+    }
+  };
 
   const fetchAdminData = async () => {
     setLoading(true);
@@ -2454,44 +2608,135 @@ export const AdminView: React.FC = () => {
 
           {/* Registered Users List */}
           <div className="bg-[#100f13] border border-white/[0.08] rounded-xl overflow-hidden shadow-xl">
-            <div className="p-4 border-b border-white/[0.06] flex items-center justify-between">
-              <span className="font-mono text-xs uppercase tracking-wider text-bone font-medium">
-                {lang === 'ru' ? 'Зарегистрированные пользователи' : 'Archive Registered Members'} ({usersList.length})
-              </span>
+            <div className="p-4 border-b border-white/[0.06] flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex items-center gap-2.5">
+                <span className="font-mono text-xs uppercase tracking-wider text-bone font-medium">
+                  {lang === 'ru' ? 'Зарегистрированные пользователи' : 'Archive Registered Members'} ({usersList.length})
+                </span>
+                {usersLoading && (
+                  <span className="font-mono text-[10px] text-ash/60 uppercase">
+                    {lang === 'ru' ? 'Поиск...' : 'Searching...'}
+                  </span>
+                )}
+              </div>
+
+              <div className="relative w-full sm:w-80">
+                <Search className="w-3.5 h-3.5 text-ash/60 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <input
+                  type="text"
+                  value={userSearch}
+                  onChange={(e) => setUserSearch(e.target.value)}
+                  placeholder={lang === 'ru' ? 'Поиск по имени, @username или email...' : 'Search by name, @username or email...'}
+                  className="w-full pl-9 pr-8 py-2 bg-[#16151a] border border-white/[0.1] rounded-lg text-xs font-mono text-white placeholder:text-ash/40 focus:outline-none focus:border-[#821c2c]"
+                />
+                {userSearch && (
+                  <button
+                    type="button"
+                    onClick={() => setUserSearch('')}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-ash/60 hover:text-white cursor-pointer"
+                    aria-label="Clear search"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
             </div>
 
             <div className="divide-y divide-white/[0.04]">
+              {usersList.length === 0 && !usersLoading && (
+                <div className="p-10 text-center font-mono text-xs text-ash/60">
+                  {lang === 'ru' ? 'Пользователи по вашему запросу не найдены.' : 'No users match your search.'}
+                </div>
+              )}
+
               {usersList.map((u) => {
                 const isCurrentUser = u.id === user.id;
                 const isMasterAdmin = u.nickname === 'sushkanov097' || u.email === 'sushkanov097@gmail.com';
+                const displayName = u.display_name || u.nickname;
+                const isLocked = Boolean(u.locked_until && new Date(u.locked_until).getTime() > Date.now());
 
                 return (
-                  <div key={u.id} className="p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                    <div className="flex items-center gap-3.5">
-                      <div className="w-10 h-10 rounded-full bg-[#1c1a24] border border-white/10 flex items-center justify-center font-title text-base text-ivory uppercase">
-                        {u.nickname?.[0] || 'A'}
+                  <div key={u.id} className="p-4 flex flex-col lg:flex-row lg:items-center justify-between gap-4 hover:bg-white/[0.015] transition-colors">
+                    <div className="flex items-start sm:items-center gap-3.5 min-w-0">
+                      <div className="w-11 h-11 rounded-full bg-[#1c1a24] border border-white/10 flex items-center justify-center font-title text-base text-ivory uppercase overflow-hidden shrink-0">
+                        {u.avatar_url ? (
+                          <img src={u.avatar_url} alt={displayName} className="w-full h-full object-cover" />
+                        ) : (
+                          displayName?.[0] || 'A'
+                        )}
                       </div>
-                      <div>
-                        <div className="font-mono text-xs text-white font-medium flex items-center gap-2">
-                          <span>{u.nickname}</span>
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="font-serif text-base text-ivory font-medium truncate">
+                            {displayName}
+                          </span>
+                          <span className="font-mono text-[11px] text-ash/75">
+                            {formatHandle(u.nickname)}
+                          </span>
                           {isCurrentUser && (
-                            <span className="text-[9px] px-1.5 py-0.2 rounded bg-white/10 text-bone">
+                            <span className="text-[9px] font-mono uppercase px-1.5 py-0.5 rounded bg-white/10 text-bone">
                               {lang === 'ru' ? 'Вы' : 'You'}
                             </span>
                           )}
                           {isMasterAdmin && (
-                            <span className="text-[9px] px-1.5 py-0.2 rounded bg-[#821c2c]/40 text-[#f5c6cb] border border-[#821c2c]">
+                            <span className="text-[9px] font-mono uppercase px-1.5 py-0.5 rounded bg-[#821c2c]/40 text-[#f5c6cb] border border-[#821c2c]">
                               Master
                             </span>
                           )}
+                          {Boolean(u.is_banned) && (
+                            <span className="text-[9px] font-mono uppercase px-1.5 py-0.5 rounded bg-red-950/70 text-red-300 border border-red-800/70">
+                              {lang === 'ru' ? 'Заблокирован' : 'Banned'}
+                            </span>
+                          )}
+                          {isLocked && (
+                            <span className="text-[9px] font-mono uppercase px-1.5 py-0.5 rounded bg-amber-950/70 text-amber-300 border border-amber-700/60">
+                              {lang === 'ru' ? 'Временная блокировка входа' : 'Login Locked'}
+                            </span>
+                          )}
                         </div>
-                        <div className="font-mono text-[10px] text-ash/60 mt-0.5">
-                          {u.email || '—'} · Level {u.level || 1} ({u.xp || 0} XP) · {formatAdminDate(u.registered_at)}
+                        <div className="font-mono text-[10px] text-ash/65 mt-1 flex flex-wrap items-center gap-x-2.5 gap-y-0.5">
+                          <span>{u.email || '—'}</span>
+                          <span>·</span>
+                          <span>LVL {u.level || 1} ({u.xp || 0} XP / {u.total_xp ?? u.xp ?? 0} Total)</span>
+                          <span>·</span>
+                          <span>{lang === 'ru' ? 'Игр' : 'Games'}: {u.games_played || 0}</span>
+                          <span>·</span>
+                          <span>{lang === 'ru' ? 'Достижений' : 'Ach'}: {u.achievements_count || 0}</span>
+                          <span>·</span>
+                          <span>{lang === 'ru' ? 'Предметов' : 'Items'}: {u.inventory_count || 0}</span>
+                          <span>·</span>
+                          <span>{formatAdminDate(u.registered_at)}</span>
                         </div>
                       </div>
                     </div>
 
-                    <div className="flex items-center gap-3">
+                    <div className="flex flex-wrap items-center gap-2 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => openUserDetails(u.id)}
+                        disabled={loadingUserDetails}
+                        className="font-mono text-[10px] uppercase px-3 py-1.5 rounded-lg border border-white/[0.12] bg-[#16151a] text-bone hover:border-white/30 hover:text-white transition-colors cursor-pointer flex items-center gap-1.5"
+                      >
+                        <Sliders className="w-3 h-3" />
+                        <span>{lang === 'ru' ? 'Профиль и права' : 'Manage'}</span>
+                      </button>
+
+                      {user.role_id === 'admin' && (!isMasterAdmin || isCurrentUser) && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setResetPassModal({ id: u.id, nickname: u.nickname, display_name: displayName });
+                            setResetPassValue('');
+                            setResetPassConfirm('');
+                            setShowResetPass(false);
+                          }}
+                          className="font-mono text-[10px] uppercase px-3 py-1.5 rounded-lg border border-amber-800/70 bg-amber-950/30 text-amber-200 hover:bg-amber-950/60 transition-colors cursor-pointer flex items-center gap-1.5"
+                        >
+                          <Key className="w-3 h-3" />
+                          <span>{lang === 'ru' ? 'Сброс пароля' : 'Reset Password'}</span>
+                        </button>
+                      )}
+
                       <select
                         value={u.role_id}
                         disabled={(isMasterAdmin && !isCurrentUser) || user.role_id !== 'admin'}
@@ -3685,6 +3930,424 @@ export const AdminView: React.FC = () => {
                         : lang === 'ru' ? 'Удалить' : 'Delete'}
                   </span>
                 </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* ==================================================================== */}
+      {/* SAFE ADMIN PASSWORD RESET MODAL (NEVER DISPLAYS OLD PASSWORD) */}
+      {/* ==================================================================== */}
+      <AnimatePresence>
+        {resetPassModal && (
+          <div
+            role="dialog"
+            aria-modal="true"
+            className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          >
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => !resettingPass && setResetPassModal(null)}
+              className="absolute inset-0 bg-black/80 backdrop-blur-sm"
+            />
+
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95, y: 10 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 10 }}
+              className="relative w-full max-w-md bg-[#141217] border border-amber-800/60 rounded-xl p-6 shadow-2xl space-y-5 z-10"
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-full bg-amber-950/60 border border-amber-700/70 flex items-center justify-center text-amber-300 shrink-0">
+                    <Key className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h3 className="font-title text-xl text-ivory uppercase tracking-wide">
+                      {lang === 'ru' ? 'Безопасный сброс пароля' : 'Safe Password Reset'}
+                    </h3>
+                    <div className="font-mono text-[11px] text-ash">
+                      {resetPassModal.display_name || resetPassModal.nickname} ({formatHandle(resetPassModal.nickname)})
+                    </div>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => !resettingPass && setResetPassModal(null)}
+                  className="text-ash hover:text-white cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="p-3 rounded-lg bg-[#1a171f] border border-white/[0.06] text-xs font-sans text-ash/90 leading-relaxed">
+                {lang === 'ru'
+                  ? 'Текущий пароль пользователя хранится в виде криптографического хеша и недоступен для просмотра. Установка нового пароля сразу завершит все активные сессии пользователя и снимет временную блокировку входа.'
+                  : 'The existing password is stored as a one-way hash and cannot be viewed. Setting a new password immediately invalidates all active sessions and clears any login lockout.'}
+              </div>
+
+              <form onSubmit={handleResetUserPassword} className="space-y-4">
+                <div className="space-y-1.5">
+                  <label className="block font-mono text-[10px] uppercase tracking-wider text-bone">
+                    {lang === 'ru' ? 'Новый временный пароль (мин. 8 символов)' : 'New Temporary Password (min. 8 chars)'}
+                  </label>
+                  <div className="relative">
+                    <input
+                      type={showResetPass ? 'text' : 'password'}
+                      value={resetPassValue}
+                      onChange={(e) => setResetPassValue(e.target.value)}
+                      required
+                      minLength={8}
+                      autoComplete="new-password"
+                      placeholder="••••••••"
+                      className="w-full px-3.5 py-2.5 pr-10 bg-[#1a1820] border border-white/10 rounded-lg text-sm font-mono text-white focus:outline-none focus:border-amber-600"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowResetPass((s) => !s)}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-ash hover:text-white cursor-pointer"
+                      aria-label={showResetPass ? 'Hide password' : 'Show password'}
+                    >
+                      {showResetPass ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="space-y-1.5">
+                  <label className="block font-mono text-[10px] uppercase tracking-wider text-bone">
+                    {lang === 'ru' ? 'Повторите новый пароль' : 'Confirm New Password'}
+                  </label>
+                  <input
+                    type={showResetPass ? 'text' : 'password'}
+                    value={resetPassConfirm}
+                    onChange={(e) => setResetPassConfirm(e.target.value)}
+                    required
+                    minLength={8}
+                    autoComplete="new-password"
+                    placeholder="••••••••"
+                    className="w-full px-3.5 py-2.5 bg-[#1a1820] border border-white/10 rounded-lg text-sm font-mono text-white focus:outline-none focus:border-amber-600"
+                  />
+                </div>
+
+                <div className="flex items-center justify-end gap-3 pt-2">
+                  <button
+                    type="button"
+                    disabled={resettingPass}
+                    onClick={() => setResetPassModal(null)}
+                    className="px-4 py-2 font-mono text-xs uppercase tracking-wider text-ash hover:text-white rounded-lg border border-white/10 hover:border-white/20 transition-colors cursor-pointer"
+                  >
+                    {lang === 'ru' ? 'Отмена' : 'Cancel'}
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={resettingPass}
+                    className="px-4 py-2 font-mono text-xs uppercase tracking-wider bg-amber-900/70 hover:bg-amber-800/80 text-amber-100 border border-amber-600/80 rounded-lg transition-all cursor-pointer font-semibold disabled:opacity-50 flex items-center gap-2"
+                  >
+                    <Key className="w-3.5 h-3.5" />
+                    <span>
+                      {resettingPass
+                        ? lang === 'ru' ? 'Обновление...' : 'Updating...'
+                        : lang === 'ru' ? 'Установить пароль' : 'Set Password'}
+                    </span>
+                  </button>
+                </div>
+              </form>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* ==================================================================== */}
+      {/* USER DETAILS, ACHIEVEMENTS & COLLECTION MANAGEMENT MODAL */}
+      {/* ==================================================================== */}
+      <AnimatePresence>
+        {userDetailsModal && (
+          <div
+            role="dialog"
+            aria-modal="true"
+            className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          >
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setUserDetailsModal(null)}
+              className="absolute inset-0 bg-black/85 backdrop-blur-sm"
+            />
+
+            <motion.div
+              initial={{ opacity: 0, scale: 0.96, y: 12 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.96, y: 12 }}
+              className="relative w-full max-w-3xl max-h-[88vh] bg-[#121016] border border-white/15 rounded-xl shadow-2xl flex flex-col overflow-hidden z-10"
+            >
+              {/* Modal Header */}
+              <div className="p-5 border-b border-white/[0.08] flex items-center justify-between gap-4 bg-[#16131c]">
+                <div className="flex items-center gap-3.5 min-w-0">
+                  <div className="w-12 h-12 rounded-full bg-[#221d2b] border border-white/15 flex items-center justify-center font-title text-lg text-ivory uppercase overflow-hidden shrink-0">
+                    {userDetailsModal.user.avatar_url ? (
+                      <img src={userDetailsModal.user.avatar_url} alt="" className="w-full h-full object-cover" />
+                    ) : (
+                      (userDetailsModal.user.display_name || userDetailsModal.user.nickname || 'A')[0]
+                    )}
+                  </div>
+                  <div className="min-w-0">
+                    <h3 className="font-serif text-xl text-ivory truncate">
+                      {userDetailsModal.user.display_name || userDetailsModal.user.nickname}
+                    </h3>
+                    <div className="font-mono text-[11px] text-ash/75 flex flex-wrap items-center gap-2">
+                      <span>{formatHandle(userDetailsModal.user.nickname)}</span>
+                      <span>·</span>
+                      <span>{userDetailsModal.user.email || '—'}</span>
+                      <span>·</span>
+                      <span className="uppercase text-bone">{userDetailsModal.user.role_id}</span>
+                    </div>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setUserDetailsModal(null)}
+                  className="p-1.5 rounded-lg text-ash hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              {/* Sub-tabs */}
+              <div className="px-5 pt-3 border-b border-white/[0.06] flex items-center gap-2 bg-[#141219]">
+                {[
+                  { id: 'overview' as const, label: lang === 'ru' ? 'Обзор профиля' : 'Overview' },
+                  {
+                    id: 'achievements' as const,
+                    label: `${lang === 'ru' ? 'Достижения' : 'Achievements'} (${userDetailsModal.achievements.filter((a) => a.is_unlocked).length}/${userDetailsModal.achievements.length})`,
+                  },
+                  {
+                    id: 'items' as const,
+                    label: `${lang === 'ru' ? 'Коллекция' : 'Shop Items'} (${userDetailsModal.items.filter((i) => i.is_owned).length}/${userDetailsModal.items.length})`,
+                  },
+                ].map((tab) => (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    onClick={() => setUserDetailsTab(tab.id)}
+                    className={`px-3.5 py-2.5 font-mono text-[11px] uppercase tracking-wider border-b-2 transition-colors cursor-pointer ${
+                      userDetailsTab === tab.id
+                        ? 'border-[#821c2c] text-ivory'
+                        : 'border-transparent text-ash hover:text-white'
+                    }`}
+                  >
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
+
+              {/* Modal Body */}
+              <div className="p-5 overflow-y-auto space-y-5 flex-1">
+                {userDetailsTab === 'overview' && (
+                  <div className="space-y-5">
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                      <div className="p-3.5 rounded-lg bg-[#181620] border border-white/[0.07]">
+                        <div className="font-mono text-[10px] uppercase text-ash/70">
+                          {lang === 'ru' ? 'Уровень' : 'Level'}
+                        </div>
+                        <div className="font-title text-2xl text-ivory mt-0.5">
+                          {userDetailsModal.user.level || 1}
+                        </div>
+                      </div>
+                      <div className="p-3.5 rounded-lg bg-[#181620] border border-white/[0.07]">
+                        <div className="font-mono text-[10px] uppercase text-ash/70">
+                          {lang === 'ru' ? 'Баланс XP' : 'Spendable XP'}
+                        </div>
+                        <div className="font-title text-2xl text-amber-300 mt-0.5">
+                          {userDetailsModal.user.xp || 0}
+                        </div>
+                      </div>
+                      <div className="p-3.5 rounded-lg bg-[#181620] border border-white/[0.07]">
+                        <div className="font-mono text-[10px] uppercase text-ash/70">
+                          {lang === 'ru' ? 'Всего XP' : 'Total XP'}
+                        </div>
+                        <div className="font-title text-2xl text-ivory mt-0.5">
+                          {userDetailsModal.user.total_xp ?? userDetailsModal.user.xp ?? 0}
+                        </div>
+                      </div>
+                      <div className="p-3.5 rounded-lg bg-[#181620] border border-white/[0.07]">
+                        <div className="font-mono text-[10px] uppercase text-ash/70">
+                          {lang === 'ru' ? 'Серия дней' : 'Streak'}
+                        </div>
+                        <div className="font-title text-2xl text-ivory mt-0.5">
+                          {userDetailsModal.user.daily_streak || 0}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 font-mono text-xs">
+                      <div className="p-3 rounded-lg bg-[#181620] border border-white/[0.06]">
+                        <div className="text-[10px] text-ash/70 uppercase">{lang === 'ru' ? 'Игр сыграно' : 'Games'}</div>
+                        <div className="text-white mt-1">{userDetailsModal.user.games_played || 0}</div>
+                      </div>
+                      <div className="p-3 rounded-lg bg-[#181620] border border-white/[0.06]">
+                        <div className="text-[10px] text-ash/70 uppercase">{lang === 'ru' ? 'Угадай трек (побед)' : 'Track Wins'}</div>
+                        <div className="text-white mt-1">{userDetailsModal.user.guess_track_wins || 0}</div>
+                      </div>
+                      <div className="p-3 rounded-lg bg-[#181620] border border-white/[0.06]">
+                        <div className="text-[10px] text-ash/70 uppercase">{lang === 'ru' ? 'Тем на форуме' : 'Posts'}</div>
+                        <div className="text-white mt-1">{userDetailsModal.user.posts_count || 0}</div>
+                      </div>
+                      <div className="p-3 rounded-lg bg-[#181620] border border-white/[0.06]">
+                        <div className="text-[10px] text-ash/70 uppercase">{lang === 'ru' ? 'Работ в галерее' : 'Creations'}</div>
+                        <div className="text-white mt-1">{userDetailsModal.user.creations_count || 0}</div>
+                      </div>
+                    </div>
+
+                    <div className="p-4 rounded-lg bg-[#181620] border border-white/[0.06] space-y-2 text-xs font-mono">
+                      <div className="flex justify-between gap-4">
+                        <span className="text-ash/70">{lang === 'ru' ? 'Дата регистрации:' : 'Registered:'}</span>
+                        <span className="text-ivory">{formatAdminDate(userDetailsModal.user.registered_at)}</span>
+                      </div>
+                      <div className="flex justify-between gap-4">
+                        <span className="text-ash/70">{lang === 'ru' ? 'Неудачных попыток входа:' : 'Failed logins:'}</span>
+                        <span className="text-ivory">{userDetailsModal.user.failed_login_attempts || 0}</span>
+                      </div>
+                      {userDetailsModal.user.custom_status && (
+                        <div className="flex justify-between gap-4">
+                          <span className="text-ash/70">{lang === 'ru' ? 'Статус:' : 'Status:'}</span>
+                          <span className="text-ivory text-right">{userDetailsModal.user.custom_status}</span>
+                        </div>
+                      )}
+                      {userDetailsModal.user.bio && (
+                        <div className="pt-2 border-t border-white/[0.06]">
+                          <div className="text-ash/70 mb-1">{lang === 'ru' ? 'О себе:' : 'Bio:'}</div>
+                          <p className="text-bone font-sans text-xs leading-relaxed">{userDetailsModal.user.bio}</p>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {userDetailsTab === 'achievements' && (
+                  <div className="space-y-2.5">
+                    {user.role_id !== 'admin' && (
+                      <div className="p-3 rounded-lg bg-amber-950/30 border border-amber-800/50 font-mono text-[11px] text-amber-200">
+                        {lang === 'ru'
+                          ? 'Выдача и отзыв достижений доступны только главному администратору.'
+                          : 'Granting and revoking achievements is restricted to administrators.'}
+                      </div>
+                    )}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                      {userDetailsModal.achievements.map((ach) => {
+                        const rCfg = RARITY_CONFIG[ach.rarity as keyof typeof RARITY_CONFIG] || RARITY_CONFIG.common;
+                        return (
+                          <div
+                            key={ach.id}
+                            className={`p-3 rounded-lg border flex items-center justify-between gap-3 ${
+                              ach.is_unlocked
+                                ? 'bg-[#1a1622] border-[#821c2c]/50'
+                                : 'bg-[#15131a] border-white/[0.06] opacity-75'
+                            }`}
+                          >
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-2">
+                                <Award className={`w-3.5 h-3.5 shrink-0 ${ach.is_unlocked ? 'text-amber-300' : 'text-ash/50'}`} />
+                                <span className="font-sans text-xs text-ivory font-medium truncate">
+                                  {lang === 'ru' ? ach.title_ru : ach.title_en}
+                                </span>
+                              </div>
+                              <div className="font-mono text-[10px] mt-1 flex items-center gap-2">
+                                <span className={rCfg.textClass}>{lang === 'ru' ? rCfg.labelRu : rCfg.labelEn}</span>
+                                <span className="text-ash/50">·</span>
+                                <span className="text-ash/70">{ach.category}</span>
+                              </div>
+                            </div>
+                            {user.role_id === 'admin' && (
+                              <button
+                                type="button"
+                                disabled={togglingAssetId === ach.id}
+                                onClick={() => handleToggleUserAchievement(userDetailsModal.user.id, ach.id, Boolean(ach.is_unlocked))}
+                                className={`px-2.5 py-1 rounded font-mono text-[10px] uppercase border transition-colors cursor-pointer shrink-0 disabled:opacity-50 ${
+                                  ach.is_unlocked
+                                    ? 'border-red-900/70 text-red-300 hover:bg-red-950/60'
+                                    : 'border-emerald-800/70 text-emerald-300 hover:bg-emerald-950/60'
+                                }`}
+                              >
+                                {ach.is_unlocked
+                                  ? lang === 'ru' ? 'Отозвать' : 'Revoke'
+                                  : lang === 'ru' ? 'Выдать' : 'Grant'}
+                              </button>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {userDetailsTab === 'items' && (
+                  <div className="space-y-2.5">
+                    {user.role_id !== 'admin' && (
+                      <div className="p-3 rounded-lg bg-amber-950/30 border border-amber-800/50 font-mono text-[11px] text-amber-200">
+                        {lang === 'ru'
+                          ? 'Выдача и отзыв предметов кастомизации доступны только администратору.'
+                          : 'Granting and revoking shop items is restricted to administrators.'}
+                      </div>
+                    )}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                      {userDetailsModal.items.map((it) => {
+                        const rCfg = RARITY_CONFIG[it.rarity as keyof typeof RARITY_CONFIG] || RARITY_CONFIG.common;
+                        const catLabel = CATEGORY_LABELS[it.category as keyof typeof CATEGORY_LABELS];
+                        return (
+                          <div
+                            key={it.id}
+                            className={`p-3 rounded-lg border flex items-center justify-between gap-3 ${
+                              it.is_owned
+                                ? 'bg-[#1a1622] border-amber-700/40'
+                                : 'bg-[#15131a] border-white/[0.06] opacity-75'
+                            }`}
+                          >
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-2">
+                                <Package className={`w-3.5 h-3.5 shrink-0 ${it.is_owned ? 'text-amber-300' : 'text-ash/50'}`} />
+                                <span className="font-sans text-xs text-ivory font-medium truncate">
+                                  {lang === 'ru' ? it.name_ru : it.name_en}
+                                </span>
+                                {it.is_equipped && (
+                                  <span className="font-mono text-[9px] uppercase px-1.5 py-0.5 rounded bg-emerald-950/70 text-emerald-300 border border-emerald-800/60">
+                                    {lang === 'ru' ? 'Надето' : 'Equipped'}
+                                  </span>
+                                )}
+                              </div>
+                              <div className="font-mono text-[10px] mt-1 flex items-center gap-2">
+                                <span className={rCfg.textClass}>{lang === 'ru' ? rCfg.labelRu : rCfg.labelEn}</span>
+                                <span className="text-ash/50">·</span>
+                                <span className="text-ash/70">{catLabel ? (lang === 'ru' ? catLabel.ru : catLabel.en) : it.category}</span>
+                                <span className="text-ash/50">·</span>
+                                <span className="text-ash/70">{it.cost_xp} XP</span>
+                              </div>
+                            </div>
+                            {user.role_id === 'admin' && (
+                              <button
+                                type="button"
+                                disabled={togglingAssetId === it.id}
+                                onClick={() => handleToggleUserItem(userDetailsModal.user.id, it.id, Boolean(it.is_owned))}
+                                className={`px-2.5 py-1 rounded font-mono text-[10px] uppercase border transition-colors cursor-pointer shrink-0 disabled:opacity-50 ${
+                                  it.is_owned
+                                    ? 'border-red-900/70 text-red-300 hover:bg-red-950/60'
+                                    : 'border-emerald-800/70 text-emerald-300 hover:bg-emerald-950/60'
+                                }`}
+                              >
+                                {it.is_owned
+                                  ? lang === 'ru' ? 'Отозвать' : 'Revoke'
+                                  : lang === 'ru' ? 'Выдать' : 'Grant'}
+                              </button>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
               </div>
             </motion.div>
           </div>

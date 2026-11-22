@@ -3,6 +3,7 @@ import { useI18n } from '../context/I18nContext.js';
 import { useAuth, authFetch } from '../context/AuthContext.js';
 import { Post, PostCategory, Comment } from '../types/index.js';
 import { safeJson } from '../utils/logic.js';
+import { formatHandle, renderEquippedBadge } from '../utils/cosmetics.js';
 import {
   MessageSquare,
   Flame,
@@ -579,16 +580,15 @@ export const CommunityView: React.FC = () => {
                       onClick={() => goToProfile(activePost.author_nickname)}
                       className={`text-sm font-semibold hover:underline cursor-pointer ${activePost.author_name_style || 'text-white'}`}
                     >
-                      {activePost.author_name}
+                      {activePost.author_name || activePost.author_nickname}
                     </button>
+                    <span className="font-mono text-[10px] text-[#8e877e]">
+                      {formatHandle(activePost.author_nickname)}
+                    </span>
                     <span className="font-mono text-[10px] text-[#8e877e] px-1.5 py-0.5 rounded bg-white/[0.04]">
                       L{activePost.author_level}
                     </span>
-                    {activePost.author_badge && (
-                      <span className="font-mono text-[10px] text-[#ded8ce] px-1.5 py-0.5 rounded bg-white/[0.06] border border-white/10">
-                        {activePost.author_badge}
-                      </span>
-                    )}
+                    {renderEquippedBadge(activePost.author_badge, lang, true)}
                   </div>
                   <div className="font-mono text-xs text-[#736c64] mt-0.5 flex flex-wrap items-center gap-1.5">
                     <span>{formatCommunityDate(activePost.created_at)}</span>
@@ -850,16 +850,15 @@ export const CommunityView: React.FC = () => {
                               onClick={() => goToProfile(cm.author_nickname)}
                               className={`text-xs font-semibold truncate hover:underline cursor-pointer ${cm.author_name_style || 'text-white'}`}
                             >
-                              {cm.author_name}
+                              {cm.author_name || cm.author_nickname}
                             </button>
+                            <span className="font-mono text-[10px] text-[#736c64] hidden sm:inline">
+                              {formatHandle(cm.author_nickname)}
+                            </span>
                             <span className="font-mono text-[10px] text-[#8e877e]">
                               L{cm.author_level}
                             </span>
-                            {cm.author_badge && (
-                              <span className="font-mono text-[10px] text-[#ded8ce] px-1.5 py-0.2 rounded bg-white/[0.05]">
-                                {cm.author_badge}
-                              </span>
-                            )}
+                            {renderEquippedBadge(cm.author_badge, lang, true)}
                           </div>
                           <div className="flex items-center gap-2 shrink-0">
                             <span className="font-mono text-[10px] text-[#736c64]">
@@ -931,8 +930,11 @@ export const CommunityView: React.FC = () => {
                                     onClick={() => goToProfile(reply.author_nickname)}
                                     className={`text-xs font-semibold truncate hover:underline cursor-pointer ${reply.author_name_style || 'text-white'}`}
                                   >
-                                    {reply.author_name}
+                                    {reply.author_name || reply.author_nickname}
                                   </button>
+                                  <span className="font-mono text-[10px] text-[#736c64] hidden sm:inline">
+                                    {formatHandle(reply.author_nickname)}
+                                  </span>
                                   <span className="font-mono text-[10px] text-[#8e877e]">
                                     L{reply.author_level}
                                   </span>
@@ -1163,8 +1165,11 @@ export const CommunityView: React.FC = () => {
                           className="w-full h-full object-cover"
                         />
                       </div>
-                      <span className={post.author_name_style || 'text-[#a39b8b]'}>
-                        {post.author_name}
+                      <span className={post.author_name_style || 'text-[#c5beb2]'}>
+                        {post.author_name || post.author_nickname}
+                      </span>
+                      <span className="text-[10px] text-[#736c64]">
+                        {formatHandle(post.author_nickname)}
                       </span>
                     </button>
                     <span>{formatCommunityDate(post.created_at)}</span>
