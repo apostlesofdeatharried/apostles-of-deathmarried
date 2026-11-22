@@ -18,6 +18,12 @@ import {
   deleteMediaFromSupabase,
 } from './server/cloudSync.js';
 import {
+  signSessionToken,
+  verifySessionToken,
+  isSignedSessionToken,
+  SESSION_TTL_MS,
+} from './server/sessionToken.js';
+import {
   calculateLevelFromXp,
   calculateQuizScore,
   validateNickname,
@@ -60,11 +66,27 @@ app.use(async (req: Request, res: Response, next: NextFunction) => {
       await ensureCloudDatabaseRestored();
     } catch {}
     if (['POST', 'PUT', 'DELETE', 'PATCH'].includes(req.method)) {
-      res.on('finish', () => {
-        if (res.statusCode >= 200 && res.statusCode < 400) {
-          void pushDatabaseBackupNow();
-        }
-      });
+      if (isVercel && isSupabaseConfigured()) {
+        // On Vercel Serverless, flush SQLite snapshot BEFORE ending the response so the container is not frozen mid-upload
+        const originalJson = res.json.bind(res);
+        res.json = ((body: any) => {
+          if (res.statusCode >= 200 && res.statusCode < 400) {
+            pushDatabaseBackupNow()
+              .catch(() => {})
+              .finally(() => {
+                originalJson(body);
+              });
+            return res;
+          }
+          return originalJson(body);
+        }) as Response['json'];
+      } else {
+        res.on('finish', () => {
+          if (res.statusCode >= 200 && res.statusCode < 400) {
+            void pushDatabaseBackupNow();
+          }
+        });
+      }
     }
   }
   next();
@@ -198,16 +220,93 @@ interface AuthRequest extends Request {
   };
 }
 
-function getSessionUser(req: Request) {
-  let token = req.cookies?.apostle_session;
-  if (!token && req.headers.authorization?.startsWith('Bearer ')) {
-    token = req.headers.authorization.slice(7);
-  }
-  if (!token) return null;
+function issueSessionForUser(
+  res: Response,
+  user: { id: string; nickname: string; role_id: string }
+): string {
+  const sid = 'ses_' + crypto.randomUUID().slice(0, 12);
+  const { token, expiresAt } = signSessionToken({
+    sid,
+    uid: user.id,
+    nick: user.nickname,
+    role: user.role_id,
+  });
 
+  try {
+    db.prepare(`
+      INSERT INTO sessions (id, user_id, token, expires_at)
+      VALUES (?, ?, ?, ?)
+    `).run(sid, user.id, token, expiresAt);
+  } catch (err) {
+    console.warn('[Auth] Could not mirror session row in SQLite:', err);
+  }
+
+  res.cookie('apostle_session', token, {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: process.env.NODE_ENV === 'production' || isVercel,
+    path: '/',
+    maxAge: SESSION_TTL_MS,
+  });
+
+  return token;
+}
+
+function extractRequestTokens(req: Request): {
+  bearerToken: string | null;
+  cookieToken: string | null;
+  candidates: string[];
+} {
+  const authHeader = req.headers.authorization;
+  const bearerToken =
+    typeof authHeader === 'string' && authHeader.startsWith('Bearer ')
+      ? authHeader.slice(7).trim() || null
+      : null;
+  const cookieToken =
+    typeof req.cookies?.apostle_session === 'string' && req.cookies.apostle_session.trim()
+      ? req.cookies.apostle_session.trim()
+      : null;
+
+  const candidates: string[] = [];
+  if (bearerToken) candidates.push(bearerToken);
+  if (cookieToken && cookieToken !== bearerToken) candidates.push(cookieToken);
+
+  return { bearerToken, cookieToken, candidates };
+}
+
+function resolveUserFromToken(token: string) {
+  // Path A: Stateless HMAC-SHA256 signed token (survives all Vercel serverless cold starts & multi-instance routing)
+  if (isSignedSessionToken(token)) {
+    const payload = verifySessionToken(token);
+    if (!payload) return null;
+
+    try {
+      const revoked = db
+        .prepare('SELECT 1 FROM revoked_sessions WHERE sid = ?')
+        .get(payload.sid);
+      if (revoked) return null;
+    } catch {}
+
+    const userRow = db.prepare(`
+      SELECT u.id as user_id, u.id, u.nickname, u.email, u.role_id, u.is_banned,
+             p.display_name, p.avatar_url, p.bio, p.level, p.xp, p.daily_streak
+      FROM users u
+      JOIN profiles p ON p.user_id = u.id
+      WHERE u.id = ? OR u.nickname = ? COLLATE NOCASE
+      ORDER BY CASE WHEN u.id = ? THEN 0 ELSE 1 END
+      LIMIT 1
+    `).get(payload.uid, payload.nick, payload.uid) as any;
+
+    if (!userRow || userRow.is_banned) {
+      return null;
+    }
+    return userRow;
+  }
+
+  // Path B: Legacy opaque session token stored in SQLite sessions table
   const session = db.prepare(`
     SELECT s.user_id, s.expires_at, u.id, u.nickname, u.email, u.role_id, u.is_banned,
-           p.display_name, p.avatar_url, p.level, p.xp
+           p.display_name, p.avatar_url, p.bio, p.level, p.xp, p.daily_streak
     FROM sessions s
     JOIN users u ON u.id = s.user_id
     JOIN profiles p ON p.user_id = u.id
@@ -218,6 +317,15 @@ function getSessionUser(req: Request) {
     return null;
   }
   return session;
+}
+
+function getSessionUser(req: Request) {
+  const { candidates } = extractRequestTokens(req);
+  for (const token of candidates) {
+    const resolved = resolveUserFromToken(token);
+    if (resolved) return resolved;
+  }
+  return null;
 }
 
 function requireAuth(req: AuthRequest, res: Response, next: NextFunction) {
@@ -305,19 +413,10 @@ app.post('/api/auth/register', authRateLimit, (req: Request, res: Response) => {
     );
   })();
 
-  const token = crypto.randomBytes(32).toString('hex');
-  const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
-  db.prepare(`
-    INSERT INTO sessions (id, user_id, token, expires_at)
-    VALUES (?, ?, ?, ?)
-  `).run('ses_' + crypto.randomUUID().slice(0, 8), userId, token, expiresAt);
-
-  res.cookie('apostle_session', token, {
-    httpOnly: true,
-    sameSite: 'lax',
-    secure: process.env.NODE_ENV === 'production' || isVercel,
-    path: '/',
-    maxAge: 30 * 24 * 60 * 60 * 1000,
+  const token = issueSessionForUser(res, {
+    id: userId,
+    nickname: trimmedNick,
+    role_id: assignedRole,
   });
 
   res.json({
@@ -374,19 +473,10 @@ app.post('/api/auth/login', authRateLimit, (req: Request, res: Response) => {
     user.role_id = 'admin';
   }
 
-  const token = crypto.randomBytes(32).toString('hex');
-  const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
-  db.prepare(`
-    INSERT INTO sessions (id, user_id, token, expires_at)
-    VALUES (?, ?, ?, ?)
-  `).run('ses_' + crypto.randomUUID().slice(0, 8), user.id, token, expiresAt);
-
-  res.cookie('apostle_session', token, {
-    httpOnly: true,
-    sameSite: 'lax',
-    secure: process.env.NODE_ENV === 'production' || isVercel,
-    path: '/',
-    maxAge: 30 * 24 * 60 * 60 * 1000,
+  const token = issueSessionForUser(res, {
+    id: user.id,
+    nickname: user.nickname,
+    role_id: user.role_id,
   });
 
   const { password_hash, ...cleanUser } = user;
@@ -447,17 +537,20 @@ app.post('/api/admin/delete-file', requireAdminOrMod, async (req: AuthRequest, r
 });
 
 app.post('/api/auth/logout', (req: Request, res: Response) => {
-  const cookieToken = req.cookies?.apostle_session;
-  const authHeader = req.headers.authorization;
-  const bearerToken = typeof authHeader === 'string' && authHeader.startsWith('Bearer ')
-    ? authHeader.slice(7).trim()
-    : null;
-
-  if (cookieToken) {
-    db.prepare('DELETE FROM sessions WHERE token = ?').run(cookieToken);
-  }
-  if (bearerToken && bearerToken !== cookieToken) {
-    db.prepare('DELETE FROM sessions WHERE token = ?').run(bearerToken);
+  const { candidates } = extractRequestTokens(req);
+  for (const token of candidates) {
+    db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+    if (isSignedSessionToken(token)) {
+      const verified = verifySessionToken(token);
+      if (verified) {
+        try {
+          db.prepare(`
+            INSERT OR REPLACE INTO revoked_sessions (sid, expires_at)
+            VALUES (?, ?)
+          `).run(verified.sid, new Date(verified.exp * 1000).toISOString());
+        } catch {}
+      }
+    }
   }
   res.clearCookie('apostle_session', { path: '/' });
   res.json({ ok: true });
@@ -468,6 +561,17 @@ app.get('/api/auth/me', (req: Request, res: Response) => {
   if (!user) {
     res.json({ user: null });
     return;
+  }
+
+  // Upgrade legacy/cookie-only sessions to stateless signed tokens transparently
+  const { bearerToken } = extractRequestTokens(req);
+  let upgradedToken: string | undefined;
+  if (!bearerToken || !isSignedSessionToken(bearerToken)) {
+    upgradedToken = issueSessionForUser(res, {
+      id: user.id,
+      nickname: user.nickname,
+      role_id: user.role_id,
+    });
   }
 
   // Fetch unlocked achievements
@@ -497,6 +601,7 @@ app.get('/api/auth/me', (req: Request, res: Response) => {
       posts_count: counts.posts_count || 0,
       creations_count: counts.creations_count || 0,
     },
+    ...(upgradedToken ? { token: upgradedToken } : {}),
   });
 });
 

@@ -140,6 +140,12 @@ export function initDatabase() {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS revoked_sessions (
+      sid TEXT PRIMARY KEY,
+      expires_at TEXT NOT NULL,
+      revoked_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     CREATE TABLE IF NOT EXISTS albums (
       id TEXT PRIMARY KEY,
       title TEXT NOT NULL,

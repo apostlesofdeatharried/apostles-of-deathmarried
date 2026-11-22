@@ -62,8 +62,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     try {
       const res = await authFetch('/api/auth/me');
       if (res.ok) {
-        const data = await safeJson(res, { user: null });
+        const data = await safeJson<{ user: UserProfile | null; token?: string }>(res, { user: null });
         setUser(data.user);
+        if (data.user && data.token) {
+          setToken(data.token);
+          try {
+            localStorage.setItem(TOKEN_KEY, data.token);
+          } catch {}
+        }
       } else {
         setUser(null);
       }

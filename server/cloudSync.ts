@@ -154,6 +154,7 @@ export async function pushDatabaseBackupNow(): Promise<boolean> {
           'x-upsert': 'true',
         },
         body: new Uint8Array(buffer),
+        signal: AbortSignal.timeout(4000),
       }
     );
     if (res.ok) {
