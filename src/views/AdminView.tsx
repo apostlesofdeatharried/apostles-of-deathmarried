@@ -33,13 +33,17 @@ import {
   Pin,
   Lock,
   Unlock,
+  Trophy,
+  Search,
+  Clock,
 } from 'lucide-react';
 
 interface DeleteModalState {
-  type: 'track' | 'album' | 'single' | 'file' | 'post' | 'creation' | 'quiz';
+  type: 'track' | 'album' | 'single' | 'file' | 'post' | 'creation' | 'quiz' | 'leaderboard_clear' | 'leaderboard_user_reset';
   id: string;
   name: string;
   subtext?: string;
+  scope?: string;
 }
 
 const formatAdminDate = (dateStr?: string) => {
@@ -54,7 +58,7 @@ export const AdminView: React.FC = () => {
   const { t, lang } = useI18n();
   const { playTrack } = usePlayer();
 
-  const [activeTab, setActiveTab] = useState<'discography' | 'singles' | 'media' | 'gametracks' | 'moderation' | 'users' | 'stats'>('discography');
+  const [activeTab, setActiveTab] = useState<'discography' | 'singles' | 'media' | 'gametracks' | 'leaderboard' | 'moderation' | 'users' | 'stats'>('discography');
   const [stats, setStats] = useState<any>(null);
   const [usersList, setUsersList] = useState<any[]>([]);
   const [albumsList, setAlbumsList] = useState<any[]>([]);
@@ -62,6 +66,12 @@ export const AdminView: React.FC = () => {
   const [mediaFilesList, setMediaFilesList] = useState<any[]>([]);
   const [gameTracksList, setGameTracksList] = useState<any[]>([]);
   const [quizQuestionsList, setQuizQuestionsList] = useState<any[]>([]);
+  const [adminLeaderboard, setAdminLeaderboard] = useState<any[]>([]);
+  const [adminLeaderboardSummary, setAdminLeaderboardSummary] = useState<any | null>(null);
+  const [lbTimeframe, setLbTimeframe] = useState<'all' | 'weekly' | 'monthly'>('all');
+  const [lbGameFilter, setLbGameFilter] = useState<'all' | 'guess-track' | 'daily-quiz'>('all');
+  const [lbSearch, setLbSearch] = useState('');
+  const [lbLoading, setLbLoading] = useState(false);
   const [allPostsList, setAllPostsList] = useState<any[]>([]);
   const [allCreationsList, setAllCreationsList] = useState<any[]>([]);
   const [reportsList, setReportsList] = useState<any[]>([]);
@@ -197,11 +207,46 @@ export const AdminView: React.FC = () => {
     }
   }, [errorMessage]);
 
+  const fetchAdminLeaderboard = async (
+    tf: 'all' | 'weekly' | 'monthly' = lbTimeframe,
+    game: 'all' | 'guess-track' | 'daily-quiz' = lbGameFilter,
+    searchQuery: string = lbSearch
+  ) => {
+    setLbLoading(true);
+    try {
+      const qs = new URLSearchParams({
+        timeframe: tf,
+        game,
+        ...(searchQuery.trim() ? { search: searchQuery.trim() } : {}),
+      });
+      const res = await authFetch(`/api/admin/leaderboard?${qs.toString()}`, { cache: 'no-store' });
+      const data = await safeJson<any>(res, null);
+      if (res.ok && data) {
+        setAdminLeaderboard(data.leaders || []);
+        setAdminLeaderboardSummary(data.summary || null);
+      } else if (data?.error) {
+        setErrorMessage(data.error);
+      }
+    } catch (e: any) {
+      setErrorMessage(e?.message || 'Failed to load leaderboard');
+    } finally {
+      setLbLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (activeTab !== 'leaderboard') return;
+    const timer = window.setTimeout(() => {
+      fetchAdminLeaderboard(lbTimeframe, lbGameFilter, lbSearch);
+    }, 150);
+    return () => window.clearTimeout(timer);
+  }, [activeTab, lbTimeframe, lbGameFilter, lbSearch]);
+
   const fetchAdminData = async () => {
     setLoading(true);
     try {
       const noStoreInit: RequestInit = { cache: 'no-store' };
-      const [resStats, resUsers, resAlb, resSng, resAud, resGame, resQuiz, resPosts, resCreations, resReports, resHealth] = await Promise.all([
+      const [resStats, resUsers, resAlb, resSng, resAud, resGame, resQuiz, resPosts, resCreations, resReports, resHealth, resLb] = await Promise.all([
         authFetch('/api/admin/stats', noStoreInit),
         authFetch('/api/admin/users', noStoreInit),
         authFetch('/api/archive/albums', noStoreInit),
@@ -213,6 +258,7 @@ export const AdminView: React.FC = () => {
         authFetch('/api/creations?status=all', noStoreInit),
         authFetch('/api/admin/reports', noStoreInit),
         fetch('/api/health', noStoreInit),
+        authFetch(`/api/admin/leaderboard?timeframe=${encodeURIComponent(lbTimeframe)}&game=${encodeURIComponent(lbGameFilter)}`, noStoreInit),
       ]);
 
       if (resStats.ok) setStats((await safeJson<any>(resStats, {})).stats);
@@ -234,6 +280,13 @@ export const AdminView: React.FC = () => {
       if (resCreations.ok) setAllCreationsList((await safeJson<any>(resCreations, {})).creations || []);
       if (resReports.ok) setReportsList((await safeJson<any>(resReports, {})).reports || []);
       if (resHealth.ok) setHealthStatus(await safeJson<any>(resHealth, null));
+      if (resLb.ok) {
+        const lbData = await safeJson<any>(resLb, null);
+        if (lbData) {
+          setAdminLeaderboard(lbData.leaders || []);
+          setAdminLeaderboardSummary(lbData.summary || null);
+        }
+      }
     } catch (e) {
       console.error('Error fetching admin data:', e);
     } finally {
@@ -904,6 +957,17 @@ export const AdminView: React.FC = () => {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url: deleteModal.id }),
         });
+      } else if (deleteModal.type === 'leaderboard_clear') {
+        res = await authFetch('/api/admin/leaderboard/clear', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ scope: deleteModal.scope || 'all' }),
+        });
+      } else if (deleteModal.type === 'leaderboard_user_reset') {
+        const scopeParam = encodeURIComponent(deleteModal.scope || 'all');
+        res = await authFetch(`/api/admin/leaderboard/users/${encodeURIComponent(deleteModal.id)}?scope=${scopeParam}`, {
+          method: 'DELETE',
+        });
       } else {
         return;
       }
@@ -918,19 +982,37 @@ export const AdminView: React.FC = () => {
           resetSingleForm();
         }
 
-        setStatusMessage(
-          lang === 'ru'
-            ? `«${deleteModal.name}» успешно удален(о)`
-            : `«${deleteModal.name}» deleted successfully`
-        );
+        if (deleteModal.type === 'leaderboard_clear') {
+          setStatusMessage(
+            lang === 'ru'
+              ? `Таблица лидеров успешно очищена (${deleteModal.name}). Аккаунты пользователей сохранены.`
+              : `Leaderboard cleared successfully (${deleteModal.name}). User accounts preserved.`
+          );
+        } else if (deleteModal.type === 'leaderboard_user_reset') {
+          setStatusMessage(
+            lang === 'ru'
+              ? `Игровой рейтинг пользователя «${deleteModal.name}» сброшен. Аккаунт сохранён.`
+              : `Leaderboard results reset for «${deleteModal.name}». Account preserved.`
+          );
+        } else {
+          setStatusMessage(
+            lang === 'ru'
+              ? `«${deleteModal.name}» успешно удален(о)`
+              : `«${deleteModal.name}» deleted successfully`
+          );
+        }
+
         setDeleteModal(null);
         await fetchAdminData();
+        if (deleteModal.type === 'leaderboard_clear' || deleteModal.type === 'leaderboard_user_reset') {
+          await fetchAdminLeaderboard(lbTimeframe, lbGameFilter, lbSearch);
+        }
       } else {
         const data = await safeJson<{ error?: string }>(res, {});
-        setErrorMessage(data.error || `Failed to delete (HTTP ${res.status})`);
+        setErrorMessage(data.error || `Operation failed (HTTP ${res.status})`);
       }
     } catch (err: any) {
-      setErrorMessage(err.message || 'Network error during deletion');
+      setErrorMessage(err.message || 'Network error during operation');
     } finally {
       setIsDeleting(false);
     }
@@ -1128,6 +1210,7 @@ export const AdminView: React.FC = () => {
           { id: 'singles', label: lang === 'ru' ? 'Синглы' : 'Singles', icon: Music, count: singlesList.length },
           { id: 'media', label: lang === 'ru' ? 'Медиатека (MP3 / WAV)' : 'Media Storage', icon: Library, count: mediaFilesList.length },
           { id: 'gametracks', label: lang === 'ru' ? 'Игры & Викторина' : 'Games & Quiz', icon: Volume2, count: gameTracksList.length },
+          { id: 'leaderboard', label: lang === 'ru' ? 'Таблица лидеров' : 'Leaderboards', icon: Trophy, count: adminLeaderboardSummary?.total_ranked ?? adminLeaderboard.length },
           { id: 'moderation', label: lang === 'ru' ? 'Модерация & Посты' : 'Moderation', icon: ShieldAlert, count: pendingPosts.length + pendingCreations.length + pendingReports.length },
           { id: 'users', label: lang === 'ru' ? 'Аккаунты & Доступ' : 'Accounts & RBAC', icon: Users, count: usersList.length },
           { id: 'stats', label: lang === 'ru' ? 'Статистика' : 'Statistics', icon: Activity },
@@ -3110,7 +3193,418 @@ export const AdminView: React.FC = () => {
       )}
 
       {/* ==================================================================== */}
-      {/* IN-UI CONFIRMATION MODAL FOR DELETIONS (REPLACES WINDOW.CONFIRM) */}
+      {/* TAB: LEADERBOARD MANAGEMENT (SAFE GAME-ONLY RESETS) */}
+      {/* ==================================================================== */}
+      {activeTab === 'leaderboard' && (
+        <motion.div
+          key="leaderboard"
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.2 }}
+          className="space-y-6"
+        >
+          {/* Daily UTC Challenges Overview */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            <div className="bg-[#100f13] border border-white/[0.08] rounded-xl p-4 space-y-1">
+              <div className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-wider text-ash">
+                <Clock className="w-3.5 h-3.5 text-[#821c2c]" />
+                <span>{lang === 'ru' ? 'Дата UTC' : 'UTC Date'}</span>
+              </div>
+              <div className="font-mono text-lg text-ivory">
+                {adminLeaderboardSummary?.today_utc || new Date().toISOString().slice(0, 10)}
+              </div>
+              <div className="font-mono text-[10px] text-ash/70">
+                {lang === 'ru' ? 'Обновление ежедневно в 00:00 UTC' : 'Resets daily at 00:00 UTC'}
+              </div>
+            </div>
+
+            <div className="bg-[#100f13] border border-white/[0.08] rounded-xl p-4 space-y-1">
+              <div className="font-mono text-[10px] uppercase tracking-wider text-ash">
+                {lang === 'ru' ? 'Трек дня (5 сек)' : 'Daily Track (5s)'}
+              </div>
+              <div className="font-display text-lg text-ivory truncate">
+                {adminLeaderboardSummary?.today_track_title || '—'}
+              </div>
+              <div className="font-mono text-[10px] text-ash/70">
+                {adminLeaderboardSummary?.today_track_snippet_start !== null && adminLeaderboardSummary?.today_track_snippet_start !== undefined
+                  ? `${formatDuration(adminLeaderboardSummary.today_track_snippet_start)} – ${formatDuration(
+                      adminLeaderboardSummary.today_track_snippet_start + (adminLeaderboardSummary.today_track_snippet_duration || 5)
+                    )} · ${adminLeaderboardSummary.today_track_attempts || 0} ${lang === 'ru' ? 'попыток' : 'plays'}`
+                  : '—'}
+              </div>
+            </div>
+
+            <div className="bg-[#100f13] border border-white/[0.08] rounded-xl p-4 space-y-1">
+              <div className="font-mono text-[10px] uppercase tracking-wider text-ash">
+                {lang === 'ru' ? 'Викторина дня' : 'Daily Quiz'}
+              </div>
+              <div className="font-mono text-lg text-ivory">
+                {adminLeaderboardSummary?.today_quiz_count ?? 0}{' '}
+                <span className="text-xs text-ash">{lang === 'ru' ? 'вопросов' : 'questions'}</span>
+              </div>
+              <div className="font-mono text-[10px] text-ash/70">
+                {adminLeaderboardSummary?.today_quiz_attempts || 0}{' '}
+                {lang === 'ru' ? 'прохождений сегодня' : 'completions today'}
+              </div>
+            </div>
+
+            <div className="bg-[#100f13] border border-white/[0.08] rounded-xl p-4 space-y-1">
+              <div className="font-mono text-[10px] uppercase tracking-wider text-ash">
+                {lang === 'ru' ? 'В таблице лидеров' : 'Ranked Members'}
+              </div>
+              <div className="font-mono text-lg text-ivory">
+                {adminLeaderboard.length}{' '}
+                <span className="text-xs text-ash">/ {adminLeaderboardSummary?.total_attempts ?? 0} {lang === 'ru' ? 'игр' : 'plays'}</span>
+              </div>
+              <div className="font-mono text-[10px] text-ash/70">
+                {lang === 'ru' ? 'С учётом текущих фильтров' : 'Matching active filters'}
+              </div>
+            </div>
+          </div>
+
+          {/* Safe Bulk Clear Controls (Admin Only) */}
+          <div className="bg-[#100f13] border border-white/[0.08] rounded-xl p-5 space-y-4">
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+              <div className="space-y-1">
+                <h3 className="font-title text-xl text-ivory uppercase tracking-wide flex items-center gap-2">
+                  <Trophy className="w-5 h-5 text-[#c49298]" />
+                  <span>{lang === 'ru' ? 'Управление таблицами лидеров' : 'Leaderboard Management'}</span>
+                </h3>
+                <p className="text-xs text-ash font-sans leading-relaxed">
+                  {lang === 'ru'
+                    ? 'Очистка удаляет только игровые результаты, попытки и рейтинг. Аккаунты пользователей, пароли, профили, аватары и покупки в магазине полностью сохраняются.'
+                    : 'Clearing removes only game results, attempts, and rankings. User accounts, passwords, profiles, avatars, and shop items are strictly preserved.'}
+                </p>
+              </div>
+            </div>
+
+            {user.role_id === 'admin' ? (
+              <div className="flex flex-wrap items-center gap-2 pt-1 font-mono text-[11px]">
+                <button
+                  type="button"
+                  onClick={() =>
+                    setDeleteModal({
+                      type: 'leaderboard_clear',
+                      id: 'all',
+                      scope: 'all',
+                      name: lang === 'ru' ? 'Вся таблица лидеров (за всё время)' : 'Entire All-Time Leaderboard',
+                      subtext:
+                        lang === 'ru'
+                          ? 'Будут сброшены все игровые попытки, ежедневные прохождения и рейтинговый XP всех пользователей. Аккаунты, пароли и профили НЕ будут удалены.'
+                          : 'All game attempts, daily completions, and ranking XP will be reset for all users. User accounts, passwords, and profiles will NOT be deleted.',
+                    })
+                  }
+                  className="px-3.5 py-2 rounded-lg bg-red-950/70 hover:bg-red-900/80 border border-red-800/80 text-red-200 uppercase tracking-wider cursor-pointer transition-colors flex items-center gap-1.5"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>{lang === 'ru' ? 'Очистить всю таблицу' : 'Clear All-Time'}</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() =>
+                    setDeleteModal({
+                      type: 'leaderboard_clear',
+                      id: 'weekly',
+                      scope: 'weekly',
+                      name: lang === 'ru' ? 'Таблица лидеров за 7 дней' : 'Weekly Leaderboard (7 days)',
+                      subtext:
+                        lang === 'ru'
+                          ? 'Будут удалены игровые результаты и XP за последние 7 дней. Аккаунты и более старая история сохраняются.'
+                          : 'Game results and XP from the last 7 days will be cleared. User accounts remain intact.',
+                    })
+                  }
+                  className="px-3 py-2 rounded-lg bg-[#16151a] hover:bg-white/[0.08] border border-white/[0.1] text-bone uppercase tracking-wider cursor-pointer transition-colors"
+                >
+                  {lang === 'ru' ? 'Очистить 7 дней' : 'Clear 7 Days'}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() =>
+                    setDeleteModal({
+                      type: 'leaderboard_clear',
+                      id: 'monthly',
+                      scope: 'monthly',
+                      name: lang === 'ru' ? 'Таблица лидеров за 30 дней' : 'Monthly Leaderboard (30 days)',
+                      subtext:
+                        lang === 'ru'
+                          ? 'Будут удалены игровые результаты и XP за последние 30 дней. Аккаунты пользователей не затрагиваются.'
+                          : 'Game results and XP from the last 30 days will be cleared. User accounts remain intact.',
+                    })
+                  }
+                  className="px-3 py-2 rounded-lg bg-[#16151a] hover:bg-white/[0.08] border border-white/[0.1] text-bone uppercase tracking-wider cursor-pointer transition-colors"
+                >
+                  {lang === 'ru' ? 'Очистить 30 дней' : 'Clear 30 Days'}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() =>
+                    setDeleteModal({
+                      type: 'leaderboard_clear',
+                      id: 'guess-track',
+                      scope: 'guess-track',
+                      name: lang === 'ru' ? 'Результаты «Угадай трек»' : 'Guess The Track Leaderboard',
+                      subtext:
+                        lang === 'ru'
+                          ? 'Будут сброшены только результаты и попытки игры «Угадай трек». Аккаунты и результаты викторины сохраняются.'
+                          : 'Only Guess The Track results and attempts will be cleared. Accounts and Quiz scores remain intact.',
+                    })
+                  }
+                  className="px-3 py-2 rounded-lg bg-[#16151a] hover:bg-white/[0.08] border border-white/[0.1] text-bone uppercase tracking-wider cursor-pointer transition-colors"
+                >
+                  {lang === 'ru' ? 'Сбросить «Угадай трек»' : 'Clear Guess Track'}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() =>
+                    setDeleteModal({
+                      type: 'leaderboard_clear',
+                      id: 'daily-quiz',
+                      scope: 'daily-quiz',
+                      name: lang === 'ru' ? 'Результаты «Ежедневной викторины»' : 'Daily Quiz Leaderboard',
+                      subtext:
+                        lang === 'ru'
+                          ? 'Будут сброшены только результаты и попытки викторины. Аккаунты и результаты «Угадай трек» сохраняются.'
+                          : 'Only Daily Quiz results and attempts will be cleared. Accounts and Guess Track scores remain intact.',
+                    })
+                  }
+                  className="px-3 py-2 rounded-lg bg-[#16151a] hover:bg-white/[0.08] border border-white/[0.1] text-bone uppercase tracking-wider cursor-pointer transition-colors"
+                >
+                  {lang === 'ru' ? 'Сбросить «Викторину»' : 'Clear Daily Quiz'}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() =>
+                    setDeleteModal({
+                      type: 'leaderboard_clear',
+                      id: 'daily-attempts',
+                      scope: 'daily-attempts',
+                      name: lang === 'ru' ? 'Сегодняшние попытки (UTC)' : "Today's Daily Attempts (UTC)",
+                      subtext:
+                        lang === 'ru'
+                          ? 'Сбросит только блокировку повторного прохождения за сегодня (UTC) — исторический XP и рейтинг сохранятся.'
+                          : 'Resets only today’s UTC daily completion locks while preserving historical XP and rankings.',
+                    })
+                  }
+                  className="px-3 py-2 rounded-lg bg-[#16151a] hover:bg-white/[0.08] border border-white/[0.1] text-ash hover:text-white uppercase tracking-wider cursor-pointer transition-colors"
+                >
+                  {lang === 'ru' ? 'Сбросить попытки сегодня' : "Reset Today's Locks"}
+                </button>
+              </div>
+            ) : (
+              <div className="p-3 rounded-lg bg-white/[0.03] border border-white/[0.06] font-mono text-xs text-ash">
+                {lang === 'ru'
+                  ? 'Очистка и сброс таблицы лидеров доступны только администратору.'
+                  : 'Clearing or resetting leaderboards requires Administrator privileges.'}
+              </div>
+            )}
+          </div>
+
+          {/* Filters & Search */}
+          <div className="bg-[#100f13] border border-white/[0.08] rounded-xl p-4 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center gap-2 font-mono text-[11px]">
+              {(['all', 'weekly', 'monthly'] as const).map((tf) => (
+                <button
+                  type="button"
+                  key={tf}
+                  onClick={() => setLbTimeframe(tf)}
+                  className={`px-3 py-1.5 rounded-lg uppercase tracking-wider transition-colors cursor-pointer ${
+                    lbTimeframe === tf
+                      ? 'bg-white/[0.12] text-white border border-white/20'
+                      : 'text-ash hover:text-white bg-white/[0.03] border border-white/[0.06]'
+                  }`}
+                >
+                  {tf === 'all'
+                    ? lang === 'ru' ? 'Всё время' : 'All-Time'
+                    : tf === 'weekly'
+                      ? lang === 'ru' ? '7 дней' : '7 Days'
+                      : lang === 'ru' ? '30 дней' : '30 Days'}
+                </button>
+              ))}
+
+              <span className="text-white/15 hidden sm:inline">|</span>
+
+              {([
+                { id: 'all', label: lang === 'ru' ? 'Все игры' : 'All Games' },
+                { id: 'guess-track', label: lang === 'ru' ? 'Угадай трек' : 'Guess Track' },
+                { id: 'daily-quiz', label: lang === 'ru' ? 'Викторина' : 'Daily Quiz' },
+              ] as const).map((g) => (
+                <button
+                  type="button"
+                  key={g.id}
+                  onClick={() => setLbGameFilter(g.id)}
+                  className={`px-3 py-1.5 rounded-lg uppercase tracking-wider transition-colors cursor-pointer ${
+                    lbGameFilter === g.id
+                      ? 'bg-[#821c2c]/35 text-[#f5c6cb] border border-[#821c2c]/70'
+                      : 'text-ash hover:text-white bg-white/[0.03] border border-white/[0.06]'
+                  }`}
+                >
+                  {g.label}
+                </button>
+              ))}
+            </div>
+
+            <div className="relative w-full lg:w-72">
+              <Search className="w-3.5 h-3.5 text-ash absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+              <input
+                type="text"
+                value={lbSearch}
+                onChange={(e) => setLbSearch(e.target.value)}
+                placeholder={lang === 'ru' ? 'Поиск игрока по нику...' : 'Search member...'}
+                className="w-full pl-9 pr-3 py-2 bg-[#16151a] border border-white/[0.1] rounded-lg text-xs text-white font-mono focus:outline-none focus:border-white/30"
+              />
+            </div>
+          </div>
+
+          {/* Ranked Players Table */}
+          <div className="bg-[#100f13] border border-white/[0.08] rounded-xl overflow-hidden shadow-xl">
+            <div className="p-4 border-b border-white/[0.06] flex items-center justify-between font-mono text-xs">
+              <span className="uppercase tracking-wider text-bone font-medium">
+                {lang === 'ru' ? 'Записи таблицы лидеров' : 'Leaderboard Entries'} ({adminLeaderboard.length})
+              </span>
+              <button
+                type="button"
+                onClick={() => fetchAdminLeaderboard(lbTimeframe, lbGameFilter, lbSearch)}
+                className="text-[11px] text-ash hover:text-white flex items-center gap-1 cursor-pointer"
+              >
+                <RotateCcw className="w-3 h-3" />
+                <span>{lang === 'ru' ? 'Обновить' : 'Refresh'}</span>
+              </button>
+            </div>
+
+            {lbLoading ? (
+              <div className="p-10 text-center font-mono text-xs text-ash">
+                {lang === 'ru' ? 'Загрузка таблицы лидеров...' : 'Loading leaderboard entries...'}
+              </div>
+            ) : adminLeaderboard.length === 0 ? (
+              <div className="p-12 text-center font-mono text-xs text-ash">
+                {lang === 'ru'
+                  ? 'Записи не найдены — таблица лидеров пуста для выбранного фильтра.'
+                  : 'No entries found — leaderboard is empty for the selected filter.'}
+              </div>
+            ) : (
+              <div className="divide-y divide-white/[0.05]">
+                {adminLeaderboard.map((entry, idx) => (
+                  <div
+                    key={entry.id}
+                    className="p-4 flex flex-col md:flex-row md:items-center justify-between gap-4 hover:bg-white/[0.02] transition-colors"
+                  >
+                    <div className="flex items-center gap-3.5 min-w-0">
+                      <span className="font-mono text-xs font-bold text-ash w-7 shrink-0">
+                        #{idx + 1 < 10 ? `0${idx + 1}` : idx + 1}
+                      </span>
+                      <div className="w-9 h-9 rounded-full overflow-hidden bg-black border border-white/10 shrink-0">
+                        <img
+                          src={entry.avatar_url || '/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg'}
+                          alt={entry.nickname}
+                          className="w-full h-full object-cover"
+                        />
+                      </div>
+                      <div className="min-w-0">
+                        <div className="font-mono text-xs text-white font-medium flex flex-wrap items-center gap-2">
+                          <span className="truncate">{entry.display_name || entry.nickname}</span>
+                          <span className="text-[10px] text-ash/70">@{entry.nickname}</span>
+                          {entry.role_id !== 'user' && (
+                            <span className="text-[9px] px-1.5 py-0.2 rounded bg-[#821c2c]/40 text-[#f5c6cb] border border-[#821c2c] uppercase">
+                              {entry.role_id}
+                            </span>
+                          )}
+                          {entry.completed_today_track && (
+                            <span className="text-[9px] px-1.5 py-0.2 rounded bg-green-950/60 text-green-300 border border-green-800/70">
+                              {lang === 'ru' ? 'Трек ✓' : 'Track ✓'}
+                            </span>
+                          )}
+                          {entry.completed_today_quiz && (
+                            <span className="text-[9px] px-1.5 py-0.2 rounded bg-green-950/60 text-green-300 border border-green-800/70">
+                              {lang === 'ru' ? 'Квиз ✓' : 'Quiz ✓'}
+                            </span>
+                          )}
+                        </div>
+                        <div className="font-mono text-[10px] text-ash/75 mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5">
+                          <span>
+                            XP: <strong className="text-ivory">{entry.rank_xp}</strong>
+                          </span>
+                          <span>
+                            {lang === 'ru' ? 'Уровень' : 'Lvl'}: <strong className="text-bone">{entry.level}</strong>
+                          </span>
+                          <span>
+                            {lang === 'ru' ? 'Очки' : 'Score'}: <strong className="text-bone">{entry.game_score}</strong>
+                          </span>
+                          <span>
+                            {lang === 'ru' ? 'Игр' : 'Plays'}: <strong className="text-bone">{entry.scoped_games_played}</strong>{' '}
+                            <span className="text-ash/60">
+                              ({entry.guess_track_played}/{entry.daily_quiz_played})
+                            </span>
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {user.role_id === 'admin' && (
+                      <div className="flex flex-wrap items-center gap-2 font-mono text-[10px] shrink-0">
+                        {(entry.completed_today_track || entry.completed_today_quiz) && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setDeleteModal({
+                                type: 'leaderboard_user_reset',
+                                id: entry.id,
+                                scope: 'daily-attempts',
+                                name: entry.nickname,
+                                subtext:
+                                  lang === 'ru'
+                                    ? `Сбросить только сегодняшние ежедневные попытки (UTC) для @${entry.nickname}. Аккаунт и накопленный XP сохраняются.`
+                                    : `Reset only today’s UTC daily completion locks for @${entry.nickname}. Account and accumulated XP remain intact.`,
+                              })
+                            }
+                            className="px-2.5 py-1.5 rounded-lg bg-white/[0.05] hover:bg-white/[0.1] border border-white/15 text-ash hover:text-white uppercase cursor-pointer transition-colors"
+                          >
+                            {lang === 'ru' ? 'Сбросить сегодня' : 'Reset Today'}
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setDeleteModal({
+                              type: 'leaderboard_user_reset',
+                              id: entry.id,
+                              scope: lbGameFilter === 'all' ? 'all' : lbGameFilter,
+                              name: entry.nickname,
+                              subtext:
+                                lbGameFilter === 'all'
+                                  ? lang === 'ru'
+                                    ? `Удалить все игровые результаты и сбросить рейтинговый XP пользователя @${entry.nickname}. Учётная запись, пароль и профиль НЕ будут удалены.`
+                                    : `Remove all leaderboard results and reset ranking XP for @${entry.nickname}. Account, password, and profile will NOT be deleted.`
+                                  : lang === 'ru'
+                                    ? `Сбросить результаты игры «${lbGameFilter === 'guess-track' ? 'Угадай трек' : 'Викторина'}» пользователя @${entry.nickname}. Аккаунт сохранится.`
+                                    : `Reset ${lbGameFilter} scores for @${entry.nickname}. Account remains intact.`,
+                            })
+                          }
+                          className="px-3 py-1.5 rounded-lg bg-red-950/60 hover:bg-red-900/80 border border-red-800/80 text-red-200 uppercase cursor-pointer transition-colors flex items-center gap-1"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                          <span>
+                            {lbGameFilter === 'all'
+                              ? lang === 'ru' ? 'Убрать из рейтинга' : 'Reset Score'
+                              : lang === 'ru' ? 'Сбросить игру' : 'Reset Game'}
+                          </span>
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </motion.div>
+      )}
+
+      {/* ==================================================================== */}
+      {/* IN-UI CONFIRMATION MODAL FOR DELETIONS & LEADERBOARD RESETS */}
       {/* ==================================================================== */}
       <AnimatePresence>
         {deleteModal && (
@@ -3139,7 +3633,9 @@ export const AdminView: React.FC = () => {
                 </div>
                 <div>
                   <h3 className="font-title text-xl text-ivory uppercase tracking-wide">
-                    {lang === 'ru' ? 'Подтверждение удаления' : 'Confirm Deletion'}
+                    {deleteModal.type === 'leaderboard_clear' || deleteModal.type === 'leaderboard_user_reset'
+                      ? lang === 'ru' ? 'Подтверждение сброса' : 'Confirm Reset'
+                      : lang === 'ru' ? 'Подтверждение удаления' : 'Confirm Deletion'}
                   </h3>
                   <div className="font-mono text-[11px] text-ash">
                     {deleteModal.type === 'track' && (lang === 'ru' ? 'Удаление трека' : 'Track Deletion')}
@@ -3149,6 +3645,8 @@ export const AdminView: React.FC = () => {
                     {deleteModal.type === 'post' && (lang === 'ru' ? 'Удаление темы форума' : 'Post Deletion')}
                     {deleteModal.type === 'creation' && (lang === 'ru' ? 'Удаление работы галереи' : 'Creation Deletion')}
                     {deleteModal.type === 'quiz' && (lang === 'ru' ? 'Удаление вопроса викторины' : 'Quiz Question Deletion')}
+                    {deleteModal.type === 'leaderboard_clear' && (lang === 'ru' ? 'Очистка таблицы лидеров' : 'Leaderboard Clear')}
+                    {deleteModal.type === 'leaderboard_user_reset' && (lang === 'ru' ? 'Сброс результата игрока' : 'User Leaderboard Reset')}
                   </div>
                 </div>
               </div>
@@ -3181,8 +3679,10 @@ export const AdminView: React.FC = () => {
                   <Trash2 className="w-3.5 h-3.5" />
                   <span>
                     {isDeleting
-                      ? lang === 'ru' ? 'Удаление...' : 'Deleting...'
-                      : lang === 'ru' ? 'Удалить' : 'Delete'}
+                      ? lang === 'ru' ? 'Выполнение...' : 'Processing...'
+                      : deleteModal.type === 'leaderboard_clear' || deleteModal.type === 'leaderboard_user_reset'
+                        ? lang === 'ru' ? 'Подтвердить сброс' : 'Confirm Reset'
+                        : lang === 'ru' ? 'Удалить' : 'Delete'}
                   </span>
                 </button>
               </div>

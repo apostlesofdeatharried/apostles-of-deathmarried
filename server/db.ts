@@ -470,6 +470,32 @@ export function ensureSchemaAndMigrations() {
       is_used INTEGER NOT NULL DEFAULT 0
     );
 
+    CREATE TABLE IF NOT EXISTS daily_track_challenges (
+      id TEXT PRIMARY KEY,
+      challenge_date TEXT NOT NULL UNIQUE,
+      track_id TEXT NOT NULL,
+      track_source TEXT NOT NULL DEFAULT 'track',
+      snippet_start_seconds INTEGER NOT NULL DEFAULT 0,
+      snippet_start_ratio REAL NOT NULL DEFAULT 0,
+      snippet_duration_seconds INTEGER NOT NULL DEFAULT 5,
+      options_json TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS daily_track_attempts (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      challenge_date TEXT NOT NULL,
+      track_id TEXT NOT NULL,
+      selected_track_id TEXT NOT NULL,
+      is_correct INTEGER NOT NULL DEFAULT 0,
+      score INTEGER NOT NULL DEFAULT 0,
+      xp_earned INTEGER NOT NULL DEFAULT 0,
+      time_spent INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(user_id, challenge_date)
+    );
+
     CREATE TABLE IF NOT EXISTS uploaded_blobs (
       filename TEXT PRIMARY KEY,
       mime_type TEXT NOT NULL,
@@ -480,6 +506,7 @@ export function ensureSchemaAndMigrations() {
   `);
 
   // Safe table schema migrations for existing databases
+  try { db.exec("ALTER TABLE daily_track_challenges ADD COLUMN snippet_start_ratio REAL NOT NULL DEFAULT 0;"); } catch {}
   try { db.exec("ALTER TABLE profiles ADD COLUMN total_xp INTEGER NOT NULL DEFAULT 0;"); } catch {}
   try { db.exec("ALTER TABLE profiles ADD COLUMN custom_status TEXT;"); } catch {}
   try { db.exec("ALTER TABLE profiles ADD COLUMN equipped_frame TEXT;"); } catch {}

@@ -32,12 +32,26 @@ import {
   checkAchievementEligibility,
   isSafeMediaUrl,
   computeDailyStreak,
-  pickDailyQuizQuestions,
   resolveServerPort,
   sanitizeStreamingLinks,
   classifyMediaUpload,
   buildSafeAsciiFilename,
 } from './src/utils/logic.js';
+import {
+  DAILY_SNIPPET_DURATION_SECONDS,
+  DEFAULT_DAILY_QUIZ_COUNT,
+  getUtcDateString,
+  isValidUtcDateString,
+  getNextUtcMidnightIso,
+  pickDailyTrackChallenge,
+  parseAndValidateQuizQuestion,
+  pickDailyQuizSet,
+  readLocalWavDurationSeconds,
+  type PlayableTrackCandidate,
+  type TitleOption,
+  type RawQuizQuestion,
+  type ValidatedQuizQuestion,
+} from './server/dailyGames.js';
 
 const app = express();
 const PORT = resolveServerPort(process.argv, process.env);
@@ -1238,15 +1252,54 @@ app.get('/api/admin/audio-files', requireAdminOrMod, (_req: Request, res: Respon
 });
 
 // ----------------------------------------------------------------------------
-// API: GAMES & XP
+// API: GAMES & XP (24H UTC DAILY CHALLENGES + LEADERBOARD)
 // ----------------------------------------------------------------------------
 
-// 1. Guess The Track round with server authority & anti-cheat token
-app.get('/api/games/guess-track/round', (req: Request, res: Response) => {
-  const user = getSessionUser(req);
-  // Collect all playable tracks and singles with audio
-  const playableTracks = db.prepare(`
-    SELECT t.id, t.title, t.audio_url, t.snippet_start_seconds, t.snippet_duration_seconds,
+function getDailyChallengeSecret(): string {
+  const configured = (process.env.SESSION_SECRET || '').trim();
+  return configured ? `daily-games:${configured}` : 'apostles-daily-challenge-v1';
+}
+
+function resolveEffectiveTrackDuration(audioUrl: string, dbDurationSeconds: number): number {
+  const trimmed = (audioUrl || '').trim();
+  if (trimmed.startsWith('/audio/') && !trimmed.includes('..')) {
+    const filename = path.basename(trimmed);
+    const publicAudioDir = path.resolve(process.cwd(), 'public', 'audio');
+    const distAudioDir = path.resolve(process.cwd(), 'dist', 'audio');
+    const candidates = [
+      { dir: publicAudioDir, file: path.join(publicAudioDir, filename) },
+      { dir: distAudioDir, file: path.join(distAudioDir, filename) },
+    ];
+    for (const { dir, file } of candidates) {
+      if (isPathInsideDir(dir, file)) {
+        const wavDur = readLocalWavDurationSeconds(file);
+        if (wavDur && wavDur > 0) return wavDur;
+      }
+    }
+  } else if (trimmed.startsWith('/uploads/') && !trimmed.includes('..')) {
+    const filename = path.basename(trimmed);
+    const publicUploadsDir = path.resolve(process.cwd(), 'public', 'uploads');
+    const candidates = [
+      { dir: uploadDir, file: path.join(uploadDir, filename) },
+      { dir: publicUploadsDir, file: path.join(publicUploadsDir, filename) },
+    ];
+    for (const { dir, file } of candidates) {
+      if (isPathInsideDir(dir, file)) {
+        const wavDur = readLocalWavDurationSeconds(file);
+        if (wavDur && wavDur > 0) return wavDur;
+      }
+    }
+  }
+  const parsed = Number(dbDurationSeconds);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
+}
+
+function getPlayableGameTrackPool(): {
+  playablePool: PlayableTrackCandidate[];
+  allTitles: TitleOption[];
+} {
+  const rawTracks = db.prepare(`
+    SELECT t.id, t.title, t.audio_url, t.duration_seconds,
            COALESCE(a.title, s.title, 'Archive Release') as album_title,
            COALESCE(a.cover_url, s.cover_url, '/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg') as cover_url
     FROM tracks t
@@ -1255,8 +1308,8 @@ app.get('/api/games/guess-track/round', (req: Request, res: Response) => {
     WHERE t.audio_url IS NOT NULL AND trim(t.audio_url) != '' AND (t.is_game_eligible = 1 OR t.is_game_eligible IS NULL)
   `).all() as any[];
 
-  const playableSingles = db.prepare(`
-    SELECT s.id, s.title, s.audio_url, 0 as snippet_start_seconds, 15 as snippet_duration_seconds,
+  const rawSingles = db.prepare(`
+    SELECT s.id, s.title, s.audio_url, s.duration_seconds,
            'Single' as album_title,
            COALESCE(s.cover_url, '/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg') as cover_url
     FROM singles s
@@ -1264,104 +1317,38 @@ app.get('/api/games/guess-track/round', (req: Request, res: Response) => {
       AND s.id NOT IN (SELECT single_id FROM tracks WHERE single_id IS NOT NULL)
   `).all() as any[];
 
-  const playablePool = [...playableTracks, ...playableSingles].filter((item) =>
-    localAudioExists(item.audio_url)
-  );
+  const playablePool: PlayableTrackCandidate[] = [
+    ...rawTracks.map((row) => ({
+      id: String(row.id),
+      title: String(row.title || '').trim(),
+      audio_url: String(row.audio_url || '').trim(),
+      duration_seconds: resolveEffectiveTrackDuration(String(row.audio_url || ''), Number(row.duration_seconds) || 0),
+      source: 'track' as const,
+      album_title: row.album_title,
+      cover_url: row.cover_url,
+    })),
+    ...rawSingles.map((row) => ({
+      id: String(row.id),
+      title: String(row.title || '').trim(),
+      audio_url: String(row.audio_url || '').trim(),
+      duration_seconds: resolveEffectiveTrackDuration(String(row.audio_url || ''), Number(row.duration_seconds) || 0),
+      source: 'single' as const,
+      album_title: row.album_title,
+      cover_url: row.cover_url,
+    })),
+  ].filter((item) => item.title.length > 0 && localAudioExists(item.audio_url));
 
-  if (playablePool.length === 0) {
-    res.status(404).json({ error: 'No audio fragments currently playable in archive.' });
-    return;
-  }
-
-  // Target track
-  const targetIndex = Math.floor(Math.random() * playablePool.length);
-  const targetTrack = playablePool[targetIndex];
-
-  // Distractors from all known tracks & singles
   const allTitles = db.prepare(`
-    SELECT id, title FROM tracks
+    SELECT id, title FROM tracks WHERE title IS NOT NULL AND trim(title) != ''
     UNION
-    SELECT id, title FROM singles
-  `).all() as any[];
+    SELECT id, title FROM singles WHERE title IS NOT NULL AND trim(title) != ''
+  `).all() as TitleOption[];
 
-  const distractors = allTitles.filter((t) => t.id !== targetTrack.id);
-  const shuffledDistractors = distractors.sort(() => 0.5 - Math.random()).slice(0, 3);
-  const options = [{ id: targetTrack.id, title: targetTrack.title }, ...shuffledDistractors]
-    .sort(() => 0.5 - Math.random())
-    .map((t) => ({ id: t.id, title: t.title }));
+  return { playablePool, allTitles };
+}
 
-  // Generate ephemeral token valid for 3 minutes (180,000 ms)
-  const token = 'rndt_' + crypto.randomUUID().replace(/-/g, '');
-  const expiresAt = Date.now() + 180000;
-
-  db.prepare(`
-    INSERT INTO guess_track_rounds (token, user_id, correct_track_id, options_json, expires_at, is_used)
-    VALUES (?, ?, ?, ?, ?, 0)
-  `).run(token, user?.id || null, targetTrack.id, JSON.stringify(options), expiresAt);
-
-  // Notice: targetTrack.id is NEVER returned here to prevent inspecting DevTools!
-  res.json({
-    round_token: token,
-    audio_url: targetTrack.audio_url,
-    snippet_start: targetTrack.snippet_start_seconds || 0,
-    snippet_duration: targetTrack.snippet_duration_seconds || 15,
-    options,
-  });
-});
-
-app.post('/api/games/guess-track/verify', (req: AuthRequest, res: Response) => {
-  const { round_token, selected_track_id, time_spent } = req.body;
-  if (!round_token || !selected_track_id) {
-    res.status(400).json({ error: 'Missing round_token or selected_track_id' });
-    return;
-  }
-
-  const user = getSessionUser(req);
-  const round = db.prepare(`
-    SELECT * FROM guess_track_rounds WHERE token = ? AND is_used = 0
-  `).get(round_token) as any;
-
-  if (!round) {
-    res.status(400).json({ error: 'Invalid or already used round token.' });
-    return;
-  }
-
-  if (round.user_id && (!user || user.id !== round.user_id)) {
-    res.status(403).json({ error: 'Round token belongs to another session.' });
-    return;
-  }
-
-  if (Date.now() > round.expires_at) {
-    db.prepare('UPDATE guess_track_rounds SET is_used = 1 WHERE token = ?').run(round_token);
-    res.status(400).json({ error: 'Round has expired. Please start a new challenge.' });
-    return;
-  }
-
-  let parsedOptions: Array<{ id: string }> = [];
-  try {
-    parsedOptions = JSON.parse(round.options_json || '[]');
-  } catch {}
-  if (parsedOptions.length > 0 && !parsedOptions.some((o) => o.id === selected_track_id)) {
-    res.status(400).json({ error: 'Selected option is not valid for this round.' });
-    return;
-  }
-
-  db.prepare('UPDATE guess_track_rounds SET is_used = 1 WHERE token = ?').run(round_token);
-  const correctTrackId: string = round.correct_track_id;
-  const isCorrect = correctTrackId === selected_track_id;
-  const safeTimeSpent = Math.max(0, Math.min(180, Number(time_spent) || 10));
-  let xpEarned = 0;
-
-  if (isCorrect) {
-    // 15 XP base + speed bonus if under 15 seconds (up to 10 extra)
-    const speed = Math.max(0, 15 - Math.floor(safeTimeSpent));
-    xpEarned = 15 + Math.min(10, speed);
-  } else {
-    xpEarned = 5; // participation XP
-  }
-
-  // Get track info for answer reveal
-  const trackInfo = db.prepare(`
+function getTrackRevealInfo(trackId: string) {
+  return db.prepare(`
     SELECT t.id, t.title, COALESCE(a.title, s.title, 'Single') as album_title,
            COALESCE(a.cover_url, s.cover_url, '/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg') as cover_url
     FROM (
@@ -1373,61 +1360,483 @@ app.post('/api/games/guess-track/verify', (req: AuthRequest, res: Response) => {
     LEFT JOIN singles s ON s.id = t.single_id
     WHERE t.id = ?
     LIMIT 1
-  `).get(correctTrackId);
+  `).get(trackId) as any;
+}
+
+interface ResolvedDailyTrackChallenge {
+  id: string;
+  challenge_date: string;
+  track: PlayableTrackCandidate;
+  snippet_start_seconds: number;
+  snippet_start_ratio: number;
+  snippet_duration_seconds: number;
+  options: TitleOption[];
+}
+
+function getOrCreateDailyTrackChallenge(utcDate: string): ResolvedDailyTrackChallenge | null {
+  const { playablePool, allTitles } = getPlayableGameTrackPool();
+  if (playablePool.length === 0) return null;
+
+  const playableById = new Map(playablePool.map((t) => [t.id, t]));
+  const existing = db.prepare(`
+    SELECT * FROM daily_track_challenges WHERE challenge_date = ?
+  `).get(utcDate) as any;
+
+  if (existing && playableById.has(existing.track_id)) {
+    const track = playableById.get(existing.track_id)!;
+    let options: TitleOption[] = [];
+    try {
+      const parsed = JSON.parse(existing.options_json || '[]');
+      if (Array.isArray(parsed)) {
+        options = parsed.filter((o: any) => o && typeof o.id === 'string' && typeof o.title === 'string');
+      }
+    } catch {}
+    if (options.some((o) => o.id === track.id)) {
+      const storedDuration = Math.min(
+        DAILY_SNIPPET_DURATION_SECONDS,
+        Math.max(1, Number(existing.snippet_duration_seconds) || DAILY_SNIPPET_DURATION_SECONDS)
+      );
+      const maxStart = track.duration_seconds > storedDuration ? track.duration_seconds - storedDuration : 0;
+      const clampedStart = Math.max(0, Math.min(maxStart > 0 ? maxStart : Number(existing.snippet_start_seconds) || 0, Number(existing.snippet_start_seconds) || 0));
+      return {
+        id: existing.id,
+        challenge_date: utcDate,
+        track,
+        snippet_start_seconds: clampedStart,
+        snippet_start_ratio: Number(existing.snippet_start_ratio) || 0,
+        snippet_duration_seconds: storedDuration,
+        options,
+      };
+    }
+  }
+
+  const recentRows = db.prepare(`
+    SELECT track_id FROM daily_track_challenges
+    WHERE challenge_date < ?
+    ORDER BY challenge_date DESC
+    LIMIT 7
+  `).all(utcDate) as Array<{ track_id: string }>;
+  const recentTrackIds = recentRows.map((r) => r.track_id);
+
+  const generated = pickDailyTrackChallenge({
+    utcDate,
+    playableTracks: playablePool,
+    allTitleCandidates: allTitles,
+    recentTrackIds,
+    secret: getDailyChallengeSecret(),
+  });
+  if (!generated) return null;
+
+  const rowId = existing?.id || `dtc_${utcDate.replace(/-/g, '')}`;
+  if (existing) {
+    // Previously stored track was deleted or disabled by admin — repair today's entry safely
+    db.prepare(`
+      UPDATE daily_track_challenges
+      SET track_id = ?, track_source = ?, snippet_start_seconds = ?, snippet_start_ratio = ?,
+          snippet_duration_seconds = ?, options_json = ?
+      WHERE challenge_date = ?
+    `).run(
+      generated.track.id,
+      generated.track.source,
+      generated.snippet_start_seconds,
+      generated.snippet_start_ratio,
+      generated.snippet_duration_seconds,
+      JSON.stringify(generated.options),
+      utcDate
+    );
+  } else {
+    db.prepare(`
+      INSERT OR IGNORE INTO daily_track_challenges
+        (id, challenge_date, track_id, track_source, snippet_start_seconds, snippet_start_ratio, snippet_duration_seconds, options_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      rowId,
+      utcDate,
+      generated.track.id,
+      generated.track.source,
+      generated.snippet_start_seconds,
+      generated.snippet_start_ratio,
+      generated.snippet_duration_seconds,
+      JSON.stringify(generated.options)
+    );
+  }
+
+  // Re-read to guarantee atomicity under concurrent requests
+  const persisted = db.prepare(`SELECT * FROM daily_track_challenges WHERE challenge_date = ?`).get(utcDate) as any;
+  if (persisted && playableById.has(persisted.track_id)) {
+    const persistedTrack = playableById.get(persisted.track_id)!;
+    let persistedOptions: TitleOption[] = generated.options;
+    try {
+      const parsed = JSON.parse(persisted.options_json || '[]');
+      if (Array.isArray(parsed) && parsed.some((o: any) => o.id === persistedTrack.id)) {
+        persistedOptions = parsed;
+      }
+    } catch {}
+    return {
+      id: persisted.id,
+      challenge_date: utcDate,
+      track: persistedTrack,
+      snippet_start_seconds: Number(persisted.snippet_start_seconds) || 0,
+      snippet_start_ratio: Number(persisted.snippet_start_ratio) || 0,
+      snippet_duration_seconds: Math.min(
+        DAILY_SNIPPET_DURATION_SECONDS,
+        Math.max(1, Number(persisted.snippet_duration_seconds) || DAILY_SNIPPET_DURATION_SECONDS)
+      ),
+      options: persistedOptions,
+    };
+  }
+
+  return {
+    id: rowId,
+    challenge_date: utcDate,
+    track: generated.track,
+    snippet_start_seconds: generated.snippet_start_seconds,
+    snippet_start_ratio: generated.snippet_start_ratio,
+    snippet_duration_seconds: generated.snippet_duration_seconds,
+    options: generated.options,
+  };
+}
+
+function getOrCreateDailyQuizChallenge(utcDate: string): ValidatedQuizQuestion[] {
+  const rawQuestions = db.prepare(`
+    SELECT id, question_ru, question_en, options_json, correct_index, explanation_ru, explanation_en, difficulty, is_active
+    FROM quiz_questions
+    WHERE is_active = 1
+  `).all() as RawQuizQuestion[];
+
+  const validById = new Map<string, ValidatedQuizQuestion>();
+  for (const raw of rawQuestions) {
+    const valid = parseAndValidateQuizQuestion(raw);
+    if (valid && !validById.has(valid.id)) {
+      validById.set(valid.id, valid);
+    }
+  }
+  if (validById.size === 0) return [];
+
+  const existing = db.prepare(`
+    SELECT id, questions_json FROM daily_challenges WHERE challenge_date = ?
+  `).get(utcDate) as { id: string; questions_json: string } | undefined;
+
+  if (existing) {
+    try {
+      const storedIds = JSON.parse(existing.questions_json);
+      if (Array.isArray(storedIds)) {
+        const seen = new Set<string>();
+        const resolved: ValidatedQuizQuestion[] = [];
+        for (const qid of storedIds) {
+          if (typeof qid === 'string' && !seen.has(qid) && validById.has(qid)) {
+            seen.add(qid);
+            resolved.push(validById.get(qid)!);
+          }
+        }
+        if (resolved.length > 0) {
+          return resolved;
+        }
+      }
+    } catch {}
+  }
+
+  // Avoid repeating questions used in the last 3 UTC days when enough questions exist
+  const recentRows = db.prepare(`
+    SELECT questions_json FROM daily_challenges
+    WHERE challenge_date < ?
+    ORDER BY challenge_date DESC
+    LIMIT 3
+  `).all(utcDate) as Array<{ questions_json: string }>;
+
+  const recentQuestionIds: string[] = [];
+  for (const row of recentRows) {
+    try {
+      const parsed = JSON.parse(row.questions_json);
+      if (Array.isArray(parsed)) {
+        for (const id of parsed) {
+          if (typeof id === 'string') recentQuestionIds.push(id);
+        }
+      }
+    } catch {}
+  }
+
+  const selected = pickDailyQuizSet({
+    utcDate,
+    rawQuestions,
+    recentQuestionIds,
+    limit: DEFAULT_DAILY_QUIZ_COUNT,
+    secret: getDailyChallengeSecret(),
+  });
+  if (selected.length === 0) return [];
+
+  const selectedIds = selected.map((q) => q.id);
+  const rowId = existing?.id || `dq_${utcDate.replace(/-/g, '')}`;
+  if (existing) {
+    db.prepare(`UPDATE daily_challenges SET questions_json = ? WHERE challenge_date = ?`).run(
+      JSON.stringify(selectedIds),
+      utcDate
+    );
+  } else {
+    db.prepare(`
+      INSERT OR IGNORE INTO daily_challenges (id, challenge_date, questions_json)
+      VALUES (?, ?, ?)
+    `).run(rowId, utcDate, JSON.stringify(selectedIds));
+  }
+
+  const persisted = db.prepare(`SELECT questions_json FROM daily_challenges WHERE challenge_date = ?`).get(utcDate) as
+    | { questions_json: string }
+    | undefined;
+  if (persisted) {
+    try {
+      const ids = JSON.parse(persisted.questions_json);
+      if (Array.isArray(ids)) {
+        const resolved = ids
+          .filter((qid): qid is string => typeof qid === 'string' && validById.has(qid))
+          .map((qid) => validById.get(qid)!);
+        if (resolved.length > 0) return resolved;
+      }
+    } catch {}
+  }
+
+  return selected;
+}
+
+// 1. Daily Guess The Track (shared 24h UTC challenge with exact 5-second snippet)
+app.get('/api/games/guess-track/round', (req: Request, res: Response) => {
+  const user = getSessionUser(req);
+  const today = getUtcDateString();
+  const nextResetAt = getNextUtcMidnightIso(today);
+
+  const daily = getOrCreateDailyTrackChallenge(today);
+  if (!daily) {
+    res.status(404).json({ error: 'В архиве пока нет доступных аудиофайлов для ежедневного испытания.' });
+    return;
+  }
+
+  let alreadyCompleted = false;
+  let previousAttempt: {
+    correct: boolean;
+    selected_track_id: string;
+    correct_track_id: string;
+    score: number;
+    xp_earned: number;
+    track: any;
+  } | null = null;
 
   if (user) {
-    db.transaction(() => {
-      // Record game attempt
-      db.prepare(`
-        INSERT INTO game_attempts (id, user_id, game_id, score, xp_earned, details_json)
-        VALUES (?, ?, 'guess-track', ?, ?, ?)
-      `).run('att_' + crypto.randomUUID().slice(0, 8), user.id, isCorrect ? 100 : 0, xpEarned, JSON.stringify({ isCorrect, correctTrackId }));
+    const attempt = db.prepare(`
+      SELECT * FROM daily_track_attempts WHERE user_id = ? AND challenge_date = ?
+    `).get(user.id, today) as any;
+    if (attempt) {
+      alreadyCompleted = true;
+      previousAttempt = {
+        correct: Boolean(attempt.is_correct),
+        selected_track_id: attempt.selected_track_id,
+        correct_track_id: attempt.track_id,
+        score: Number(attempt.score) || 0,
+        xp_earned: Number(attempt.xp_earned) || 0,
+        track: getTrackRevealInfo(attempt.track_id) || { id: daily.track.id, title: daily.track.title },
+      };
+    }
+  }
 
-      // Record XP transaction
-      db.prepare(`
-        INSERT INTO xp_transactions (id, user_id, amount, source, details)
-        VALUES (?, ?, ?, 'guess_track', ?)
-      `).run('xpt_' + crypto.randomUUID().slice(0, 8), user.id, xpEarned, isCorrect ? 'Guessed correctly' : 'Participation reward');
+  // Notice: correct track id is NEVER returned until user completes today's challenge!
+  res.json({
+    challenge_date: today,
+    next_reset_at: nextResetAt,
+    round_token: `daily:${today}`,
+    audio_url: daily.track.audio_url,
+    snippet_start: daily.snippet_start_seconds,
+    snippet_start_ratio: daily.snippet_start_ratio,
+    snippet_duration: daily.snippet_duration_seconds,
+    options: daily.options,
+    already_completed: alreadyCompleted,
+    previous_attempt: previousAttempt,
+  });
+});
 
-      // Update spendable XP & total XP
-      db.prepare(`
-        UPDATE profiles SET
-          xp = xp + ?,
-          total_xp = total_xp + ?,
-          updated_at = datetime('now')
-        WHERE user_id = ?
-      `).run(xpEarned, xpEarned, user.id);
+app.post('/api/games/guess-track/verify', (req: AuthRequest, res: Response) => {
+  const { round_token, challenge_date, selected_track_id, time_spent } = req.body || {};
+  if (!selected_track_id || typeof selected_track_id !== 'string') {
+    res.status(400).json({ error: 'Missing selected_track_id' });
+    return;
+  }
 
-      // Recalculate level strictly from total_xp (never drops when spending XP)
-      const current = db.prepare('SELECT total_xp FROM profiles WHERE user_id = ?').get(user.id) as any;
-      const { level } = calculateLevelFromXp(current.total_xp);
-      db.prepare('UPDATE profiles SET level = ? WHERE user_id = ?').run(level, user.id);
+  const user = getSessionUser(req);
+  const today = getUtcDateString();
+  const nextResetAt = getNextUtcMidnightIso(today);
 
-      // Check achievements
-      const attemptsCount = (db.prepare('SELECT COUNT(*) as c FROM game_attempts WHERE user_id = ?').get(user.id) as any).c;
-      if (attemptsCount === 1) {
-        unlockAchievement(user.id, 'first_blood');
-      } else if (attemptsCount >= 10) {
-        unlockAchievement(user.id, 'initiate_ritual');
+  // Extract client challenge date (if provided) to gracefully handle midnight UTC rollover
+  let clientDate: string | null = null;
+  if (isValidUtcDateString(challenge_date)) {
+    clientDate = challenge_date;
+  } else if (typeof round_token === 'string' && round_token.startsWith('daily:')) {
+    const extracted = round_token.slice('daily:'.length);
+    if (isValidUtcDateString(extracted)) {
+      clientDate = extracted;
+    }
+  }
+
+  if (clientDate && clientDate !== today) {
+    res.status(409).json({
+      error: 'Наступил новый день (UTC) — доступно новое ежедневное испытание!',
+      code: 'DAILY_ROLLOVER',
+      challenge_date: today,
+      next_reset_at: nextResetAt,
+    });
+    return;
+  }
+
+  const daily = getOrCreateDailyTrackChallenge(today);
+  if (!daily) {
+    res.status(404).json({ error: 'Ежедневное испытание временно недоступно.' });
+    return;
+  }
+
+  if (!daily.options.some((o) => o.id === selected_track_id)) {
+    res.status(400).json({ error: 'Selected option is not valid for today\'s challenge.' });
+    return;
+  }
+
+  if (user) {
+    const existingAttempt = db.prepare(`
+      SELECT id FROM daily_track_attempts WHERE user_id = ? AND challenge_date = ?
+    `).get(user.id, today);
+    if (existingAttempt) {
+      res.status(400).json({
+        error: 'Вы уже прошли сегодняшнее испытание «Угадай трек». Новое появится в 00:00 UTC!',
+        already_completed: true,
+      });
+      return;
+    }
+  }
+
+  const correctTrackId = daily.track.id;
+  const isCorrect = correctTrackId === selected_track_id;
+  const safeTimeSpent = Math.max(1, Math.min(180, Math.round(Number(time_spent) || 10)));
+  const score = isCorrect ? 100 : 0;
+  let xpEarned = 5;
+  if (isCorrect) {
+    // 15 XP base + speed bonus if under 15 seconds (up to 10 extra)
+    const speed = Math.max(0, 15 - Math.floor(safeTimeSpent));
+    xpEarned = 15 + Math.min(10, speed);
+  }
+
+  const trackInfo = getTrackRevealInfo(correctTrackId) || {
+    id: daily.track.id,
+    title: daily.track.title,
+    album_title: daily.track.album_title || 'Single',
+    cover_url: daily.track.cover_url,
+  };
+
+  if (user) {
+    try {
+      db.transaction(() => {
+        // Ensure today's daily track challenge row is persisted in the DB snapshot synced to Supabase
+        db.prepare(`
+          INSERT OR IGNORE INTO daily_track_challenges
+            (id, challenge_date, track_id, track_source, snippet_start_seconds, snippet_start_ratio, snippet_duration_seconds, options_json)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          daily.id,
+          today,
+          daily.track.id,
+          daily.track.source,
+          daily.snippet_start_seconds,
+          daily.snippet_start_ratio,
+          daily.snippet_duration_seconds,
+          JSON.stringify(daily.options)
+        );
+
+        // Enforce strictly 1 rewarded attempt per user per UTC day
+        db.prepare(`
+          INSERT INTO daily_track_attempts
+            (id, user_id, challenge_date, track_id, selected_track_id, is_correct, score, xp_earned, time_spent)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          'dta_' + crypto.randomUUID().slice(0, 8),
+          user.id,
+          today,
+          correctTrackId,
+          selected_track_id,
+          isCorrect ? 1 : 0,
+          score,
+          xpEarned,
+          safeTimeSpent
+        );
+
+        // Record game attempt
+        db.prepare(`
+          INSERT INTO game_attempts (id, user_id, game_id, score, xp_earned, details_json)
+          VALUES (?, ?, 'guess-track', ?, ?, ?)
+        `).run(
+          'att_' + crypto.randomUUID().slice(0, 8),
+          user.id,
+          score,
+          xpEarned,
+          JSON.stringify({ isCorrect, correctTrackId, challengeDate: today })
+        );
+
+        // Record XP transaction
+        db.prepare(`
+          INSERT INTO xp_transactions (id, user_id, amount, source, details)
+          VALUES (?, ?, ?, 'guess_track', ?)
+        `).run(
+          'xpt_' + crypto.randomUUID().slice(0, 8),
+          user.id,
+          xpEarned,
+          isCorrect ? `Daily Guess Track (${today}): Correct` : `Daily Guess Track (${today}): Participation`
+        );
+
+        const prev = db.prepare('SELECT total_xp, daily_streak, last_active_date FROM profiles WHERE user_id = ?').get(user.id) as any;
+        const nextStreak = computeDailyStreak(prev?.last_active_date, today, prev?.daily_streak || 0);
+        const nextTotalXp = (prev?.total_xp || 0) + xpEarned;
+        const { level } = calculateLevelFromXp(nextTotalXp);
+
+        db.prepare(`
+          UPDATE profiles SET
+            xp = xp + ?,
+            total_xp = ?,
+            level = ?,
+            daily_streak = ?,
+            last_active_date = ?,
+            updated_at = datetime('now')
+          WHERE user_id = ?
+        `).run(xpEarned, nextTotalXp, level, nextStreak, today, user.id);
+
+        // Check achievements
+        const attemptsCount = (db.prepare('SELECT COUNT(*) as c FROM game_attempts WHERE user_id = ?').get(user.id) as any).c;
+        if (attemptsCount >= 1) unlockAchievement(user.id, 'first_blood');
+        if (attemptsCount >= 10) unlockAchievement(user.id, 'initiate_ritual');
+        if (nextStreak >= 3) unlockAchievement(user.id, 'devoted_acolyte');
+        if (nextStreak >= 7) unlockAchievement(user.id, 'eternal_vigil');
+        if (nextTotalXp >= 500) unlockAchievement(user.id, 'dark_apostle');
+      })();
+    } catch (err: any) {
+      if (String(err?.message || '').includes('UNIQUE')) {
+        res.status(400).json({
+          error: 'Вы уже прошли сегодняшнее испытание «Угадай трек». Новое появится в 00:00 UTC!',
+          already_completed: true,
+        });
+        return;
       }
-      if (current.total_xp >= 500) {
-        unlockAchievement(user.id, 'dark_apostle');
-      }
-    })();
+      throw err;
+    }
   }
 
   res.json({
     correct: isCorrect,
     correct_track_id: correctTrackId,
+    selected_track_id,
+    score,
     xp_earned: xpEarned,
     track: trackInfo,
+    challenge_date: today,
+    next_reset_at: nextResetAt,
   });
 });
 
-// 2. Daily Quiz with daily lock & duplicate protection
+// 2. Daily Quiz with 24h UTC persisted set & duplicate protection
 app.get('/api/games/quiz/daily', (req: Request, res: Response) => {
   const user = getSessionUser(req);
-  const today = new Date().toISOString().split('T')[0];
+  const today = getUtcDateString();
+  const nextResetAt = getNextUtcMidnightIso(today);
 
   let alreadyCompleted = false;
   let previousScore = 0;
@@ -1444,20 +1853,12 @@ app.get('/api/games/quiz/daily', (req: Request, res: Response) => {
     }
   }
 
-  // Returns deterministically rotated daily questions without correct_index
-  const activeQuestions = db.prepare(`
-    SELECT id, question_ru, question_en, options_json, difficulty
-    FROM quiz_questions
-    WHERE is_active = 1
-  `).all() as any[];
-
-  const questions = pickDailyQuizQuestions(activeQuestions, today, 5);
-
+  const questions = getOrCreateDailyQuizChallenge(today);
   const sanitized = questions.map((q) => ({
     id: q.id,
     question_ru: q.question_ru,
     question_en: q.question_en,
-    options: JSON.parse(q.options_json),
+    options: q.options,
     difficulty: q.difficulty,
   }));
 
@@ -1467,18 +1868,30 @@ app.get('/api/games/quiz/daily', (req: Request, res: Response) => {
     previous_score: previousScore,
     previous_xp: previousXp,
     challenge_date: today,
+    next_reset_at: nextResetAt,
   });
 });
 
 app.post('/api/games/quiz/submit', (req: AuthRequest, res: Response) => {
-  const { answers, time_spent_seconds } = req.body;
-  if (!answers || typeof answers !== 'object') {
+  const { answers, time_spent_seconds, challenge_date } = req.body || {};
+  if (!answers || typeof answers !== 'object' || Array.isArray(answers)) {
     res.status(400).json({ error: 'Answers must be provided.' });
     return;
   }
 
   const user = getSessionUser(req);
-  const today = new Date().toISOString().split('T')[0];
+  const today = getUtcDateString();
+  const nextResetAt = getNextUtcMidnightIso(today);
+
+  if (isValidUtcDateString(challenge_date) && challenge_date !== today) {
+    res.status(409).json({
+      error: 'Наступил новый день (UTC) — доступна новая ежедневная викторина!',
+      code: 'DAILY_ROLLOVER',
+      challenge_date: today,
+      next_reset_at: nextResetAt,
+    });
+    return;
+  }
 
   if (user) {
     const existingAttempt = db.prepare(`
@@ -1491,17 +1904,23 @@ app.post('/api/games/quiz/submit', (req: AuthRequest, res: Response) => {
     }
   }
 
-  const allQuestions = db.prepare(`
-    SELECT id, question_ru, question_en, options_json, correct_index, explanation_ru, explanation_en
-    FROM quiz_questions
-    WHERE is_active = 1
-  `).all() as any[];
+  const dailyQuestions = getOrCreateDailyQuizChallenge(today);
+  if (dailyQuestions.length === 0) {
+    res.status(404).json({ error: 'Вопросы для ежедневной викторины не найдены.' });
+    return;
+  }
 
   let correctCount = 0;
-  const matchedQuestions = allQuestions.filter((q) => answers[q.id] !== undefined);
-  const total = matchedQuestions.length;
-  const results = matchedQuestions.map((q) => {
-    const selectedIndex = answers[q.id];
+  const matchedQuestions = dailyQuestions.filter((q) => answers[q.id] !== undefined);
+  if (matchedQuestions.length === 0) {
+    res.status(400).json({ error: 'Не переданы ответы на сегодняшние вопросы викторины.' });
+    return;
+  }
+
+  const total = dailyQuestions.length;
+  const results = dailyQuestions.map((q) => {
+    const rawSelected = answers[q.id];
+    const selectedIndex = Number.isInteger(Number(rawSelected)) ? Number(rawSelected) : -1;
     const isCorrect = selectedIndex === q.correct_index;
     if (isCorrect) correctCount++;
     return {
@@ -1517,53 +1936,73 @@ app.post('/api/games/quiz/submit', (req: AuthRequest, res: Response) => {
   const { baseScore, speedBonus, totalXp } = calculateQuizScore(total, correctCount, safeTime);
 
   if (user) {
-    db.transaction(() => {
-      // Record in quiz_attempts
-      db.prepare(`
-        INSERT INTO quiz_attempts (id, user_id, challenge_date, score, xp_earned)
-        VALUES (?, ?, ?, ?, ?)
-      `).run('qa_' + crypto.randomUUID().slice(0, 8), user.id, today, baseScore, totalXp);
+    try {
+      db.transaction(() => {
+        // Ensure today's daily_challenges row is persisted in the DB snapshot synced to Supabase
+        db.prepare(`
+          INSERT OR IGNORE INTO daily_challenges (id, challenge_date, questions_json)
+          VALUES (?, ?, ?)
+        `).run(`dq_${today.replace(/-/g, '')}`, today, JSON.stringify(dailyQuestions.map((q) => q.id)));
 
-      // Record in game_attempts
-      db.prepare(`
-        INSERT INTO game_attempts (id, user_id, game_id, score, xp_earned, details_json)
-        VALUES (?, ?, 'daily-quiz', ?, ?, ?)
-      `).run('att_' + crypto.randomUUID().slice(0, 8), user.id, baseScore, totalXp, JSON.stringify({ correctCount, total }));
+        // Record in quiz_attempts (UNIQUE(user_id, challenge_date) enforces single reward)
+        db.prepare(`
+          INSERT INTO quiz_attempts (id, user_id, challenge_date, score, xp_earned)
+          VALUES (?, ?, ?, ?, ?)
+        `).run('qa_' + crypto.randomUUID().slice(0, 8), user.id, today, baseScore, totalXp);
 
-      // Record XP transaction
-      db.prepare(`
-        INSERT INTO xp_transactions (id, user_id, amount, source, details)
-        VALUES (?, ?, ?, 'daily_quiz', ?)
-      `).run('xpt_' + crypto.randomUUID().slice(0, 8), user.id, totalXp, `Daily Quiz score: ${correctCount}/${total}`);
+        // Record in game_attempts
+        db.prepare(`
+          INSERT INTO game_attempts (id, user_id, game_id, score, xp_earned, details_json)
+          VALUES (?, ?, 'daily-quiz', ?, ?, ?)
+        `).run(
+          'att_' + crypto.randomUUID().slice(0, 8),
+          user.id,
+          baseScore,
+          totalXp,
+          JSON.stringify({ correctCount, total, challengeDate: today })
+        );
 
-      const prev = db.prepare('SELECT total_xp, daily_streak, last_active_date FROM profiles WHERE user_id = ?').get(user.id) as any;
-      const nextStreak = computeDailyStreak(prev?.last_active_date, today, prev?.daily_streak || 0);
-      const nextTotalXp = (prev?.total_xp || 0) + totalXp;
-      const { level } = calculateLevelFromXp(nextTotalXp);
+        // Record XP transaction
+        db.prepare(`
+          INSERT INTO xp_transactions (id, user_id, amount, source, details)
+          VALUES (?, ?, ?, 'daily_quiz', ?)
+        `).run('xpt_' + crypto.randomUUID().slice(0, 8), user.id, totalXp, `Daily Quiz (${today}): ${correctCount}/${total}`);
 
-      // Update spendable XP, total XP, level, and streak accurately
-      db.prepare(`
-        UPDATE profiles SET
-          xp = xp + ?,
-          total_xp = ?,
-          level = ?,
-          daily_streak = ?,
-          last_active_date = ?,
-          updated_at = datetime('now')
-        WHERE user_id = ?
-      `).run(totalXp, nextTotalXp, level, nextStreak, today, user.id);
+        const prev = db.prepare('SELECT total_xp, daily_streak, last_active_date FROM profiles WHERE user_id = ?').get(user.id) as any;
+        const nextStreak = computeDailyStreak(prev?.last_active_date, today, prev?.daily_streak || 0);
+        const nextTotalXp = (prev?.total_xp || 0) + totalXp;
+        const { level } = calculateLevelFromXp(nextTotalXp);
 
-      // Check achievements
-      unlockAchievement(user.id, 'first_blood');
-      if (nextStreak >= 3) unlockAchievement(user.id, 'devoted_acolyte');
-      if (nextStreak >= 7) unlockAchievement(user.id, 'eternal_vigil');
-      if (correctCount === total && total >= 3) {
-        unlockAchievement(user.id, 'lore_scholar');
+        // Update spendable XP, total XP, level, and streak accurately
+        db.prepare(`
+          UPDATE profiles SET
+            xp = xp + ?,
+            total_xp = ?,
+            level = ?,
+            daily_streak = ?,
+            last_active_date = ?,
+            updated_at = datetime('now')
+          WHERE user_id = ?
+        `).run(totalXp, nextTotalXp, level, nextStreak, today, user.id);
+
+        // Check achievements
+        unlockAchievement(user.id, 'first_blood');
+        if (nextStreak >= 3) unlockAchievement(user.id, 'devoted_acolyte');
+        if (nextStreak >= 7) unlockAchievement(user.id, 'eternal_vigil');
+        if (correctCount === total && total >= 3) {
+          unlockAchievement(user.id, 'lore_scholar');
+        }
+        if (nextTotalXp >= 500) {
+          unlockAchievement(user.id, 'dark_apostle');
+        }
+      })();
+    } catch (err: any) {
+      if (String(err?.message || '').includes('UNIQUE')) {
+        res.status(400).json({ error: 'Вы уже прошли ежедневную викторину сегодня. Возвращайтесь завтра!' });
+        return;
       }
-      if (nextTotalXp >= 500) {
-        unlockAchievement(user.id, 'dark_apostle');
-      }
-    })();
+      throw err;
+    }
   }
 
   res.json({
@@ -1573,6 +2012,8 @@ app.post('/api/games/quiz/submit', (req: AuthRequest, res: Response) => {
     speed_bonus: speedBonus,
     total_xp: totalXp,
     results,
+    challenge_date: today,
+    next_reset_at: nextResetAt,
   });
 });
 
@@ -1586,9 +2027,40 @@ function unlockAchievement(userId: string, achievementSlug: string) {
   `).run('uach_' + crypto.randomUUID().slice(0, 8), userId, ach.id);
 }
 
-// 3. Leaderboard (All-Time, Weekly, Monthly)
+// 3. Leaderboard (All-Time, Weekly, Monthly + optional Game filter)
 app.get('/api/games/leaderboard', (req: Request, res: Response) => {
-  const timeframe = req.query.timeframe || 'all'; // all, weekly, monthly
+  const rawTimeframe = String(req.query.timeframe || 'all');
+  const timeframe = rawTimeframe === 'weekly' || rawTimeframe === 'monthly' ? rawTimeframe : 'all';
+  const rawGame = String(req.query.game || 'all');
+  const gameFilter = rawGame === 'guess-track' || rawGame === 'daily-quiz' ? rawGame : 'all';
+
+  if (gameFilter !== 'all') {
+    const timeClause =
+      timeframe === 'weekly'
+        ? "AND datetime(ga.created_at) >= datetime('now', '-7 days')"
+        : timeframe === 'monthly'
+          ? "AND datetime(ga.created_at) >= datetime('now', '-30 days')"
+          : '';
+    const leaders = db.prepare(`
+      SELECT u.id, u.nickname, p.display_name, p.avatar_url, p.level,
+             p.equipped_frame, p.equipped_banner, p.equipped_name_style, p.equipped_badge,
+             COALESCE(SUM(ga.xp_earned), 0) as xp,
+             COALESCE(SUM(ga.score), 0) as score,
+             p.daily_streak,
+             COUNT(ga.id) as games_played
+      FROM users u
+      JOIN profiles p ON p.user_id = u.id
+      JOIN game_attempts ga ON ga.user_id = u.id AND ga.game_id = ? ${timeClause}
+      WHERE u.is_banned = 0
+      GROUP BY u.id
+      HAVING COUNT(ga.id) > 0
+      ORDER BY xp DESC, score DESC, games_played DESC
+      LIMIT 50
+    `).all(gameFilter);
+    res.json({ leaders, timeframe, game: gameFilter });
+    return;
+  }
+
   let query = `
     SELECT u.id, u.nickname, p.display_name, p.avatar_url, p.level, p.total_xp as xp, p.daily_streak,
            p.equipped_frame, p.equipped_banner, p.equipped_name_style, p.equipped_badge,
@@ -1596,7 +2068,8 @@ app.get('/api/games/leaderboard', (req: Request, res: Response) => {
     FROM users u
     JOIN profiles p ON p.user_id = u.id
     WHERE u.is_banned = 0
-    ORDER BY p.total_xp DESC, p.level DESC
+      AND (p.total_xp > 0 OR EXISTS (SELECT 1 FROM game_attempts ga WHERE ga.user_id = u.id))
+    ORDER BY p.total_xp DESC, games_played DESC, p.level DESC
     LIMIT 50
   `;
 
@@ -1611,7 +2084,8 @@ app.get('/api/games/leaderboard', (req: Request, res: Response) => {
       LEFT JOIN xp_transactions xt ON xt.user_id = u.id AND xt.amount > 0 AND datetime(xt.created_at) >= datetime('now', '-7 days')
       WHERE u.is_banned = 0
       GROUP BY u.id
-      ORDER BY xp DESC
+      HAVING xp > 0 OR games_played > 0
+      ORDER BY xp DESC, games_played DESC
       LIMIT 50
     `;
   } else if (timeframe === 'monthly') {
@@ -1625,13 +2099,14 @@ app.get('/api/games/leaderboard', (req: Request, res: Response) => {
       LEFT JOIN xp_transactions xt ON xt.user_id = u.id AND xt.amount > 0 AND datetime(xt.created_at) >= datetime('now', '-30 days')
       WHERE u.is_banned = 0
       GROUP BY u.id
-      ORDER BY xp DESC
+      HAVING xp > 0 OR games_played > 0
+      ORDER BY xp DESC, games_played DESC
       LIMIT 50
     `;
   }
 
   const leaders = db.prepare(query).all();
-  res.json({ leaders });
+  res.json({ leaders, timeframe, game: gameFilter });
 });
 
 // ----------------------------------------------------------------------------
@@ -2944,6 +3419,298 @@ app.put('/api/admin/quiz-questions/:id', requireAdminOrMod, (req: AuthRequest, r
 app.delete('/api/admin/quiz-questions/:id', requireAdminOrMod, (req: AuthRequest, res: Response) => {
   db.prepare('DELETE FROM quiz_questions WHERE id = ?').run(req.params.id);
   res.json({ ok: true });
+});
+
+// ----------------------------------------------------------------------------
+// API: ADMIN LEADERBOARD MANAGEMENT (SAFE GAME-ONLY RESETS, NEVER DELETES ACCOUNTS)
+// ----------------------------------------------------------------------------
+
+function adjustUserProfileAfterXpRemoval(userId: string, removedXp: number) {
+  const safeRemoved = Math.max(0, Math.floor(removedXp || 0));
+  if (safeRemoved <= 0) return;
+  const prof = db.prepare('SELECT xp, total_xp FROM profiles WHERE user_id = ?').get(userId) as any;
+  if (!prof) return;
+  const nextTotalXp = Math.max(0, (Number(prof.total_xp) || 0) - safeRemoved);
+  const nextSpendableXp = Math.max(0, (Number(prof.xp) || 0) - safeRemoved);
+  const { level } = calculateLevelFromXp(nextTotalXp);
+  db.prepare(`
+    UPDATE profiles
+    SET xp = ?, total_xp = ?, level = ?, updated_at = datetime('now')
+    WHERE user_id = ?
+  `).run(nextSpendableXp, nextTotalXp, level, userId);
+}
+
+app.get('/api/admin/leaderboard', requireAdminOrMod, (req: Request, res: Response) => {
+  const rawTimeframe = String(req.query.timeframe || 'all');
+  const timeframe = rawTimeframe === 'weekly' || rawTimeframe === 'monthly' ? rawTimeframe : 'all';
+  const rawGame = String(req.query.game || 'all');
+  const gameFilter = rawGame === 'guess-track' || rawGame === 'daily-quiz' ? rawGame : 'all';
+  const search = String(req.query.search || '').trim().toLowerCase();
+  const today = getUtcDateString();
+
+  const timeConditionGa =
+    timeframe === 'weekly'
+      ? "AND datetime(ga.created_at) >= datetime('now', '-7 days')"
+      : timeframe === 'monthly'
+        ? "AND datetime(ga.created_at) >= datetime('now', '-30 days')"
+        : '';
+
+  const timeConditionXt =
+    timeframe === 'weekly'
+      ? "AND datetime(xt.created_at) >= datetime('now', '-7 days')"
+      : timeframe === 'monthly'
+        ? "AND datetime(xt.created_at) >= datetime('now', '-30 days')"
+        : '';
+
+  const rows = db.prepare(`
+    SELECT
+      u.id,
+      u.nickname,
+      u.role_id,
+      u.is_banned,
+      p.display_name,
+      p.avatar_url,
+      p.level,
+      p.xp as spendable_xp,
+      p.total_xp,
+      p.daily_streak,
+      (SELECT COUNT(*) FROM game_attempts ga WHERE ga.user_id = u.id ${timeConditionGa}) as games_played,
+      (SELECT COUNT(*) FROM game_attempts ga WHERE ga.user_id = u.id AND ga.game_id = 'guess-track' ${timeConditionGa}) as guess_track_played,
+      (SELECT COUNT(*) FROM game_attempts ga WHERE ga.user_id = u.id AND ga.game_id = 'daily-quiz' ${timeConditionGa}) as daily_quiz_played,
+      (SELECT COALESCE(SUM(ga.score), 0) FROM game_attempts ga WHERE ga.user_id = u.id ${gameFilter !== 'all' ? 'AND ga.game_id = @gameFilter' : ''} ${timeConditionGa}) as game_score,
+      (SELECT COALESCE(SUM(ga.xp_earned), 0) FROM game_attempts ga WHERE ga.user_id = u.id ${gameFilter !== 'all' ? 'AND ga.game_id = @gameFilter' : ''} ${timeConditionGa}) as game_xp,
+      (SELECT COALESCE(SUM(xt.amount), 0) FROM xp_transactions xt WHERE xt.user_id = u.id AND xt.amount > 0 ${timeConditionXt}) as period_xp,
+      EXISTS(SELECT 1 FROM daily_track_attempts dta WHERE dta.user_id = u.id AND dta.challenge_date = @today) as completed_today_track,
+      EXISTS(SELECT 1 FROM quiz_attempts qa WHERE qa.user_id = u.id AND qa.challenge_date = @today) as completed_today_quiz
+    FROM users u
+    JOIN profiles p ON p.user_id = u.id
+  `).all({ gameFilter, today }) as any[];
+
+  const enriched = rows
+    .map((row) => {
+      const rankXp =
+        gameFilter !== 'all'
+          ? Number(row.game_xp) || 0
+          : timeframe === 'all'
+            ? Number(row.total_xp) || 0
+            : Number(row.period_xp) || 0;
+      const scopedGamesPlayed =
+        gameFilter === 'guess-track'
+          ? Number(row.guess_track_played) || 0
+          : gameFilter === 'daily-quiz'
+            ? Number(row.daily_quiz_played) || 0
+            : Number(row.games_played) || 0;
+      return {
+        ...row,
+        rank_xp: rankXp,
+        scoped_games_played: scopedGamesPlayed,
+        completed_today_track: Boolean(row.completed_today_track),
+        completed_today_quiz: Boolean(row.completed_today_quiz),
+      };
+    })
+    .filter((row) => {
+      if (row.rank_xp <= 0 && row.scoped_games_played <= 0 && !row.completed_today_track && !row.completed_today_quiz) {
+        return false;
+      }
+      if (search) {
+        const nick = String(row.nickname || '').toLowerCase();
+        const disp = String(row.display_name || '').toLowerCase();
+        return nick.includes(search) || disp.includes(search);
+      }
+      return true;
+    })
+    .sort((a, b) => {
+      if (b.rank_xp !== a.rank_xp) return b.rank_xp - a.rank_xp;
+      if (b.game_score !== a.game_score) return b.game_score - a.game_score;
+      return b.scoped_games_played - a.scoped_games_played;
+    });
+
+  const todayTrack = getOrCreateDailyTrackChallenge(today);
+  const todayQuiz = getOrCreateDailyQuizChallenge(today);
+  const totalAttempts = (db.prepare('SELECT COUNT(*) as c FROM game_attempts').get() as any)?.c || 0;
+  const todayTrackAttempts = (db.prepare('SELECT COUNT(*) as c FROM daily_track_attempts WHERE challenge_date = ?').get(today) as any)?.c || 0;
+  const todayQuizAttempts = (db.prepare('SELECT COUNT(*) as c FROM quiz_attempts WHERE challenge_date = ?').get(today) as any)?.c || 0;
+
+  res.json({
+    leaders: enriched,
+    timeframe,
+    game: gameFilter,
+    summary: {
+      today_utc: today,
+      next_reset_at: getNextUtcMidnightIso(today),
+      total_ranked: enriched.length,
+      total_attempts: totalAttempts,
+      today_track_title: todayTrack?.track.title || null,
+      today_track_snippet_start: todayTrack?.snippet_start_seconds ?? null,
+      today_track_snippet_duration: todayTrack?.snippet_duration_seconds ?? DAILY_SNIPPET_DURATION_SECONDS,
+      today_track_attempts: todayTrackAttempts,
+      today_quiz_count: todayQuiz.length,
+      today_quiz_attempts: todayQuizAttempts,
+    },
+  });
+});
+
+app.post('/api/admin/leaderboard/clear', requireAdmin, (req: AuthRequest, res: Response) => {
+  const rawScope = String(req.body?.scope || 'all').trim();
+  const allowedScopes = new Set(['all', 'weekly', 'monthly', 'guess-track', 'daily-quiz', 'daily-attempts']);
+  if (!allowedScopes.has(rawScope)) {
+    res.status(400).json({ error: 'Invalid leaderboard clear scope.' });
+    return;
+  }
+
+  const today = getUtcDateString();
+  const removed = {
+    game_attempts: 0,
+    daily_track_attempts: 0,
+    quiz_attempts: 0,
+    xp_transactions: 0,
+    profiles_updated: 0,
+  };
+
+  db.transaction(() => {
+    if (rawScope === 'all') {
+      removed.game_attempts = db.prepare('DELETE FROM game_attempts').run().changes;
+      removed.daily_track_attempts = db.prepare('DELETE FROM daily_track_attempts').run().changes;
+      removed.quiz_attempts = db.prepare('DELETE FROM quiz_attempts').run().changes;
+      removed.xp_transactions = db.prepare("DELETE FROM xp_transactions WHERE source IN ('guess_track', 'daily_quiz') OR amount > 0").run().changes;
+      removed.profiles_updated = db.prepare(`
+        UPDATE profiles
+        SET xp = 0, total_xp = 0, level = 1, daily_streak = 0, last_active_date = NULL, updated_at = datetime('now')
+      `).run().changes;
+    } else if (rawScope === 'weekly' || rawScope === 'monthly') {
+      const windowSql = rawScope === 'weekly' ? '-7 days' : '-30 days';
+      const xpByUser = db.prepare(`
+        SELECT user_id, COALESCE(SUM(amount), 0) as sum_xp
+        FROM xp_transactions
+        WHERE amount > 0 AND datetime(created_at) >= datetime('now', ?)
+        GROUP BY user_id
+      `).all(windowSql) as Array<{ user_id: string; sum_xp: number }>;
+
+      removed.game_attempts = db.prepare(`DELETE FROM game_attempts WHERE datetime(created_at) >= datetime('now', ?)`).run(windowSql).changes;
+      removed.daily_track_attempts = db.prepare(`DELETE FROM daily_track_attempts WHERE datetime(created_at) >= datetime('now', ?)`).run(windowSql).changes;
+      removed.quiz_attempts = db.prepare(`DELETE FROM quiz_attempts WHERE datetime(created_at) >= datetime('now', ?)`).run(windowSql).changes;
+      removed.xp_transactions = db.prepare(`DELETE FROM xp_transactions WHERE amount > 0 AND datetime(created_at) >= datetime('now', ?)`).run(windowSql).changes;
+
+      for (const item of xpByUser) {
+        adjustUserProfileAfterXpRemoval(item.user_id, item.sum_xp);
+        removed.profiles_updated += 1;
+      }
+    } else if (rawScope === 'guess-track') {
+      const xpByUser = db.prepare(`
+        SELECT user_id, COALESCE(SUM(xp_earned), 0) as sum_xp
+        FROM game_attempts
+        WHERE game_id = 'guess-track'
+        GROUP BY user_id
+      `).all() as Array<{ user_id: string; sum_xp: number }>;
+
+      removed.game_attempts = db.prepare("DELETE FROM game_attempts WHERE game_id = 'guess-track'").run().changes;
+      removed.daily_track_attempts = db.prepare('DELETE FROM daily_track_attempts').run().changes;
+      removed.xp_transactions = db.prepare("DELETE FROM xp_transactions WHERE source = 'guess_track'").run().changes;
+
+      for (const item of xpByUser) {
+        adjustUserProfileAfterXpRemoval(item.user_id, item.sum_xp);
+        removed.profiles_updated += 1;
+      }
+    } else if (rawScope === 'daily-quiz') {
+      const xpByUser = db.prepare(`
+        SELECT user_id, COALESCE(SUM(xp_earned), 0) as sum_xp
+        FROM game_attempts
+        WHERE game_id = 'daily-quiz'
+        GROUP BY user_id
+      `).all() as Array<{ user_id: string; sum_xp: number }>;
+
+      removed.game_attempts = db.prepare("DELETE FROM game_attempts WHERE game_id = 'daily-quiz'").run().changes;
+      removed.quiz_attempts = db.prepare('DELETE FROM quiz_attempts').run().changes;
+      removed.xp_transactions = db.prepare("DELETE FROM xp_transactions WHERE source = 'daily_quiz'").run().changes;
+
+      for (const item of xpByUser) {
+        adjustUserProfileAfterXpRemoval(item.user_id, item.sum_xp);
+        removed.profiles_updated += 1;
+      }
+    } else if (rawScope === 'daily-attempts') {
+      removed.daily_track_attempts = db.prepare('DELETE FROM daily_track_attempts WHERE challenge_date = ?').run(today).changes;
+      removed.quiz_attempts = db.prepare('DELETE FROM quiz_attempts WHERE challenge_date = ?').run(today).changes;
+    }
+
+    db.prepare(`
+      INSERT INTO moderation_actions (id, moderator_id, target_user_id, action_type, details)
+      VALUES (?, ?, ?, 'leaderboard_clear', ?)
+    `).run(
+      'mod_' + crypto.randomUUID().slice(0, 8),
+      req.user!.id,
+      req.user!.id,
+      `Cleared leaderboard scope=${rawScope} (${JSON.stringify(removed)})`
+    );
+  })();
+
+  res.json({ ok: true, scope: rawScope, removed });
+});
+
+app.delete('/api/admin/leaderboard/users/:userId', requireAdmin, (req: AuthRequest, res: Response) => {
+  const userId = String(req.params.userId || '').trim();
+  const rawScope = String(req.query.scope || req.body?.scope || 'all').trim();
+  const allowedScopes = new Set(['all', 'guess-track', 'daily-quiz', 'daily-attempts']);
+  if (!allowedScopes.has(rawScope)) {
+    res.status(400).json({ error: 'Invalid user leaderboard reset scope.' });
+    return;
+  }
+
+  const targetUser = db.prepare('SELECT id, nickname FROM users WHERE id = ?').get(userId) as
+    | { id: string; nickname: string }
+    | undefined;
+  if (!targetUser) {
+    res.status(404).json({ error: 'Пользователь не найден.' });
+    return;
+  }
+
+  const today = getUtcDateString();
+  const removed = {
+    game_attempts: 0,
+    daily_track_attempts: 0,
+    quiz_attempts: 0,
+    xp_transactions: 0,
+  };
+
+  db.transaction(() => {
+    if (rawScope === 'all') {
+      removed.game_attempts = db.prepare('DELETE FROM game_attempts WHERE user_id = ?').run(userId).changes;
+      removed.daily_track_attempts = db.prepare('DELETE FROM daily_track_attempts WHERE user_id = ?').run(userId).changes;
+      removed.quiz_attempts = db.prepare('DELETE FROM quiz_attempts WHERE user_id = ?').run(userId).changes;
+      removed.xp_transactions = db.prepare("DELETE FROM xp_transactions WHERE user_id = ? AND (source IN ('guess_track', 'daily_quiz') OR amount > 0)").run(userId).changes;
+      db.prepare(`
+        UPDATE profiles
+        SET xp = 0, total_xp = 0, level = 1, daily_streak = 0, last_active_date = NULL, updated_at = datetime('now')
+        WHERE user_id = ?
+      `).run(userId);
+    } else if (rawScope === 'guess-track') {
+      const sumRow = db.prepare("SELECT COALESCE(SUM(xp_earned), 0) as sum_xp FROM game_attempts WHERE user_id = ? AND game_id = 'guess-track'").get(userId) as any;
+      removed.game_attempts = db.prepare("DELETE FROM game_attempts WHERE user_id = ? AND game_id = 'guess-track'").run(userId).changes;
+      removed.daily_track_attempts = db.prepare('DELETE FROM daily_track_attempts WHERE user_id = ?').run(userId).changes;
+      removed.xp_transactions = db.prepare("DELETE FROM xp_transactions WHERE user_id = ? AND source = 'guess_track'").run(userId).changes;
+      adjustUserProfileAfterXpRemoval(userId, Number(sumRow?.sum_xp) || 0);
+    } else if (rawScope === 'daily-quiz') {
+      const sumRow = db.prepare("SELECT COALESCE(SUM(xp_earned), 0) as sum_xp FROM game_attempts WHERE user_id = ? AND game_id = 'daily-quiz'").get(userId) as any;
+      removed.game_attempts = db.prepare("DELETE FROM game_attempts WHERE user_id = ? AND game_id = 'daily-quiz'").run(userId).changes;
+      removed.quiz_attempts = db.prepare('DELETE FROM quiz_attempts WHERE user_id = ?').run(userId).changes;
+      removed.xp_transactions = db.prepare("DELETE FROM xp_transactions WHERE user_id = ? AND source = 'daily_quiz'").run(userId).changes;
+      adjustUserProfileAfterXpRemoval(userId, Number(sumRow?.sum_xp) || 0);
+    } else if (rawScope === 'daily-attempts') {
+      removed.daily_track_attempts = db.prepare('DELETE FROM daily_track_attempts WHERE user_id = ? AND challenge_date = ?').run(userId, today).changes;
+      removed.quiz_attempts = db.prepare('DELETE FROM quiz_attempts WHERE user_id = ? AND challenge_date = ?').run(userId, today).changes;
+    }
+
+    db.prepare(`
+      INSERT INTO moderation_actions (id, moderator_id, target_user_id, action_type, details)
+      VALUES (?, ?, ?, 'leaderboard_user_reset', ?)
+    `).run(
+      'mod_' + crypto.randomUUID().slice(0, 8),
+      req.user!.id,
+      userId,
+      `Reset leaderboard for @${targetUser.nickname} scope=${rawScope} (${JSON.stringify(removed)})`
+    );
+  })();
+
+  res.json({ ok: true, user_id: userId, nickname: targetUser.nickname, scope: rawScope, removed });
 });
 
 // ----------------------------------------------------------------------------
