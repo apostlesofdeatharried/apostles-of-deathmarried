@@ -9,6 +9,7 @@ import bcrypt from 'bcryptjs';
 import { db, initDatabase, closeDatabase } from './server/db.js';
 import {
   ensureCloudDatabaseRestored,
+  syncCloudDatabase,
   pushDatabaseBackupNow,
   getCloudSyncStatus,
   isSupabaseConfigured,
@@ -59,33 +60,77 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(cookieParser());
 
-// Cloud database cold-start restore & write-through snapshot sync middleware
+// Disable HTTP/CDN/browser caching on all /api/* responses so admin edits appear immediately
+app.use('/api', (_req: Request, res: Response, next: NextFunction) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  res.setHeader('CDN-Cache-Control', 'no-store');
+  res.setHeader('Vercel-CDN-Cache-Control', 'no-store');
+  next();
+});
+
+const STATELESS_POST_PATHS = new Set(['/api/upload/signed-url']);
+
+// Cloud database freshness check (before reads/writes) & write-through snapshot sync middleware
 app.use(async (req: Request, res: Response, next: NextFunction) => {
   if (req.path.startsWith('/api') || req.path.startsWith('/uploads')) {
-    try {
-      await ensureCloudDatabaseRestored();
-    } catch {}
-    if (['POST', 'PUT', 'DELETE', 'PATCH'].includes(req.method)) {
-      if (isVercel && isSupabaseConfigured()) {
-        // On Vercel Serverless, flush SQLite snapshot BEFORE ending the response so the container is not frozen mid-upload
+    const isMutation =
+      ['POST', 'PUT', 'DELETE', 'PATCH'].includes(req.method) &&
+      !STATELESS_POST_PATHS.has(req.path);
+
+    if (isSupabaseConfigured()) {
+      try {
+        if (isMutation) {
+          // Always pull the latest SQLite snapshot before mutating so a warm Vercel Lambda
+          // never overwrites newer cloud data with a stale /tmp/apostles.db
+          await syncCloudDatabase({ force: true });
+        } else if (req.path.startsWith('/api')) {
+          // On Vercel GET requests, check ETag freshness via If-None-Match so all instances stay in sync
+          await syncCloudDatabase({ force: isVercel, minIntervalMs: isVercel ? 0 : 5000 });
+        } else {
+          await ensureCloudDatabaseRestored();
+        }
+      } catch (err) {
+        console.warn('[CloudSync] Pre-request sync warning:', err instanceof Error ? err.message : err);
+      }
+
+      if (isMutation) {
+        // Flush checkpointed SQLite snapshot to Supabase Storage BEFORE sending the HTTP response.
+        // If cloud upload fails, return HTTP 500 with the exact error instead of a false 200 OK.
         const originalJson = res.json.bind(res);
+        let cloudSyncHandled = false;
         res.json = ((body: any) => {
+          if (cloudSyncHandled) {
+            return originalJson(body);
+          }
+          cloudSyncHandled = true;
           if (res.statusCode >= 200 && res.statusCode < 400) {
             pushDatabaseBackupNow()
-              .catch(() => {})
-              .finally(() => {
-                originalJson(body);
+              .then((syncResult) => {
+                if (!syncResult.ok) {
+                  console.error('[CloudSync] Failed to persist mutation to Supabase:', syncResult.error);
+                  res.status(500);
+                  return originalJson({
+                    error: `Ошибка сохранения базы данных в Supabase Storage: ${syncResult.error || 'unknown error'}`,
+                    cloud_sync_error: syncResult.error || 'unknown error',
+                  });
+                }
+                return originalJson(body);
+              })
+              .catch((err: any) => {
+                const msg = err?.message || 'unexpected cloud sync failure';
+                console.error('[CloudSync] Mutation backup threw:', msg);
+                res.status(500);
+                return originalJson({
+                  error: `Ошибка сохранения базы данных в Supabase Storage: ${msg}`,
+                  cloud_sync_error: msg,
+                });
               });
             return res;
           }
           return originalJson(body);
         }) as Response['json'];
-      } else {
-        res.on('finish', () => {
-          if (res.statusCode >= 200 && res.statusCode < 400) {
-            void pushDatabaseBackupNow();
-          }
-        });
       }
     }
   }
@@ -160,11 +205,12 @@ function localAudioExists(audioUrl?: string | null): boolean {
     const diskPath = path.join(uploadDir, filename);
     const publicPath = path.resolve(process.cwd(), 'public', 'uploads', filename);
     if (fs.existsSync(diskPath) || fs.existsSync(publicPath)) return true;
+    if (isSupabaseConfigured()) return true;
     try {
       const blobRow = db.prepare('SELECT 1 FROM uploaded_blobs WHERE filename = ?').get(filename);
       if (blobRow) return true;
       const indexedAudio = db.prepare('SELECT 1 FROM audio_files WHERE storage_path = ?').get(trimmed);
-      if (indexedAudio && isSupabaseConfigured()) return true;
+      if (indexedAudio) return true;
     } catch {}
     return false;
   }
@@ -748,6 +794,12 @@ app.post('/api/archive/albums', requireAdminOrMod, (req: AuthRequest, res: Respo
 });
 
 app.put('/api/archive/albums/:id', requireAdminOrMod, (req: AuthRequest, res: Response) => {
+  const existingAlbum = db.prepare('SELECT id FROM albums WHERE id = ?').get(req.params.id);
+  if (!existingAlbum) {
+    res.status(404).json({ error: 'Album not found' });
+    return;
+  }
+
   const { title, format_type, release_year, release_date, cover_url, description, source_url, streaming_links, sort_order } = req.body || {};
   const hasCover = 'cover_url' in (req.body || {});
   const nextCover = typeof cover_url === 'string' && cover_url.trim() ? cover_url.trim() : null;
@@ -799,13 +851,36 @@ app.put('/api/archive/albums/:id', requireAdminOrMod, (req: AuthRequest, res: Re
     req.params.id
   );
 
-  res.json({ ok: true });
+  const updatedAlbum = db.prepare('SELECT * FROM albums WHERE id = ?').get(req.params.id);
+  res.json({ ok: true, id: req.params.id, album: updatedAlbum });
 });
 
 app.delete('/api/archive/albums/:id', requireAdminOrMod, (req: AuthRequest, res: Response) => {
-  db.prepare('DELETE FROM tracks WHERE album_id = ?').run(req.params.id);
-  db.prepare('DELETE FROM albums WHERE id = ?').run(req.params.id);
-  res.json({ ok: true });
+  const albumId = req.params.id;
+  const existingAlbum = db.prepare('SELECT id FROM albums WHERE id = ?').get(albumId);
+  if (!existingAlbum) {
+    res.status(404).json({ error: 'Album not found' });
+    return;
+  }
+
+  let deletedTracks = 0;
+  db.transaction(() => {
+    const albumTracks = db.prepare('SELECT id FROM tracks WHERE album_id = ?').all(albumId) as Array<{ id: string }>;
+    deletedTracks = albumTracks.length;
+
+    for (const trk of albumTracks) {
+      db.prepare('UPDATE audio_files SET track_id = NULL WHERE track_id = ?').run(trk.id);
+      db.prepare('DELETE FROM guess_track_rounds WHERE correct_track_id = ?').run(trk.id);
+      db.prepare("DELETE FROM favorites WHERE target_type = 'track' AND target_id = ?").run(trk.id);
+    }
+
+    db.prepare("DELETE FROM favorites WHERE target_type = 'album' AND target_id = ?").run(albumId);
+    db.prepare("DELETE FROM reactions WHERE target_type = 'album' AND target_id = ?").run(albumId);
+    db.prepare('DELETE FROM tracks WHERE album_id = ?').run(albumId);
+    db.prepare('DELETE FROM albums WHERE id = ?').run(albumId);
+  })();
+
+  res.json({ ok: true, deletedId: albumId, deletedTracks });
 });
 
 // Admin tracks management
@@ -814,6 +889,20 @@ app.post('/api/archive/tracks', requireAdminOrMod, (req: AuthRequest, res: Respo
   if (typeof title !== 'string' || !title.trim()) {
     res.status(400).json({ error: 'Track title is required.' });
     return;
+  }
+  if (album_id) {
+    const parentAlbum = db.prepare('SELECT id FROM albums WHERE id = ?').get(album_id);
+    if (!parentAlbum) {
+      res.status(400).json({ error: 'Selected album does not exist.' });
+      return;
+    }
+  }
+  if (single_id) {
+    const parentSingle = db.prepare('SELECT id FROM singles WHERE id = ?').get(single_id);
+    if (!parentSingle) {
+      res.status(400).json({ error: 'Selected single does not exist.' });
+      return;
+    }
   }
   const cleanAudio = typeof audio_url === 'string' ? audio_url.trim() : '';
   if (cleanAudio && !isSafeMediaUrl(cleanAudio)) {
@@ -827,36 +916,47 @@ app.post('/api/archive/tracks', requireAdminOrMod, (req: AuthRequest, res: Respo
   }
 
   const id = 'trk_' + crypto.randomUUID().slice(0, 8);
-  db.prepare(`
-    INSERT INTO tracks (id, album_id, single_id, title, track_number, duration_seconds, audio_url, lyrics, external_url)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    id,
-    album_id || null,
-    single_id || null,
-    title.trim(),
-    Number(track_number) || 1,
-    Number(duration_seconds) || 180,
-    cleanAudio,
-    typeof lyrics === 'string' ? lyrics : '',
-    cleanExternal
-  );
-
-  // Update album track_count & duration if linked
-  if (album_id) {
+  db.transaction(() => {
     db.prepare(`
-      UPDATE albums SET
-        track_count = (SELECT COUNT(*) FROM tracks WHERE album_id = ?),
-        duration_seconds = (SELECT COALESCE(SUM(duration_seconds), 0) FROM tracks WHERE album_id = ?)
-      WHERE id = ?
-    `).run(album_id, album_id, album_id);
-  }
+      INSERT INTO tracks (id, album_id, single_id, title, track_number, duration_seconds, audio_url, lyrics, external_url)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id,
+      album_id || null,
+      single_id || null,
+      title.trim(),
+      Number(track_number) || 1,
+      Number(duration_seconds) || 180,
+      cleanAudio,
+      typeof lyrics === 'string' ? lyrics : '',
+      cleanExternal
+    );
 
-  res.json({ ok: true, id });
+    if (cleanAudio.startsWith('/uploads/')) {
+      db.prepare('UPDATE audio_files SET track_id = ? WHERE storage_path = ?').run(id, cleanAudio);
+    }
+
+    if (album_id) {
+      db.prepare(`
+        UPDATE albums SET
+          track_count = (SELECT COUNT(*) FROM tracks WHERE album_id = ?),
+          duration_seconds = (SELECT COALESCE(SUM(duration_seconds), 0) FROM tracks WHERE album_id = ?),
+          updated_at = datetime('now')
+        WHERE id = ?
+      `).run(album_id, album_id, album_id);
+    }
+  })();
+
+  const savedTrack = db.prepare('SELECT * FROM tracks WHERE id = ?').get(id) as any;
+  res.json({
+    ok: true,
+    id,
+    track: savedTrack ? { ...savedTrack, has_local_audio: localAudioExists(savedTrack.audio_url) } : null,
+  });
 });
 
 app.put('/api/archive/tracks/:id', requireAdminOrMod, (req: AuthRequest, res: Response) => {
-  const existingTrack = db.prepare('SELECT album_id FROM tracks WHERE id = ?').get(req.params.id) as any;
+  const existingTrack = db.prepare('SELECT album_id, audio_url FROM tracks WHERE id = ?').get(req.params.id) as any;
   if (!existingTrack) {
     res.status(404).json({ error: 'Track not found' });
     return;
@@ -864,6 +964,13 @@ app.put('/api/archive/tracks/:id', requireAdminOrMod, (req: AuthRequest, res: Re
 
   const { album_id, title, track_number, duration_seconds, audio_url, lyrics, external_url } = req.body || {};
   const hasAlbumId = 'album_id' in (req.body || {});
+  if (hasAlbumId && album_id) {
+    const parentAlbum = db.prepare('SELECT id FROM albums WHERE id = ?').get(album_id);
+    if (!parentAlbum) {
+      res.status(400).json({ error: 'Selected album does not exist.' });
+      return;
+    }
+  }
   const hasAudio = 'audio_url' in (req.body || {});
   const nextAudio = typeof audio_url === 'string' ? audio_url.trim() : '';
   if (hasAudio && nextAudio && !isSafeMediaUrl(nextAudio)) {
@@ -875,58 +982,85 @@ app.put('/api/archive/tracks/:id', requireAdminOrMod, (req: AuthRequest, res: Re
     return;
   }
 
-  db.prepare(`
-    UPDATE tracks SET
-      album_id = CASE WHEN ? = 1 THEN ? ELSE album_id END,
-      title = COALESCE(?, title),
-      track_number = COALESCE(?, track_number),
-      duration_seconds = COALESCE(?, duration_seconds),
-      audio_url = CASE WHEN ? = 1 THEN ? ELSE audio_url END,
-      lyrics = COALESCE(?, lyrics),
-      external_url = COALESCE(?, external_url)
-    WHERE id = ?
-  `).run(
-    hasAlbumId ? 1 : 0,
-    album_id || null,
-    typeof title === 'string' && title.trim() ? title.trim() : null,
-    track_number ?? null,
-    duration_seconds ?? null,
-    hasAudio ? 1 : 0,
-    nextAudio,
-    typeof lyrics === 'string' ? lyrics : null,
-    typeof external_url === 'string' ? external_url.trim() : null,
-    req.params.id
-  );
-
-  const track = db.prepare('SELECT album_id FROM tracks WHERE id = ?').get(req.params.id) as any;
-  const affectedAlbums = new Set<string>();
-  if (existingTrack.album_id) affectedAlbums.add(existingTrack.album_id);
-  if (track?.album_id) affectedAlbums.add(track.album_id);
-
-  for (const albId of affectedAlbums) {
+  db.transaction(() => {
     db.prepare(`
-      UPDATE albums SET
-        track_count = (SELECT COUNT(*) FROM tracks WHERE album_id = ?),
-        duration_seconds = (SELECT COALESCE(SUM(duration_seconds), 0) FROM tracks WHERE album_id = ?)
+      UPDATE tracks SET
+        album_id = CASE WHEN ? = 1 THEN ? ELSE album_id END,
+        title = COALESCE(?, title),
+        track_number = COALESCE(?, track_number),
+        duration_seconds = COALESCE(?, duration_seconds),
+        audio_url = CASE WHEN ? = 1 THEN ? ELSE audio_url END,
+        lyrics = COALESCE(?, lyrics),
+        external_url = COALESCE(?, external_url)
       WHERE id = ?
-    `).run(albId, albId, albId);
-  }
+    `).run(
+      hasAlbumId ? 1 : 0,
+      album_id || null,
+      typeof title === 'string' && title.trim() ? title.trim() : null,
+      track_number ?? null,
+      duration_seconds ?? null,
+      hasAudio ? 1 : 0,
+      nextAudio,
+      typeof lyrics === 'string' ? lyrics : null,
+      typeof external_url === 'string' ? external_url.trim() : null,
+      req.params.id
+    );
 
-  res.json({ ok: true });
+    if (hasAudio) {
+      db.prepare('UPDATE audio_files SET track_id = NULL WHERE track_id = ? AND storage_path != ?').run(req.params.id, nextAudio);
+      if (nextAudio.startsWith('/uploads/')) {
+        db.prepare('UPDATE audio_files SET track_id = ? WHERE storage_path = ?').run(req.params.id, nextAudio);
+      }
+    }
+
+    const updatedRef = db.prepare('SELECT album_id FROM tracks WHERE id = ?').get(req.params.id) as any;
+    const affectedAlbums = new Set<string>();
+    if (existingTrack.album_id) affectedAlbums.add(existingTrack.album_id);
+    if (updatedRef?.album_id) affectedAlbums.add(updatedRef.album_id);
+
+    for (const albId of affectedAlbums) {
+      db.prepare(`
+        UPDATE albums SET
+          track_count = (SELECT COUNT(*) FROM tracks WHERE album_id = ?),
+          duration_seconds = (SELECT COALESCE(SUM(duration_seconds), 0) FROM tracks WHERE album_id = ?),
+          updated_at = datetime('now')
+        WHERE id = ?
+      `).run(albId, albId, albId);
+    }
+  })();
+
+  const savedTrack = db.prepare('SELECT * FROM tracks WHERE id = ?').get(req.params.id) as any;
+  res.json({
+    ok: true,
+    id: req.params.id,
+    track: savedTrack ? { ...savedTrack, has_local_audio: localAudioExists(savedTrack.audio_url) } : null,
+  });
 });
 
 app.delete('/api/archive/tracks/:id', requireAdminOrMod, (req: AuthRequest, res: Response) => {
-  const track = db.prepare('SELECT album_id FROM tracks WHERE id = ?').get(req.params.id) as any;
-  db.prepare('DELETE FROM tracks WHERE id = ?').run(req.params.id);
-  if (track?.album_id) {
-    db.prepare(`
-      UPDATE albums SET
-        track_count = (SELECT COUNT(*) FROM tracks WHERE album_id = ?),
-        duration_seconds = (SELECT COALESCE(SUM(duration_seconds), 0) FROM tracks WHERE album_id = ?)
-      WHERE id = ?
-    `).run(track.album_id, track.album_id, track.album_id);
+  const track = db.prepare('SELECT id, album_id FROM tracks WHERE id = ?').get(req.params.id) as any;
+  if (!track) {
+    res.status(404).json({ error: 'Track not found' });
+    return;
   }
-  res.json({ ok: true });
+
+  db.transaction(() => {
+    db.prepare('UPDATE audio_files SET track_id = NULL WHERE track_id = ?').run(track.id);
+    db.prepare('DELETE FROM guess_track_rounds WHERE correct_track_id = ?').run(track.id);
+    db.prepare("DELETE FROM favorites WHERE target_type = 'track' AND target_id = ?").run(track.id);
+    db.prepare('DELETE FROM tracks WHERE id = ?').run(track.id);
+    if (track.album_id) {
+      db.prepare(`
+        UPDATE albums SET
+          track_count = (SELECT COUNT(*) FROM tracks WHERE album_id = ?),
+          duration_seconds = (SELECT COALESCE(SUM(duration_seconds), 0) FROM tracks WHERE album_id = ?),
+          updated_at = datetime('now')
+        WHERE id = ?
+      `).run(track.album_id, track.album_id, track.album_id);
+    }
+  })();
+
+  res.json({ ok: true, deletedId: track.id });
 });
 
 // Admin singles management
@@ -978,6 +1112,12 @@ app.post('/api/archive/singles', requireAdminOrMod, (req: AuthRequest, res: Resp
 });
 
 app.put('/api/archive/singles/:id', requireAdminOrMod, (req: AuthRequest, res: Response) => {
+  const existingSingle = db.prepare('SELECT id FROM singles WHERE id = ?').get(req.params.id);
+  if (!existingSingle) {
+    res.status(404).json({ error: 'Single not found' });
+    return;
+  }
+
   const { title, release_year, release_date, cover_url, description, duration_seconds, audio_url, lyrics, streaming_links, sort_order } = req.body || {};
   const hasCover = 'cover_url' in (req.body || {});
   const nextCover = typeof cover_url === 'string' && cover_url.trim() ? cover_url.trim() : null;
@@ -1015,7 +1155,8 @@ app.put('/api/archive/singles/:id', requireAdminOrMod, (req: AuthRequest, res: R
       audio_url = CASE WHEN ? = 1 THEN ? ELSE audio_url END,
       lyrics = COALESCE(?, lyrics),
       streaming_links_json = COALESCE(?, streaming_links_json),
-      sort_order = COALESCE(?, sort_order)
+      sort_order = COALESCE(?, sort_order),
+      updated_at = datetime('now')
     WHERE id = ?
   `).run(
     typeof title === 'string' && title.trim() ? title.trim() : null,
@@ -1033,12 +1174,31 @@ app.put('/api/archive/singles/:id', requireAdminOrMod, (req: AuthRequest, res: R
     req.params.id
   );
 
-  res.json({ ok: true });
+  const savedSingle = db.prepare('SELECT * FROM singles WHERE id = ?').get(req.params.id);
+  res.json({ ok: true, id: req.params.id, single: savedSingle });
 });
 
 app.delete('/api/archive/singles/:id', requireAdminOrMod, (req: AuthRequest, res: Response) => {
-  db.prepare('DELETE FROM singles WHERE id = ?').run(req.params.id);
-  res.json({ ok: true });
+  const singleId = req.params.id;
+  const existingSingle = db.prepare('SELECT id FROM singles WHERE id = ?').get(singleId);
+  if (!existingSingle) {
+    res.status(404).json({ error: 'Single not found' });
+    return;
+  }
+
+  db.transaction(() => {
+    const linkedTracks = db.prepare('SELECT id FROM tracks WHERE single_id = ?').all(singleId) as Array<{ id: string }>;
+    for (const trk of linkedTracks) {
+      db.prepare('UPDATE audio_files SET track_id = NULL WHERE track_id = ?').run(trk.id);
+      db.prepare('DELETE FROM guess_track_rounds WHERE correct_track_id = ?').run(trk.id);
+    }
+    db.prepare('DELETE FROM guess_track_rounds WHERE correct_track_id = ?').run(singleId);
+    db.prepare("DELETE FROM favorites WHERE target_type = 'single' AND target_id = ?").run(singleId);
+    db.prepare('DELETE FROM tracks WHERE single_id = ?').run(singleId);
+    db.prepare('DELETE FROM singles WHERE id = ?').run(singleId);
+  })();
+
+  res.json({ ok: true, deletedId: singleId });
 });
 
 // Admin media storage inventory (audio tracks + uploaded cover images)

@@ -51,47 +51,79 @@ function openConfiguredDatabase(dbPath: string): Database.Database {
   try {
     // Single-file rollback journal prevents -wal/-shm sidecar desyncs during cloud/container snapshots
     instance.pragma('journal_mode = DELETE');
-    instance.pragma('synchronous = NORMAL');
+    instance.pragma('synchronous = FULL');
   } catch {}
   instance.pragma('foreign_keys = ON');
   return instance;
 }
 
-export let db = openConfiguredDatabase(activeDbPath);
+let currentDb: Database.Database = openConfiguredDatabase(activeDbPath);
+
+// Live Proxy guarantees every module (ESM or transpiled CJS) always targets the current reopened DB handle
+export const db: Database.Database = new Proxy({} as Database.Database, {
+  get(_target, prop) {
+    const value = (currentDb as any)[prop];
+    return typeof value === 'function' ? value.bind(currentDb) : value;
+  },
+});
 
 export function getDbPath(): string {
   return activeDbPath;
 }
 
-export function closeDatabase(): void {
+export function checkpointDatabase(): void {
   try {
-    db.pragma('wal_checkpoint(TRUNCATE)');
+    currentDb.pragma('wal_checkpoint(TRUNCATE)');
   } catch {}
   try {
-    db.close();
+    currentDb.pragma('journal_mode = DELETE');
+  } catch {}
+}
+
+export function closeDatabase(): void {
+  checkpointDatabase();
+  try {
+    currentDb.close();
   } catch {}
 }
 
 export function serializeDatabase(): Buffer {
-  return db.serialize();
+  checkpointDatabase();
+  return currentDb.serialize();
 }
 
 export function replaceDatabaseWithBuffer(buffer: Buffer): void {
   if (!buffer || buffer.length < 100) return;
+  if (buffer.subarray(0, 15).toString('utf8') !== 'SQLite format 3') {
+    throw new Error('Invalid SQLite database buffer');
+  }
   try {
-    db.close();
+    currentDb.pragma('wal_checkpoint(TRUNCATE)');
   } catch {}
   try {
-    if (fs.existsSync(`${activeDbPath}-wal`)) fs.unlinkSync(`${activeDbPath}-wal`);
-    if (fs.existsSync(`${activeDbPath}-shm`)) fs.unlinkSync(`${activeDbPath}-shm`);
+    currentDb.close();
   } catch {}
-  fs.writeFileSync(activeDbPath, buffer);
-  db = openConfiguredDatabase(activeDbPath);
-  initDatabase();
+  for (const suffix of ['-wal', '-shm', '-journal']) {
+    try {
+      if (fs.existsSync(`${activeDbPath}${suffix}`)) {
+        fs.unlinkSync(`${activeDbPath}${suffix}`);
+      }
+    } catch {}
+  }
+  const tmpFile = `${activeDbPath}.swap.${process.pid}.${Date.now()}`;
+  fs.writeFileSync(tmpFile, buffer);
+  fs.renameSync(tmpFile, activeDbPath);
+  currentDb = openConfiguredDatabase(activeDbPath);
+  ensureSchemaAndMigrations();
 }
 
-export function initDatabase() {
+export function ensureSchemaAndMigrations() {
   db.exec(`
+    CREATE TABLE IF NOT EXISTS app_meta (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS roles (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL UNIQUE,
@@ -463,12 +495,23 @@ export function initDatabase() {
   try { db.exec("ALTER TABLE comments ADD COLUMN status TEXT NOT NULL DEFAULT 'approved';"); } catch {}
   try { db.exec("ALTER TABLE creations ADD COLUMN status TEXT NOT NULL DEFAULT 'approved';"); } catch {}
   try { db.exec("ALTER TABLE creations ADD COLUMN rejection_reason TEXT;"); } catch {}
+  try { db.exec("ALTER TABLE users ADD COLUMN email TEXT;"); } catch {}
+  try { db.exec("ALTER TABLE albums ADD COLUMN streaming_links_json TEXT;"); } catch {}
+  try { db.exec("ALTER TABLE albums ADD COLUMN verified_source TEXT;"); } catch {}
+  try { db.exec("ALTER TABLE albums ADD COLUMN last_verified_at TEXT;"); } catch {}
+  try { db.exec("ALTER TABLE singles ADD COLUMN streaming_links_json TEXT;"); } catch {}
+  try { db.exec("ALTER TABLE singles ADD COLUMN verified_source TEXT;"); } catch {}
+  try { db.exec("ALTER TABLE singles ADD COLUMN last_verified_at TEXT;"); } catch {}
+  try { db.exec("ALTER TABLE singles ADD COLUMN lyrics TEXT;"); } catch {}
 
   // Sync total_xp with existing xp if total_xp is 0
   try {
     db.exec("UPDATE profiles SET total_xp = xp WHERE total_xp = 0 AND xp > 0;");
   } catch {}
+}
 
+export function initDatabase() {
+  ensureSchemaAndMigrations();
   seedInitialData();
 }
 
@@ -626,10 +669,14 @@ function seedInitialData() {
   try { db.exec("ALTER TABLE singles ADD COLUMN last_verified_at TEXT;"); } catch {}
 
   // --------------------------------------------------------------------------
-  // SEED VERIFIED DEATHMARRIED DISCOGRAPHY (ALBUMS, EPS, SINGLES)
+  // SEED VERIFIED DEATHMARRIED DISCOGRAPHY (ALBUMS, EPS, SINGLES) — ONCE ONLY
   // --------------------------------------------------------------------------
+  const discographySeeded = db.prepare("SELECT value FROM app_meta WHERE key = 'discography_seeded'").get() as { value: string } | undefined;
   const albumCount = db.prepare('SELECT COUNT(*) as count FROM albums').get() as { count: number };
-  if (albumCount.count === 0) {
+  if (!discographySeeded && albumCount.count > 0) {
+    db.prepare("INSERT OR REPLACE INTO app_meta (key, value) VALUES ('discography_seeded', '1')").run();
+  }
+  if (!discographySeeded && albumCount.count === 0) {
     // 1. Studio Album: nightmortan (Released October 10, 2025)
     const alb1Id = 'alb_nightmortan';
     const nightmortanStreaming = JSON.stringify({
@@ -928,6 +975,7 @@ function seedInitialData() {
         idx + 1
       );
     });
+    db.prepare("INSERT OR REPLACE INTO app_meta (key, value) VALUES ('discography_seeded', '1')").run();
   }
 
   // Seed verified Quiz Questions on real deathmarried canon
@@ -1049,25 +1097,29 @@ function seedInitialData() {
     db.prepare("UPDATE posts SET category_id = 'cat_official' WHERE category_id = 'cat_lore'").run();
     db.prepare("DELETE FROM post_categories WHERE id = 'cat_lore'").run();
 
-    // Clean duplicate broken track trk_8f0b51c4 and ensure verified track #9 (the last violin) exists
-    const brokenAudioPath = path.resolve('public/audio/the_last_violin.mp3');
-    if (!fs.existsSync(brokenAudioPath)) {
-      db.prepare("DELETE FROM tracks WHERE id = 'trk_8f0b51c4' AND audio_url = '/audio/the_last_violin.mp3'").run();
-    }
-    const nmAlbum = db.prepare("SELECT id FROM albums WHERE id = 'alb_nightmortan'").get();
-    const hasLastViolin = db.prepare("SELECT id FROM tracks WHERE album_id = 'alb_nightmortan' AND LOWER(title) = 'the last violin'").get();
-    if (nmAlbum && !hasLastViolin) {
+    const cleanupApplied = db.prepare("SELECT value FROM app_meta WHERE key = 'cleanup_v1_applied'").get();
+    if (!cleanupApplied) {
+      // Clean duplicate broken track trk_8f0b51c4 and ensure verified track #9 (the last violin) exists (once only)
+      const brokenAudioPath = path.resolve('public/audio/the_last_violin.mp3');
+      if (!fs.existsSync(brokenAudioPath)) {
+        db.prepare("DELETE FROM tracks WHERE id = 'trk_8f0b51c4' AND audio_url = '/audio/the_last_violin.mp3'").run();
+      }
+      const nmAlbum = db.prepare("SELECT id FROM albums WHERE id = 'alb_nightmortan'").get();
+      const hasLastViolin = db.prepare("SELECT id FROM tracks WHERE album_id = 'alb_nightmortan' AND LOWER(title) = 'the last violin'").get();
+      if (nmAlbum && !hasLastViolin) {
+        db.prepare(`
+          INSERT OR IGNORE INTO tracks (id, album_id, title, track_number, duration_seconds, audio_url, lyrics, source_url, is_verified)
+          VALUES ('trk_nm_09', 'alb_nightmortan', 'the last violin', 9, 162, '', 'final bow strokes fading into absolute stillness', 'https://music.apple.com/us/artist/deathmarried/1769850125', 1)
+        `).run();
+      }
       db.prepare(`
-        INSERT OR IGNORE INTO tracks (id, album_id, title, track_number, duration_seconds, audio_url, lyrics, source_url, is_verified)
-        VALUES ('trk_nm_09', 'alb_nightmortan', 'the last violin', 9, 162, '', 'final bow strokes fading into absolute stillness', 'https://music.apple.com/us/artist/deathmarried/1769850125', 1)
+        UPDATE albums SET
+          track_count = (SELECT COUNT(*) FROM tracks WHERE album_id = albums.id),
+          duration_seconds = (SELECT COALESCE(SUM(duration_seconds), 0) FROM tracks WHERE album_id = albums.id)
+        WHERE id = 'alb_nightmortan'
       `).run();
+      db.prepare("INSERT OR REPLACE INTO app_meta (key, value) VALUES ('cleanup_v1_applied', '1')").run();
     }
-    db.prepare(`
-      UPDATE albums SET
-        track_count = (SELECT COUNT(*) FROM tracks WHERE album_id = albums.id),
-        duration_seconds = (SELECT COALESCE(SUM(duration_seconds), 0) FROM tracks WHERE album_id = albums.id)
-      WHERE id = 'alb_nightmortan'
-    `).run();
 
     // Update cliché admin display_name if untouched
     db.prepare("UPDATE profiles SET display_name = 'Archive Curator (Admin)' WHERE user_id = 'usr_admin_001' AND display_name = 'Arch-Apostle (Admin)'").run();

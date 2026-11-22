@@ -18,7 +18,7 @@ export const authFetch = async (url: string, options: RequestInit = {}): Promise
   if (token && !headers.has('Authorization')) {
     headers.set('Authorization', `Bearer ${token}`);
   }
-  return fetch(url, { credentials: 'include', ...options, headers });
+  return fetch(url, { credentials: 'include', cache: 'no-store', ...options, headers });
 };
 
 interface AuthContextType {

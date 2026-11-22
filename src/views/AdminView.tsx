@@ -159,6 +159,29 @@ export const AdminView: React.FC = () => {
   const [trackDuration, setTrackDuration] = useState('180');
   const [trackLyrics, setTrackLyrics] = useState('');
 
+  // Refs synced with media URL states so rapid submits right after upload never read stale values
+  const albumCoverUrlRef = useRef('');
+  const singleCoverUrlRef = useRef('');
+  const singleAudioUrlRef = useRef('');
+  const trackAudioUrlRef = useRef('');
+
+  const updateAlbumCoverUrl = (val: string) => {
+    albumCoverUrlRef.current = val;
+    setAlbumCoverUrl(val);
+  };
+  const updateSingleCoverUrl = (val: string) => {
+    singleCoverUrlRef.current = val;
+    setSingleCoverUrl(val);
+  };
+  const updateSingleAudioUrl = (val: string) => {
+    singleAudioUrlRef.current = val;
+    setSingleAudioUrl(val);
+  };
+  const updateTrackAudioUrl = (val: string) => {
+    trackAudioUrlRef.current = val;
+    setTrackAudioUrl(val);
+  };
+
   // Clear toast timer
   useEffect(() => {
     if (statusMessage) {
@@ -177,18 +200,19 @@ export const AdminView: React.FC = () => {
   const fetchAdminData = async () => {
     setLoading(true);
     try {
+      const noStoreInit: RequestInit = { cache: 'no-store' };
       const [resStats, resUsers, resAlb, resSng, resAud, resGame, resQuiz, resPosts, resCreations, resReports, resHealth] = await Promise.all([
-        authFetch('/api/admin/stats'),
-        authFetch('/api/admin/users'),
-        authFetch('/api/archive/albums'),
-        authFetch('/api/archive/singles'),
-        authFetch('/api/admin/audio-files'),
-        authFetch('/api/admin/game-tracks'),
-        authFetch('/api/admin/quiz-questions'),
-        authFetch('/api/community/posts?status=all'),
-        authFetch('/api/creations?status=all'),
-        authFetch('/api/admin/reports'),
-        fetch('/api/health'),
+        authFetch('/api/admin/stats', noStoreInit),
+        authFetch('/api/admin/users', noStoreInit),
+        authFetch('/api/archive/albums', noStoreInit),
+        authFetch('/api/archive/singles', noStoreInit),
+        authFetch('/api/admin/audio-files', noStoreInit),
+        authFetch('/api/admin/game-tracks', noStoreInit),
+        authFetch('/api/admin/quiz-questions', noStoreInit),
+        authFetch('/api/community/posts?status=all', noStoreInit),
+        authFetch('/api/creations?status=all', noStoreInit),
+        authFetch('/api/admin/reports', noStoreInit),
+        fetch('/api/health', noStoreInit),
       ]);
 
       if (resStats.ok) setStats((await safeJson<any>(resStats, {})).stats);
@@ -196,9 +220,11 @@ export const AdminView: React.FC = () => {
       if (resAlb.ok) {
         const albs = (await safeJson<any>(resAlb, {})).albums || [];
         setAlbumsList(albs);
-        if (albs.length > 0 && !trackAlbumId) {
-          setTrackAlbumId(albs[0].id);
-        }
+        setTrackAlbumId((prev) => {
+          if (albs.length === 0) return '';
+          if (prev && albs.some((a: any) => a.id === prev)) return prev;
+          return albs[0].id;
+        });
       }
       if (resSng.ok) setSinglesList((await safeJson<any>(resSng, {})).singles || []);
       if (resAud.ok) setMediaFilesList((await safeJson<any>(resAud, {})).files || []);
@@ -454,29 +480,31 @@ export const AdminView: React.FC = () => {
     setStatusMessage(lang === 'ru' ? 'Загрузка файла...' : 'Uploading file...');
     setErrorMessage(null);
 
-    const applyUploadedResult = (uploadedUrl: string, uploadedName: string) => {
+    const applyUploadedResult = async (uploadedUrl: string, uploadedName: string) => {
+      const normalizedUrl = uploadedUrl.trim();
+      if (targetField === 'albumCover') {
+        updateAlbumCoverUrl(normalizedUrl);
+      } else if (targetField === 'singleCover') {
+        updateSingleCoverUrl(normalizedUrl);
+      } else if (targetField === 'trackAudio') {
+        updateTrackAudioUrl(normalizedUrl);
+        if (normalizedUrl) autoDetectDuration(normalizedUrl, (sec) => setTrackDuration(String(sec)));
+      } else if (targetField === 'singleAudio') {
+        updateSingleAudioUrl(normalizedUrl);
+        if (normalizedUrl) autoDetectDuration(normalizedUrl, (sec) => setSingleDuration(String(sec)));
+      }
       setStatusMessage(
         lang === 'ru'
-          ? `Файл успешно загружен: ${uploadedName || file.name}`
-          : `Uploaded: ${uploadedName || file.name}`
+          ? `Файл загружен и привязан к форме: ${uploadedName || file.name}. Нажмите «Сохранить» для записи в архив.`
+          : `Uploaded and attached to form: ${uploadedName || file.name}. Click Save to persist.`
       );
-      if (targetField === 'albumCover') {
-        setAlbumCoverUrl(uploadedUrl);
-      } else if (targetField === 'singleCover') {
-        setSingleCoverUrl(uploadedUrl);
-      } else if (targetField === 'trackAudio') {
-        setTrackAudioUrl(uploadedUrl);
-        if (uploadedUrl) autoDetectDuration(uploadedUrl, (sec) => setTrackDuration(String(sec)));
-      } else if (targetField === 'singleAudio') {
-        setSingleAudioUrl(uploadedUrl);
-        if (uploadedUrl) autoDetectDuration(uploadedUrl, (sec) => setSingleDuration(String(sec)));
-      }
-      fetchAdminData();
+      await fetchAdminData();
     };
 
     try {
       // Attempt Step 1: direct signed Supabase Storage upload (bypasses Vercel 4.5MB body limit)
       let directHandled = false;
+      let uploadedToCloudStorage = false;
       try {
         const signRes = await authFetch('/api/upload/signed-url', {
           method: 'POST',
@@ -517,6 +545,7 @@ export const AdminView: React.FC = () => {
                 : `Cloud storage upload failed (HTTP ${putRes.status}).`
             );
           }
+          uploadedToCloudStorage = true;
 
           const completeRes = await authFetch('/api/upload/complete', {
             method: 'POST',
@@ -530,13 +559,18 @@ export const AdminView: React.FC = () => {
           });
           const completeData = await safeJson<{ url?: string; filename?: string; error?: string }>(completeRes, {});
           if (!completeRes.ok || !completeData.url) {
-            throw new Error(completeData.error || 'Failed to register uploaded file');
+            throw new Error(
+              completeData.error ||
+                (lang === 'ru'
+                  ? `Файл загружен в Supabase, но не удалось зарегистрировать запись (HTTP ${completeRes.status}).`
+                  : `Uploaded to Supabase, but failed to register metadata (HTTP ${completeRes.status}).`)
+            );
           }
           directHandled = true;
-          applyUploadedResult(completeData.url, completeData.filename || file.name);
+          await applyUploadedResult(completeData.url, completeData.filename || file.name);
         }
       } catch (directErr: any) {
-        if (file.size > 4 * 1024 * 1024) {
+        if (uploadedToCloudStorage || file.size > 4 * 1024 * 1024) {
           throw directErr;
         }
       }
@@ -569,7 +603,7 @@ export const AdminView: React.FC = () => {
         return;
       }
 
-      applyUploadedResult(data.url, data.filename || file.name);
+      await applyUploadedResult(data.url, data.filename || file.name);
     } catch (err: any) {
       setErrorMessage(err?.message || (lang === 'ru' ? 'Ошибка сети при загрузке файла' : 'Upload failed due to network error'));
       setStatusMessage(null);
@@ -581,7 +615,7 @@ export const AdminView: React.FC = () => {
   // Album Save / Update
   const handleSaveAlbum = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (savingAlbum || !albumTitle.trim()) return;
+    if (savingAlbum || uploadingField === 'albumCover' || !albumTitle.trim()) return;
 
     const streaming_links = {
       spotify: albumSpotify.trim() || undefined,
@@ -592,17 +626,19 @@ export const AdminView: React.FC = () => {
       youtube_music: albumYoutube.trim() || undefined,
     };
 
+    const effectiveCoverUrl = (albumCoverUrlRef.current || albumCoverUrl).trim();
     const payload = {
       title: albumTitle.trim(),
       format_type: albumFormat,
       release_year: parseInt(albumYear, 10) || 2025,
       release_date: albumDate.trim() || `${albumYear}-01-01`,
-      cover_url: albumCoverUrl.trim() || null,
+      cover_url: effectiveCoverUrl || null,
       description: albumDesc.trim(),
       streaming_links,
     };
 
     setSavingAlbum(true);
+    setErrorMessage(null);
     try {
       const res = editingAlbumId
         ? await authFetch(`/api/archive/albums/${editingAlbumId}`, {
@@ -616,9 +652,9 @@ export const AdminView: React.FC = () => {
             body: JSON.stringify(payload),
           });
 
+      const data = await safeJson<{ ok?: boolean; error?: string }>(res, {});
       if (!res.ok) {
-        const data = await safeJson<{ error?: string }>(res, {});
-        setErrorMessage(data.error || 'Failed to save album');
+        setErrorMessage(data.error || `Failed to save album (HTTP ${res.status})`);
         return;
       }
 
@@ -628,7 +664,7 @@ export const AdminView: React.FC = () => {
           : lang === 'ru' ? 'Новый релиз добавлен в архив' : 'New album created'
       );
       resetAlbumForm();
-      fetchAdminData();
+      await fetchAdminData();
     } catch (e: any) {
       setErrorMessage(e.message || 'Server connection error');
     } finally {
@@ -642,7 +678,7 @@ export const AdminView: React.FC = () => {
     setAlbumFormat(alb.format_type || 'album');
     setAlbumYear(String(alb.release_year || '2025'));
     setAlbumDate(alb.release_date || `${alb.release_year}-01-01`);
-    setAlbumCoverUrl(alb.cover_url || '');
+    updateAlbumCoverUrl(alb.cover_url || '');
     setAlbumDesc(alb.description || '');
     const sl = alb.streaming_links || {};
     setAlbumSpotify(sl.spotify || '');
@@ -659,7 +695,7 @@ export const AdminView: React.FC = () => {
     setAlbumFormat('album');
     setAlbumYear('2025');
     setAlbumDate('2025-01-01');
-    setAlbumCoverUrl('');
+    updateAlbumCoverUrl('');
     setAlbumDesc('');
     setAlbumSpotify('');
     setAlbumApple('');
@@ -672,7 +708,7 @@ export const AdminView: React.FC = () => {
   // Single Save / Update
   const handleSaveSingle = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (savingSingle || !singleTitle.trim()) return;
+    if (savingSingle || uploadingField === 'singleCover' || uploadingField === 'singleAudio' || !singleTitle.trim()) return;
 
     const streaming_links = {
       spotify: singleSpotify.trim() || undefined,
@@ -683,12 +719,14 @@ export const AdminView: React.FC = () => {
       youtube_music: singleYoutube.trim() || undefined,
     };
 
+    const effectiveCoverUrl = (singleCoverUrlRef.current || singleCoverUrl).trim();
+    const effectiveAudioUrl = (singleAudioUrlRef.current || singleAudioUrl).trim();
     const payload = {
       title: singleTitle.trim(),
       release_year: parseInt(singleYear, 10) || 2025,
       release_date: singleDate.trim() || `${singleYear}-01-01`,
-      cover_url: singleCoverUrl.trim() || null,
-      audio_url: singleAudioUrl.trim() || null,
+      cover_url: effectiveCoverUrl || null,
+      audio_url: effectiveAudioUrl || '',
       duration_seconds: parseInt(singleDuration, 10) || 180,
       description: singleDesc.trim(),
       lyrics: singleLyrics.trim(),
@@ -696,6 +734,7 @@ export const AdminView: React.FC = () => {
     };
 
     setSavingSingle(true);
+    setErrorMessage(null);
     try {
       const res = editingSingleId
         ? await authFetch(`/api/archive/singles/${editingSingleId}`, {
@@ -709,9 +748,9 @@ export const AdminView: React.FC = () => {
             body: JSON.stringify(payload),
           });
 
+      const data = await safeJson<{ ok?: boolean; error?: string }>(res, {});
       if (!res.ok) {
-        const data = await safeJson<{ error?: string }>(res, {});
-        setErrorMessage(data.error || 'Failed to save single');
+        setErrorMessage(data.error || `Failed to save single (HTTP ${res.status})`);
         return;
       }
 
@@ -721,7 +760,7 @@ export const AdminView: React.FC = () => {
           : lang === 'ru' ? 'Сингл добавлен в архив' : 'Single inscribed'
       );
       resetSingleForm();
-      fetchAdminData();
+      await fetchAdminData();
     } catch (e: any) {
       setErrorMessage(e.message || 'Server connection error');
     } finally {
@@ -734,8 +773,8 @@ export const AdminView: React.FC = () => {
     setSingleTitle(sng.title || '');
     setSingleYear(String(sng.release_year || '2025'));
     setSingleDate(sng.release_date || `${sng.release_year}-01-01`);
-    setSingleCoverUrl(sng.cover_url || '');
-    setSingleAudioUrl(sng.audio_url || '');
+    updateSingleCoverUrl(sng.cover_url || '');
+    updateSingleAudioUrl(sng.audio_url || '');
     setSingleDuration(String(sng.duration_seconds || '180'));
     setSingleDesc(sng.description || '');
     setSingleLyrics(sng.lyrics || '');
@@ -753,8 +792,8 @@ export const AdminView: React.FC = () => {
     setSingleTitle('');
     setSingleYear('2025');
     setSingleDate('2025-01-01');
-    setSingleCoverUrl('');
-    setSingleAudioUrl('');
+    updateSingleCoverUrl('');
+    updateSingleAudioUrl('');
     setSingleDuration('180');
     setSingleDesc('');
     setSingleLyrics('');
@@ -769,22 +808,24 @@ export const AdminView: React.FC = () => {
   // Track Save / Update (in Album)
   const handleSaveTrack = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (savingTrack) return;
+    if (savingTrack || uploadingField === 'trackAudio') return;
     if (!trackTitle.trim() || !trackAlbumId) {
       setErrorMessage(lang === 'ru' ? 'Укажите название трека и выберите альбом' : 'Provide track title and album');
       return;
     }
 
+    const effectiveAudioUrl = (trackAudioUrlRef.current || trackAudioUrl).trim();
     const payload = {
       album_id: trackAlbumId,
       title: trackTitle.trim(),
       track_number: parseInt(trackNumber, 10) || 1,
-      audio_url: trackAudioUrl.trim(),
+      audio_url: effectiveAudioUrl,
       duration_seconds: parseInt(trackDuration, 10) || 180,
       lyrics: trackLyrics.trim(),
     };
 
     setSavingTrack(true);
+    setErrorMessage(null);
     try {
       const res = editingTrackId
         ? await authFetch(`/api/archive/tracks/${editingTrackId}`, {
@@ -798,19 +839,19 @@ export const AdminView: React.FC = () => {
             body: JSON.stringify(payload),
           });
 
+      const data = await safeJson<{ ok?: boolean; error?: string }>(res, {});
       if (!res.ok) {
-        const data = await safeJson<{ error?: string }>(res, {});
-        setErrorMessage(data.error || 'Failed to save track');
+        setErrorMessage(data.error || `Failed to save track (HTTP ${res.status})`);
         return;
       }
 
       setStatusMessage(
         editingTrackId
-          ? lang === 'ru' ? 'Трек успешно обновлен' : 'Track updated'
-          : lang === 'ru' ? 'Трек добавлен в альбом' : 'Track added to album'
+          ? lang === 'ru' ? 'Трек успешно обновлен и сохранён' : 'Track updated and saved'
+          : lang === 'ru' ? 'Трек добавлен в альбом и сохранён' : 'Track added to album'
       );
       resetTrackForm();
-      fetchAdminData();
+      await fetchAdminData();
     } catch (e: any) {
       setErrorMessage(e.message || 'Server connection error');
     } finally {
@@ -823,7 +864,7 @@ export const AdminView: React.FC = () => {
     setTrackAlbumId(trk.album_id);
     setTrackTitle(trk.title || '');
     setTrackNumber(String(trk.track_number || 1));
-    setTrackAudioUrl(trk.audio_url || '');
+    updateTrackAudioUrl(trk.audio_url || '');
     setTrackDuration(String(trk.duration_seconds || 180));
     setTrackLyrics(trk.lyrics || '');
   };
@@ -832,7 +873,7 @@ export const AdminView: React.FC = () => {
     setEditingTrackId(null);
     setTrackTitle('');
     setTrackNumber('1');
-    setTrackAudioUrl('');
+    updateTrackAudioUrl('');
     setTrackDuration('180');
     setTrackLyrics('');
   };
@@ -841,6 +882,7 @@ export const AdminView: React.FC = () => {
   const handleConfirmDelete = async () => {
     if (!deleteModal) return;
     setIsDeleting(true);
+    setErrorMessage(null);
 
     try {
       let res: Response;
@@ -867,16 +909,25 @@ export const AdminView: React.FC = () => {
       }
 
       if (res.ok) {
+        if (deleteModal.type === 'album') {
+          if (editingAlbumId === deleteModal.id) resetAlbumForm();
+          if (trackAlbumId === deleteModal.id) resetTrackForm();
+        } else if (deleteModal.type === 'track' && editingTrackId === deleteModal.id) {
+          resetTrackForm();
+        } else if (deleteModal.type === 'single' && editingSingleId === deleteModal.id) {
+          resetSingleForm();
+        }
+
         setStatusMessage(
           lang === 'ru'
             ? `«${deleteModal.name}» успешно удален(о)`
             : `«${deleteModal.name}» deleted successfully`
         );
         setDeleteModal(null);
-        fetchAdminData();
+        await fetchAdminData();
       } else {
         const data = await safeJson<{ error?: string }>(res, {});
-        setErrorMessage(data.error || 'Failed to delete');
+        setErrorMessage(data.error || `Failed to delete (HTTP ${res.status})`);
       }
     } catch (err: any) {
       setErrorMessage(err.message || 'Network error during deletion');
@@ -1213,7 +1264,7 @@ export const AdminView: React.FC = () => {
                 <input
                   type="text"
                   value={albumCoverUrl}
-                  onChange={(e) => setAlbumCoverUrl(e.target.value)}
+                  onChange={(e) => updateAlbumCoverUrl(e.target.value)}
                   placeholder="https://... or /uploads/..."
                   className="w-full px-3.5 py-2 bg-[#16151a] border border-white/[0.1] rounded-lg text-white focus:outline-none font-mono text-[11px]"
                 />
@@ -1244,7 +1295,7 @@ export const AdminView: React.FC = () => {
                     </div>
                     <button
                       type="button"
-                      onClick={() => setAlbumCoverUrl('')}
+                      onClick={() => updateAlbumCoverUrl('')}
                       className="text-[10px] font-mono text-ash hover:text-red-400 px-2 py-1 cursor-pointer shrink-0"
                     >
                       {lang === 'ru' ? 'Убрать' : 'Clear'}
@@ -1319,14 +1370,16 @@ export const AdminView: React.FC = () => {
 
               <button
                 type="submit"
-                disabled={savingAlbum}
+                disabled={savingAlbum || uploadingField === 'albumCover'}
                 className="w-full py-3 font-mono text-xs uppercase tracking-widest bg-white/[0.1] hover:bg-white/[0.18] disabled:opacity-50 text-white border border-white/20 rounded-lg transition-all cursor-pointer font-semibold shadow-md"
               >
-                {savingAlbum
-                  ? lang === 'ru' ? 'Сохранение...' : 'Saving...'
-                  : editingAlbumId
-                    ? lang === 'ru' ? 'Сохранить изменения' : 'Save Changes'
-                    : lang === 'ru' ? 'Создать релиз' : 'Create Release'}
+                {uploadingField === 'albumCover'
+                  ? lang === 'ru' ? 'Загрузка обложки...' : 'Uploading Cover...'
+                  : savingAlbum
+                    ? lang === 'ru' ? 'Сохранение...' : 'Saving...'
+                    : editingAlbumId
+                      ? lang === 'ru' ? 'Сохранить изменения' : 'Save Changes'
+                      : lang === 'ru' ? 'Создать релиз' : 'Create Release'}
               </button>
             </form>
           </div>
@@ -1590,7 +1643,7 @@ export const AdminView: React.FC = () => {
                     type="text"
                     value={trackAudioUrl}
                     onChange={(e) => {
-                      setTrackAudioUrl(e.target.value);
+                      updateTrackAudioUrl(e.target.value);
                       autoDetectDuration(e.target.value, (sec) => setTrackDuration(String(sec)));
                     }}
                     placeholder="/uploads/... or /audio/... or https://..."
@@ -1618,7 +1671,7 @@ export const AdminView: React.FC = () => {
                         value={mediaFilesList.some((m) => m.storage_path === trackAudioUrl) ? trackAudioUrl : ''}
                         onChange={(e) => {
                           if (e.target.value) {
-                            setTrackAudioUrl(e.target.value);
+                            updateTrackAudioUrl(e.target.value);
                             autoDetectDuration(e.target.value, (sec) => setTrackDuration(String(sec)));
                           }
                         }}
@@ -1636,10 +1689,14 @@ export const AdminView: React.FC = () => {
 
                   {/* Inline Audio Preview Player */}
                   {trackAudioUrl && (
-                    <div className="pt-2">
-                      <div className="font-mono text-[10px] text-ash/80 mb-1 flex items-center gap-1.5">
-                        <Volume2 className="w-3 h-3 text-green-400" />
-                        <span>{lang === 'ru' ? 'Предпрослушивание трека:' : 'Audio Preview:'}</span>
+                    <div className="pt-2 space-y-1.5">
+                      <div className="font-mono text-[10px] text-green-300/90 flex items-center justify-between gap-2">
+                        <span className="flex items-center gap-1.5 truncate">
+                          <Check className="w-3 h-3 text-green-400 shrink-0" />
+                          <span className="truncate">
+                            {lang === 'ru' ? `Привязано: ${trackAudioUrl}` : `Attached: ${trackAudioUrl}`}
+                          </span>
+                        </span>
                       </div>
                       <audio controls preload="metadata" src={trackAudioUrl} className="w-full h-8 rounded" />
                     </div>
@@ -1661,14 +1718,16 @@ export const AdminView: React.FC = () => {
 
                 <button
                   type="submit"
-                  disabled={savingTrack}
+                  disabled={savingTrack || uploadingField === 'trackAudio'}
                   className="py-2.5 px-6 font-mono text-xs uppercase tracking-widest bg-white/[0.1] hover:bg-white/[0.2] disabled:opacity-50 text-white border border-white/20 rounded-lg transition-colors cursor-pointer font-semibold"
                 >
-                  {savingTrack
-                    ? lang === 'ru' ? 'Сохранение...' : 'Saving...'
-                    : editingTrackId
-                      ? lang === 'ru' ? 'Сохранить трек' : 'Update Track'
-                      : lang === 'ru' ? 'Добавить трек' : 'Inscribe Track'}
+                  {uploadingField === 'trackAudio'
+                    ? lang === 'ru' ? 'Загрузка аудио...' : 'Uploading Audio...'
+                    : savingTrack
+                      ? lang === 'ru' ? 'Сохранение...' : 'Saving...'
+                      : editingTrackId
+                        ? lang === 'ru' ? 'Сохранить трек' : 'Update Track'
+                        : lang === 'ru' ? 'Добавить трек' : 'Inscribe Track'}
                 </button>
               </form>
             </div>
@@ -1782,7 +1841,7 @@ export const AdminView: React.FC = () => {
                 <input
                   type="text"
                   value={singleCoverUrl}
-                  onChange={(e) => setSingleCoverUrl(e.target.value)}
+                  onChange={(e) => updateSingleCoverUrl(e.target.value)}
                   placeholder="https://... or /uploads/..."
                   className="w-full px-3 py-2 bg-[#16151a] border border-white/[0.1] rounded-lg text-white focus:outline-none font-mono text-xs"
                 />
@@ -1813,7 +1872,7 @@ export const AdminView: React.FC = () => {
                     </div>
                     <button
                       type="button"
-                      onClick={() => setSingleCoverUrl('')}
+                      onClick={() => updateSingleCoverUrl('')}
                       className="text-[10px] font-mono text-ash hover:text-red-400 px-2 py-1 cursor-pointer shrink-0"
                     >
                       {lang === 'ru' ? 'Убрать' : 'Clear'}
@@ -1846,7 +1905,7 @@ export const AdminView: React.FC = () => {
                   type="text"
                   value={singleAudioUrl}
                   onChange={(e) => {
-                    setSingleAudioUrl(e.target.value);
+                    updateSingleAudioUrl(e.target.value);
                     autoDetectDuration(e.target.value, (sec) => setSingleDuration(String(sec)));
                   }}
                   placeholder="/uploads/... or /audio/..."
@@ -1873,7 +1932,7 @@ export const AdminView: React.FC = () => {
                       value={mediaFilesList.some((m) => m.storage_path === singleAudioUrl) ? singleAudioUrl : ''}
                       onChange={(e) => {
                         if (e.target.value) {
-                          setSingleAudioUrl(e.target.value);
+                          updateSingleAudioUrl(e.target.value);
                           autoDetectDuration(e.target.value, (sec) => setSingleDuration(String(sec)));
                         }
                       }}
@@ -1890,10 +1949,12 @@ export const AdminView: React.FC = () => {
                 )}
 
                 {singleAudioUrl && (
-                  <div className="pt-2">
-                    <div className="font-mono text-[10px] text-ash/80 mb-1 flex items-center gap-1.5">
-                      <Volume2 className="w-3 h-3 text-green-400" />
-                      <span>{lang === 'ru' ? 'Предпрослушивание сингла:' : 'Audio Preview:'}</span>
+                  <div className="pt-2 space-y-1.5">
+                    <div className="font-mono text-[10px] text-green-300/90 flex items-center gap-1.5 truncate">
+                      <Check className="w-3 h-3 text-green-400 shrink-0" />
+                      <span className="truncate">
+                        {lang === 'ru' ? `Привязано: ${singleAudioUrl}` : `Attached: ${singleAudioUrl}`}
+                      </span>
                     </div>
                     <audio controls preload="metadata" src={singleAudioUrl} className="w-full h-8 rounded" />
                   </div>
@@ -1979,14 +2040,16 @@ export const AdminView: React.FC = () => {
 
               <button
                 type="submit"
-                disabled={savingSingle}
+                disabled={savingSingle || uploadingField === 'singleCover' || uploadingField === 'singleAudio'}
                 className="w-full py-3 font-mono text-xs uppercase tracking-widest bg-white/[0.1] hover:bg-white/[0.2] disabled:opacity-50 text-white border border-white/20 rounded-lg transition-all cursor-pointer font-semibold shadow-md"
               >
-                {savingSingle
-                  ? lang === 'ru' ? 'Сохранение...' : 'Saving...'
-                  : editingSingleId
-                    ? lang === 'ru' ? 'Сохранить сингл' : 'Save Single'
-                    : lang === 'ru' ? 'Создать сингл' : 'Create Single'}
+                {uploadingField === 'singleCover' || uploadingField === 'singleAudio'
+                  ? lang === 'ru' ? 'Загрузка файла...' : 'Uploading File...'
+                  : savingSingle
+                    ? lang === 'ru' ? 'Сохранение...' : 'Saving...'
+                    : editingSingleId
+                      ? lang === 'ru' ? 'Сохранить сингл' : 'Save Single'
+                      : lang === 'ru' ? 'Создать сингл' : 'Create Single'}
               </button>
             </form>
           </div>

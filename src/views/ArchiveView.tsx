@@ -109,8 +109,8 @@ export const ArchiveView: React.FC = () => {
   const fetchArchive = async () => {
     try {
       const [resAlb, resSng] = await Promise.all([
-        fetch('/api/archive/albums'),
-        fetch('/api/archive/singles'),
+        fetch('/api/archive/albums', { cache: 'no-store' }),
+        fetch('/api/archive/singles', { cache: 'no-store' }),
       ]);
       const dataAlb = await safeJson(resAlb, { albums: [] });
       const dataSng = await safeJson(resSng, { singles: [] });
