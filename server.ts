@@ -3,13 +3,19 @@ import cookieParser from 'cookie-parser';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
+import http from 'http';
 import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
-import { db, initDatabase } from './server/db.js';
+import { db, initDatabase, closeDatabase } from './server/db.js';
 import {
   ensureCloudDatabaseRestored,
   pushDatabaseBackupNow,
   getCloudSyncStatus,
+  isSupabaseConfigured,
+  uploadMediaToSupabase,
+  createSignedMediaUploadUrl,
+  fetchMediaFromSupabase,
+  deleteMediaFromSupabase,
 } from './server/cloudSync.js';
 import {
   calculateLevelFromXp,
@@ -20,10 +26,13 @@ import {
   isSafeMediaUrl,
   computeDailyStreak,
   pickDailyQuizQuestions,
+  resolveServerPort,
+  sanitizeStreamingLinks,
+  classifyMediaUpload,
 } from './src/utils/logic.js';
 
 const app = express();
-const PORT = Number(process.env.PORT) || 3000;
+const PORT = resolveServerPort(process.argv, process.env);
 const isVercel = Boolean(process.env.VERCEL);
 
 // Trust Vercel / reverse proxy headers for rate limiting & secure cookies
@@ -103,6 +112,12 @@ const BUNDLED_AUDIO_FILES = new Set([
   '/audio/cathedral_veil.wav',
 ]);
 
+function isPathInsideDir(baseDir: string, candidatePath: string): boolean {
+  const resolvedBase = path.resolve(baseDir);
+  const resolvedCandidate = path.resolve(candidatePath);
+  return resolvedCandidate.startsWith(resolvedBase + path.sep);
+}
+
 function localAudioExists(audioUrl?: string | null): boolean {
   if (!audioUrl || typeof audioUrl !== 'string') return false;
   const trimmed = audioUrl.trim();
@@ -126,6 +141,8 @@ function localAudioExists(audioUrl?: string | null): boolean {
     try {
       const blobRow = db.prepare('SELECT 1 FROM uploaded_blobs WHERE filename = ?').get(filename);
       if (blobRow) return true;
+      const indexedAudio = db.prepare('SELECT 1 FROM audio_files WHERE storage_path = ?').get(trimmed);
+      if (indexedAudio && isSupabaseConfigured()) return true;
     } catch {}
     return false;
   }
@@ -133,20 +150,24 @@ function localAudioExists(audioUrl?: string | null): boolean {
   return isSafeMediaUrl(trimmed);
 }
 
-// Multer storage configuration with mime/extension validation
+function buildSafeUploadFilename(originalName: string, mimeType: string): string {
+  const classified = classifyMediaUpload(originalName, mimeType);
+  const ext = path.extname(originalName).toLowerCase();
+  const safeExt = classified.allowed ? classified.normalizedExt : '.bin';
+  const cleanBase = path
+    .basename(originalName, ext)
+    .replace(/[^a-zA-Z0-9_\-\u0400-\u04FF]/g, '_')
+    .slice(0, 30) || 'media';
+  return `${Date.now()}_${cleanBase}_${crypto.randomBytes(4).toString('hex')}${safeExt}`;
+}
+
+// Multer storage configuration with strict mime/extension validation
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => {
     cb(null, uploadDir);
   },
   filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    const isAudio = ['.mp3', '.wav', '.wave', '.ogg', '.m4a', '.flac', '.aac', '.aiff', '.wma'].includes(ext);
-    const isImg = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.svg', '.bmp'].includes(ext);
-    const isVid = ['.mp4', '.webm', '.mov'].includes(ext);
-    const safeExt = isAudio ? (ext === '.wave' ? '.wav' : ext) : (isImg || isVid ? ext : '.bin');
-    const cleanBase = path.basename(file.originalname, ext).replace(/[^a-zA-Z0-9_\-\u0400-\u04FF]/g, '_').slice(0, 30);
-    const unique = `${Date.now()}_${cleanBase}_${crypto.randomBytes(4).toString('hex')}${safeExt}`;
-    cb(null, unique);
+    cb(null, buildSafeUploadFilename(file.originalname, file.mimetype));
   },
 });
 
@@ -154,18 +175,11 @@ const upload = multer({
   storage,
   limits: { fileSize: 100 * 1024 * 1024 }, // 100MB max for high-res WAV & video uploads
   fileFilter: (_req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    const isAudioExt = ['.mp3', '.wav', '.wave', '.ogg', '.m4a', '.flac', '.aac', '.aiff', '.wma'].includes(ext);
-    const isImageExt = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.svg', '.bmp'].includes(ext);
-    const isVideoExt = ['.mp4', '.webm', '.mov'].includes(ext);
-    const isAudioMime = file.mimetype.startsWith('audio/') || (file.mimetype === 'application/octet-stream' && isAudioExt);
-    const isImageMime = file.mimetype.startsWith('image/');
-    const isVideoMime = file.mimetype.startsWith('video/');
-
-    if (isAudioExt || isImageExt || isVideoExt || isAudioMime || isImageMime || isVideoMime) {
+    const classified = classifyMediaUpload(file.originalname, file.mimetype);
+    if (classified.allowed) {
       cb(null, true);
     } else {
-      cb(new Error('Disallowed file type. Only audio (MP3, WAV, FLAC, OGG, M4A), images (JPG, PNG, WEBP), and video (MP4, WEBM) are accepted.'));
+      cb(new Error('Disallowed file type. Only audio (MP3, WAV, FLAC, OGG, M4A), images (JPG, PNG, WEBP, GIF), and video (MP4, WEBM, MOV) are accepted.'));
     }
   },
 });
@@ -324,8 +338,8 @@ app.post('/api/auth/register', authRateLimit, (req: Request, res: Response) => {
 });
 
 app.post('/api/auth/login', authRateLimit, (req: Request, res: Response) => {
-  const { nickname, password } = req.body;
-  if (!nickname || !password) {
+  const { nickname, password } = req.body || {};
+  if (typeof nickname !== 'string' || typeof password !== 'string' || !nickname.trim() || !password) {
     res.status(400).json({ error: 'Nickname and password are required.' });
     return;
   }
@@ -399,34 +413,51 @@ app.post('/api/auth/bind-admin', requireAdmin, (req: AuthRequest, res: Response)
   res.json({ ok: true, user: updatedUser });
 });
 
-// Delete uploaded file from storage and database
-app.post('/api/admin/delete-file', requireAdminOrMod, (req: AuthRequest, res: Response) => {
-  const { url } = req.body;
+// Delete uploaded file from storage, Supabase bucket, and database
+app.post('/api/admin/delete-file', requireAdminOrMod, async (req: AuthRequest, res: Response) => {
+  const { url } = req.body || {};
   if (!url || typeof url !== 'string') {
     res.status(400).json({ error: 'Valid URL is required.' });
     return;
   }
-  if (url.startsWith('/uploads/')) {
+  if (url.startsWith('/uploads/') && !url.includes('..')) {
     const filename = path.basename(url);
-    const fullPath = path.join(uploadDir, filename);
-    if (fs.existsSync(fullPath)) {
-      try {
-        fs.unlinkSync(fullPath);
-      } catch (err) {
-        console.error('Failed to unlink file:', err);
+    const uploadPath = path.join(uploadDir, filename);
+    const publicUploadsDir = path.resolve(process.cwd(), 'public', 'uploads');
+    const publicPath = path.join(publicUploadsDir, filename);
+
+    for (const [base, candidate] of [
+      [uploadDir, uploadPath],
+      [publicUploadsDir, publicPath],
+    ] as const) {
+      if (isPathInsideDir(base, candidate) && fs.existsSync(candidate)) {
+        try {
+          fs.unlinkSync(candidate);
+        } catch (err) {
+          console.error('Failed to unlink file:', err);
+        }
       }
     }
     db.prepare('DELETE FROM audio_files WHERE storage_path = ?').run(url);
     db.prepare('DELETE FROM archive_images WHERE storage_path = ?').run(url);
     db.prepare('DELETE FROM uploaded_blobs WHERE filename = ?').run(filename);
+    await deleteMediaFromSupabase(filename);
   }
   res.json({ ok: true });
 });
 
 app.post('/api/auth/logout', (req: Request, res: Response) => {
-  const token = req.cookies?.apostle_session;
-  if (token) {
-    db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+  const cookieToken = req.cookies?.apostle_session;
+  const authHeader = req.headers.authorization;
+  const bearerToken = typeof authHeader === 'string' && authHeader.startsWith('Bearer ')
+    ? authHeader.slice(7).trim()
+    : null;
+
+  if (cookieToken) {
+    db.prepare('DELETE FROM sessions WHERE token = ?').run(cookieToken);
+  }
+  if (bearerToken && bearerToken !== cookieToken) {
+    db.prepare('DELETE FROM sessions WHERE token = ?').run(bearerToken);
   }
   res.clearCookie('apostle_session', { path: '/' });
   res.json({ ok: true });
@@ -566,26 +597,45 @@ app.get('/api/archive/singles/:id', (req: Request, res: Response) => {
 
 // Admin album management
 app.post('/api/archive/albums', requireAdminOrMod, (req: AuthRequest, res: Response) => {
-  const { title, format_type, release_year, release_date, cover_url, description, source_url, streaming_links, sort_order } = req.body;
-  if (!title || !title.trim()) {
+  const { title, format_type, release_year, release_date, cover_url, description, source_url, streaming_links, sort_order } = req.body || {};
+  if (typeof title !== 'string' || !title.trim()) {
     res.status(400).json({ error: 'Album title is required.' });
     return;
   }
+  const cleanCover = typeof cover_url === 'string' && cover_url.trim() ? cover_url.trim() : null;
+  if (cleanCover && !isSafeMediaUrl(cleanCover)) {
+    res.status(400).json({ error: 'Invalid cover URL.' });
+    return;
+  }
+  const cleanSource = typeof source_url === 'string' && source_url.trim() ? source_url.trim() : '';
+  if (cleanSource && !isSafeMediaUrl(cleanSource)) {
+    res.status(400).json({ error: 'Invalid source URL.' });
+    return;
+  }
+  const parsedLinks = typeof streaming_links === 'object'
+    ? sanitizeStreamingLinks(streaming_links)
+    : (() => {
+        try {
+          return sanitizeStreamingLinks(JSON.parse(req.body.streaming_links_json || '{}'));
+        } catch {
+          return {};
+        }
+      })();
   const id = 'alb_' + crypto.randomUUID().slice(0, 8);
-  const linksJson = typeof streaming_links === 'object' ? JSON.stringify(streaming_links) : (req.body.streaming_links_json || '{}');
+  const yearNum = Number(release_year) || new Date().getFullYear();
   db.prepare(`
     INSERT INTO albums (id, title, format_type, release_year, release_date, cover_url, description, source_url, streaming_links_json, sort_order)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id,
     title.trim(),
-    format_type || 'album',
-    release_year || new Date().getFullYear(),
-    release_date || `${release_year || new Date().getFullYear()}-01-01`,
-    cover_url || null,
-    description || '',
-    source_url || '',
-    linksJson,
+    format_type === 'ep' ? 'ep' : 'album',
+    yearNum,
+    typeof release_date === 'string' && release_date.trim() ? release_date.trim() : `${yearNum}-01-01`,
+    cleanCover,
+    typeof description === 'string' ? description : '',
+    cleanSource,
+    JSON.stringify(parsedLinks),
     sort_order ?? 10
   );
 
@@ -593,10 +643,29 @@ app.post('/api/archive/albums', requireAdminOrMod, (req: AuthRequest, res: Respo
 });
 
 app.put('/api/archive/albums/:id', requireAdminOrMod, (req: AuthRequest, res: Response) => {
-  const { title, format_type, release_year, release_date, cover_url, description, source_url, streaming_links, sort_order } = req.body;
-  const linksJson = streaming_links !== undefined ? (typeof streaming_links === 'object' ? JSON.stringify(streaming_links) : streaming_links) : undefined;
-  const hasCover = 'cover_url' in req.body;
-  const nextCover = cover_url ? String(cover_url).trim() : null;
+  const { title, format_type, release_year, release_date, cover_url, description, source_url, streaming_links, sort_order } = req.body || {};
+  const hasCover = 'cover_url' in (req.body || {});
+  const nextCover = typeof cover_url === 'string' && cover_url.trim() ? cover_url.trim() : null;
+  if (hasCover && nextCover && !isSafeMediaUrl(nextCover)) {
+    res.status(400).json({ error: 'Invalid cover URL.' });
+    return;
+  }
+  if (typeof source_url === 'string' && source_url.trim() && !isSafeMediaUrl(source_url.trim())) {
+    res.status(400).json({ error: 'Invalid source URL.' });
+    return;
+  }
+  let linksJson: string | undefined;
+  if (streaming_links !== undefined) {
+    if (typeof streaming_links === 'object') {
+      linksJson = JSON.stringify(sanitizeStreamingLinks(streaming_links));
+    } else if (typeof streaming_links === 'string') {
+      try {
+        linksJson = JSON.stringify(sanitizeStreamingLinks(JSON.parse(streaming_links)));
+      } catch {
+        linksJson = '{}';
+      }
+    }
+  }
 
   db.prepare(`
     UPDATE albums SET
@@ -612,14 +681,14 @@ app.put('/api/archive/albums/:id', requireAdminOrMod, (req: AuthRequest, res: Re
       updated_at = datetime('now')
     WHERE id = ?
   `).run(
-    title ? title.trim() : null,
-    format_type ?? null,
+    typeof title === 'string' && title.trim() ? title.trim() : null,
+    format_type === 'ep' || format_type === 'album' ? format_type : null,
     release_year ?? null,
-    release_date ?? null,
+    typeof release_date === 'string' ? release_date : null,
     hasCover ? 1 : 0,
     nextCover,
-    description ?? null,
-    source_url ?? null,
+    typeof description === 'string' ? description : null,
+    typeof source_url === 'string' ? source_url.trim() : null,
     linksJson ?? null,
     sort_order ?? null,
     req.params.id
@@ -636,11 +705,22 @@ app.delete('/api/archive/albums/:id', requireAdminOrMod, (req: AuthRequest, res:
 
 // Admin tracks management
 app.post('/api/archive/tracks', requireAdminOrMod, (req: AuthRequest, res: Response) => {
-  const { album_id, single_id, title, track_number, duration_seconds, audio_url, lyrics, external_url } = req.body;
-  if (!title || !title.trim()) {
+  const { album_id, single_id, title, track_number, duration_seconds, audio_url, lyrics, external_url } = req.body || {};
+  if (typeof title !== 'string' || !title.trim()) {
     res.status(400).json({ error: 'Track title is required.' });
     return;
   }
+  const cleanAudio = typeof audio_url === 'string' ? audio_url.trim() : '';
+  if (cleanAudio && !isSafeMediaUrl(cleanAudio)) {
+    res.status(400).json({ error: 'Invalid audio URL.' });
+    return;
+  }
+  const cleanExternal = typeof external_url === 'string' ? external_url.trim() : '';
+  if (cleanExternal && !isSafeMediaUrl(cleanExternal)) {
+    res.status(400).json({ error: 'Invalid external URL.' });
+    return;
+  }
+
   const id = 'trk_' + crypto.randomUUID().slice(0, 8);
   db.prepare(`
     INSERT INTO tracks (id, album_id, single_id, title, track_number, duration_seconds, audio_url, lyrics, external_url)
@@ -650,11 +730,11 @@ app.post('/api/archive/tracks', requireAdminOrMod, (req: AuthRequest, res: Respo
     album_id || null,
     single_id || null,
     title.trim(),
-    track_number || 1,
-    duration_seconds || 180,
-    audio_url || '',
-    lyrics || '',
-    external_url || ''
+    Number(track_number) || 1,
+    Number(duration_seconds) || 180,
+    cleanAudio,
+    typeof lyrics === 'string' ? lyrics : '',
+    cleanExternal
   );
 
   // Update album track_count & duration if linked
@@ -677,10 +757,18 @@ app.put('/api/archive/tracks/:id', requireAdminOrMod, (req: AuthRequest, res: Re
     return;
   }
 
-  const { album_id, title, track_number, duration_seconds, audio_url, lyrics, external_url } = req.body;
-  const hasAlbumId = 'album_id' in req.body;
-  const hasAudio = 'audio_url' in req.body;
-  const nextAudio = audio_url ? String(audio_url).trim() : '';
+  const { album_id, title, track_number, duration_seconds, audio_url, lyrics, external_url } = req.body || {};
+  const hasAlbumId = 'album_id' in (req.body || {});
+  const hasAudio = 'audio_url' in (req.body || {});
+  const nextAudio = typeof audio_url === 'string' ? audio_url.trim() : '';
+  if (hasAudio && nextAudio && !isSafeMediaUrl(nextAudio)) {
+    res.status(400).json({ error: 'Invalid audio URL.' });
+    return;
+  }
+  if (typeof external_url === 'string' && external_url.trim() && !isSafeMediaUrl(external_url.trim())) {
+    res.status(400).json({ error: 'Invalid external URL.' });
+    return;
+  }
 
   db.prepare(`
     UPDATE tracks SET
@@ -695,13 +783,13 @@ app.put('/api/archive/tracks/:id', requireAdminOrMod, (req: AuthRequest, res: Re
   `).run(
     hasAlbumId ? 1 : 0,
     album_id || null,
-    title ? title.trim() : null,
+    typeof title === 'string' && title.trim() ? title.trim() : null,
     track_number ?? null,
     duration_seconds ?? null,
     hasAudio ? 1 : 0,
     nextAudio,
-    lyrics ?? null,
-    external_url ?? null,
+    typeof lyrics === 'string' ? lyrics : null,
+    typeof external_url === 'string' ? external_url.trim() : null,
     req.params.id
   );
 
@@ -738,27 +826,46 @@ app.delete('/api/archive/tracks/:id', requireAdminOrMod, (req: AuthRequest, res:
 
 // Admin singles management
 app.post('/api/archive/singles', requireAdminOrMod, (req: AuthRequest, res: Response) => {
-  const { title, release_year, release_date, cover_url, description, duration_seconds, audio_url, lyrics, streaming_links, sort_order } = req.body;
-  if (!title || !title.trim()) {
+  const { title, release_year, release_date, cover_url, description, duration_seconds, audio_url, lyrics, streaming_links, sort_order } = req.body || {};
+  if (typeof title !== 'string' || !title.trim()) {
     res.status(400).json({ error: 'Single title is required.' });
     return;
   }
+  const cleanCover = typeof cover_url === 'string' && cover_url.trim() ? cover_url.trim() : null;
+  if (cleanCover && !isSafeMediaUrl(cleanCover)) {
+    res.status(400).json({ error: 'Invalid cover URL.' });
+    return;
+  }
+  const cleanAudio = typeof audio_url === 'string' ? audio_url.trim() : '';
+  if (cleanAudio && !isSafeMediaUrl(cleanAudio)) {
+    res.status(400).json({ error: 'Invalid audio URL.' });
+    return;
+  }
+  const parsedLinks = typeof streaming_links === 'object'
+    ? sanitizeStreamingLinks(streaming_links)
+    : (() => {
+        try {
+          return sanitizeStreamingLinks(JSON.parse(req.body.streaming_links_json || '{}'));
+        } catch {
+          return {};
+        }
+      })();
   const id = 'sng_' + crypto.randomUUID().slice(0, 8);
-  const linksJson = typeof streaming_links === 'object' ? JSON.stringify(streaming_links) : (req.body.streaming_links_json || '{}');
+  const yearNum = Number(release_year) || new Date().getFullYear();
   db.prepare(`
     INSERT INTO singles (id, title, release_year, release_date, cover_url, description, duration_seconds, audio_url, lyrics, streaming_links_json, sort_order)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id,
     title.trim(),
-    release_year || new Date().getFullYear(),
-    release_date || `${release_year || new Date().getFullYear()}-01-01`,
-    cover_url || null,
-    description || '',
-    duration_seconds || 180,
-    audio_url || '',
-    lyrics || '',
-    linksJson,
+    yearNum,
+    typeof release_date === 'string' && release_date.trim() ? release_date.trim() : `${yearNum}-01-01`,
+    cleanCover,
+    typeof description === 'string' ? description : '',
+    Number(duration_seconds) || 180,
+    cleanAudio,
+    typeof lyrics === 'string' ? lyrics : '',
+    JSON.stringify(parsedLinks),
     sort_order ?? 10
   );
 
@@ -766,12 +873,31 @@ app.post('/api/archive/singles', requireAdminOrMod, (req: AuthRequest, res: Resp
 });
 
 app.put('/api/archive/singles/:id', requireAdminOrMod, (req: AuthRequest, res: Response) => {
-  const { title, release_year, release_date, cover_url, description, duration_seconds, audio_url, lyrics, streaming_links, sort_order } = req.body;
-  const linksJson = streaming_links !== undefined ? (typeof streaming_links === 'object' ? JSON.stringify(streaming_links) : streaming_links) : undefined;
-  const hasCover = 'cover_url' in req.body;
-  const nextCover = cover_url ? String(cover_url).trim() : null;
-  const hasAudio = 'audio_url' in req.body;
-  const nextAudio = audio_url ? String(audio_url).trim() : '';
+  const { title, release_year, release_date, cover_url, description, duration_seconds, audio_url, lyrics, streaming_links, sort_order } = req.body || {};
+  const hasCover = 'cover_url' in (req.body || {});
+  const nextCover = typeof cover_url === 'string' && cover_url.trim() ? cover_url.trim() : null;
+  if (hasCover && nextCover && !isSafeMediaUrl(nextCover)) {
+    res.status(400).json({ error: 'Invalid cover URL.' });
+    return;
+  }
+  const hasAudio = 'audio_url' in (req.body || {});
+  const nextAudio = typeof audio_url === 'string' ? audio_url.trim() : '';
+  if (hasAudio && nextAudio && !isSafeMediaUrl(nextAudio)) {
+    res.status(400).json({ error: 'Invalid audio URL.' });
+    return;
+  }
+  let linksJson: string | undefined;
+  if (streaming_links !== undefined) {
+    if (typeof streaming_links === 'object') {
+      linksJson = JSON.stringify(sanitizeStreamingLinks(streaming_links));
+    } else if (typeof streaming_links === 'string') {
+      try {
+        linksJson = JSON.stringify(sanitizeStreamingLinks(JSON.parse(streaming_links)));
+      } catch {
+        linksJson = '{}';
+      }
+    }
+  }
 
   db.prepare(`
     UPDATE singles SET
@@ -787,16 +913,16 @@ app.put('/api/archive/singles/:id', requireAdminOrMod, (req: AuthRequest, res: R
       sort_order = COALESCE(?, sort_order)
     WHERE id = ?
   `).run(
-    title ? title.trim() : null,
+    typeof title === 'string' && title.trim() ? title.trim() : null,
     release_year ?? null,
-    release_date ?? null,
+    typeof release_date === 'string' ? release_date : null,
     hasCover ? 1 : 0,
     nextCover,
-    description ?? null,
+    typeof description === 'string' ? description : null,
     duration_seconds ?? null,
     hasAudio ? 1 : 0,
     nextAudio,
-    lyrics ?? null,
+    typeof lyrics === 'string' ? lyrics : null,
     linksJson ?? null,
     sort_order ?? null,
     req.params.id
@@ -810,15 +936,29 @@ app.delete('/api/archive/singles/:id', requireAdminOrMod, (req: AuthRequest, res
   res.json({ ok: true });
 });
 
-// Admin audio files inventory
+// Admin media storage inventory (audio tracks + uploaded cover images)
 app.get('/api/admin/audio-files', requireAdminOrMod, (_req: Request, res: Response) => {
-  const files = db.prepare(`
-    SELECT af.*, u.nickname as uploader_name, t.title as attached_track_title
+  const audioFiles = db.prepare(`
+    SELECT af.id, af.filename, af.mime_type, af.byte_size, af.storage_path, af.created_at,
+           u.nickname as uploader_name, t.title as attached_track_title
     FROM audio_files af
     LEFT JOIN users u ON u.id = af.uploaded_by
     LEFT JOIN tracks t ON t.id = af.track_id
-    ORDER BY af.created_at DESC
-  `).all();
+  `).all() as any[];
+
+  const imageFiles = db.prepare(`
+    SELECT ai.id, ai.title as filename, 'image/*' as mime_type,
+           COALESCE(ub.byte_size, 0) as byte_size,
+           ai.storage_path, ai.created_at,
+           u.nickname as uploader_name, NULL as attached_track_title
+    FROM archive_images ai
+    LEFT JOIN users u ON u.id = ai.uploaded_by
+    LEFT JOIN uploaded_blobs ub ON ub.filename = replace(ai.storage_path, '/uploads/', '')
+  `).all() as any[];
+
+  const files = [...audioFiles, ...imageFiles].sort((a, b) =>
+    String(b.created_at || '').localeCompare(String(a.created_at || ''))
+  );
   res.json({ files });
 });
 
@@ -2333,11 +2473,36 @@ app.get('/api/admin/users', requireAdminOrMod, (_req: Request, res: Response) =>
 });
 
 app.post('/api/admin/users/:id/ban', requireAdminOrMod, (req: AuthRequest, res: Response) => {
-  const { is_banned, ban_reason } = req.body;
+  const { is_banned, ban_reason } = req.body || {};
+  const targetUser = db.prepare('SELECT id, nickname, email, role_id FROM users WHERE id = ?').get(req.params.id) as any;
+  if (!targetUser) {
+    res.status(404).json({ error: 'User not found' });
+    return;
+  }
+  const isTargetMaster =
+    String(targetUser.nickname || '').toLowerCase() === 'sushkanov097' ||
+    String(targetUser.email || '').toLowerCase() === 'sushkanov097@gmail.com';
+  if (targetUser.id === req.user!.id) {
+    res.status(400).json({ error: 'You cannot ban your own account.' });
+    return;
+  }
+  if (isTargetMaster) {
+    res.status(403).json({ error: 'Master administrator account cannot be banned.' });
+    return;
+  }
+  if (req.user!.role_id !== 'admin' && (targetUser.role_id === 'admin' || targetUser.role_id === 'moderator')) {
+    res.status(403).json({ error: 'Moderators cannot ban administrators or other moderators.' });
+    return;
+  }
+
   db.prepare(`
     UPDATE users SET is_banned = ?, ban_reason = ?, updated_at = datetime('now')
     WHERE id = ?
-  `).run(is_banned ? 1 : 0, ban_reason || 'Sanctuary rules violation', req.params.id);
+  `).run(
+    is_banned ? 1 : 0,
+    typeof ban_reason === 'string' && ban_reason.trim() ? ban_reason.trim() : 'Sanctuary rules violation',
+    req.params.id
+  );
 
   // If banned, invalidate sessions immediately
   if (is_banned) {
@@ -2348,12 +2513,28 @@ app.post('/api/admin/users/:id/ban', requireAdminOrMod, (req: AuthRequest, res: 
 });
 
 app.post('/api/admin/users/:id/role', requireAdmin, (req: AuthRequest, res: Response) => {
-  const { role_id } = req.body;
+  const { role_id } = req.body || {};
   if (!['user', 'moderator', 'admin'].includes(role_id)) {
     res.status(400).json({ error: 'Invalid role' });
     return;
   }
-  db.prepare('UPDATE users SET role_id = ?, updated_at = datetime(\'now\') WHERE id = ?').run(role_id, req.params.id);
+  const targetUser = db.prepare('SELECT id, nickname, email FROM users WHERE id = ?').get(req.params.id) as any;
+  if (!targetUser) {
+    res.status(404).json({ error: 'User not found' });
+    return;
+  }
+  const isTargetMaster =
+    String(targetUser.nickname || '').toLowerCase() === 'sushkanov097' ||
+    String(targetUser.email || '').toLowerCase() === 'sushkanov097@gmail.com';
+  if (isTargetMaster && role_id !== 'admin') {
+    res.status(403).json({ error: 'Master administrator role cannot be downgraded.' });
+    return;
+  }
+  if (targetUser.id === req.user!.id && role_id !== 'admin') {
+    res.status(400).json({ error: 'You cannot demote your own administrator account.' });
+    return;
+  }
+  db.prepare("UPDATE users SET role_id = ?, updated_at = datetime('now') WHERE id = ?").run(role_id, req.params.id);
   res.json({ ok: true });
 });
 
@@ -2382,19 +2563,27 @@ app.get('/api/admin/reports', requireAdminOrMod, (_req: Request, res: Response) 
 });
 
 app.post('/api/admin/reports/:id/resolve', requireAdminOrMod, (req: AuthRequest, res: Response) => {
-  const { status, note } = req.body; // 'resolved', 'dismissed'
+  const { status, note } = req.body || {}; // 'resolved', 'dismissed'
+  const cleanStatus = status === 'dismissed' ? 'dismissed' : 'resolved';
   db.prepare(`
     UPDATE reports SET
       status = ?, resolution_note = ?, resolved_by = ?, resolved_at = datetime('now')
     WHERE id = ?
-  `).run(status || 'resolved', note || '', req.user!.id, req.params.id);
+  `).run(cleanStatus, typeof note === 'string' ? note : '', req.user!.id, req.params.id);
   res.json({ ok: true });
 });
 
 // User can report content
 app.post('/api/reports', requireAuth, (req: AuthRequest, res: Response) => {
-  const { target_type, target_id, reason } = req.body;
-  if (!target_type || !target_id || !reason) {
+  const { target_type, target_id, reason } = req.body || {};
+  if (
+    typeof target_type !== 'string' ||
+    typeof target_id !== 'string' ||
+    typeof reason !== 'string' ||
+    !target_type.trim() ||
+    !target_id.trim() ||
+    !reason.trim()
+  ) {
     res.status(400).json({ error: 'target_type, target_id and reason are required.' });
     return;
   }
@@ -2402,7 +2591,7 @@ app.post('/api/reports', requireAuth, (req: AuthRequest, res: Response) => {
   db.prepare(`
     INSERT INTO reports (id, reporter_id, target_type, target_id, reason)
     VALUES (?, ?, ?, ?, ?)
-  `).run(id, req.user!.id, target_type, target_id, reason.trim());
+  `).run(id, req.user!.id, target_type.trim(), target_id.trim(), reason.trim());
 
   res.json({ ok: true, id });
 });
@@ -2414,8 +2603,16 @@ app.get('/api/admin/quiz-questions', requireAdminOrMod, (_req: Request, res: Res
 });
 
 app.post('/api/admin/quiz-questions', requireAdminOrMod, (req: AuthRequest, res: Response) => {
-  const { question_ru, question_en, options, correct_index, explanation_ru, explanation_en, difficulty } = req.body;
-  if (!question_ru || !question_en || !options || correct_index === undefined) {
+  const { question_ru, question_en, options, correct_index, explanation_ru, explanation_en, difficulty } = req.body || {};
+  if (
+    typeof question_ru !== 'string' ||
+    !question_ru.trim() ||
+    typeof question_en !== 'string' ||
+    !question_en.trim() ||
+    !Array.isArray(options) ||
+    options.length < 2 ||
+    correct_index === undefined
+  ) {
     res.status(400).json({ error: 'Missing required quiz question fields' });
     return;
   }
@@ -2423,7 +2620,16 @@ app.post('/api/admin/quiz-questions', requireAdminOrMod, (req: AuthRequest, res:
   db.prepare(`
     INSERT INTO quiz_questions (id, question_ru, question_en, options_json, correct_index, explanation_ru, explanation_en, difficulty)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, question_ru, question_en, JSON.stringify(options), correct_index, explanation_ru || '', explanation_en || '', difficulty || 1);
+  `).run(
+    id,
+    question_ru.trim(),
+    question_en.trim(),
+    JSON.stringify(options),
+    Math.max(0, Math.min(Number(correct_index) || 0, options.length - 1)),
+    typeof explanation_ru === 'string' ? explanation_ru : '',
+    typeof explanation_en === 'string' ? explanation_en : '',
+    Number(difficulty) || 1
+  );
 
   res.json({ ok: true, id });
 });
@@ -2434,7 +2640,7 @@ app.put('/api/admin/quiz-questions/:id', requireAdminOrMod, (req: AuthRequest, r
     res.status(404).json({ error: 'Quiz question not found' });
     return;
   }
-  const { question_ru, question_en, options, correct_index, explanation_ru, explanation_en, difficulty, is_active } = req.body;
+  const { question_ru, question_en, options, correct_index, explanation_ru, explanation_en, difficulty, is_active } = req.body || {};
   db.prepare(`
     UPDATE quiz_questions SET
       question_ru = COALESCE(?, question_ru),
@@ -2447,13 +2653,13 @@ app.put('/api/admin/quiz-questions/:id', requireAdminOrMod, (req: AuthRequest, r
       is_active = COALESCE(?, is_active)
     WHERE id = ?
   `).run(
-    question_ru ?? null,
-    question_en ?? null,
-    options !== undefined ? JSON.stringify(options) : null,
-    correct_index !== undefined ? correct_index : null,
-    explanation_ru ?? null,
-    explanation_en ?? null,
-    difficulty ?? null,
+    typeof question_ru === 'string' ? question_ru : null,
+    typeof question_en === 'string' ? question_en : null,
+    Array.isArray(options) ? JSON.stringify(options) : null,
+    correct_index !== undefined ? Number(correct_index) : null,
+    typeof explanation_ru === 'string' ? explanation_ru : null,
+    typeof explanation_en === 'string' ? explanation_en : null,
+    difficulty !== undefined ? Number(difficulty) : null,
     is_active !== undefined ? (is_active ? 1 : 0) : null,
     req.params.id
   );
@@ -2466,72 +2672,194 @@ app.delete('/api/admin/quiz-questions/:id', requireAdminOrMod, (req: AuthRequest
 });
 
 // ----------------------------------------------------------------------------
-// API: UPLOAD (IMAGES, AUDIO & VIDEO)
+// API: UPLOAD (IMAGES, AUDIO & VIDEO) — LOCAL + SUPABASE DIRECT SIGNED STORAGE
 // ----------------------------------------------------------------------------
 
-app.post('/api/upload', uploadRateLimit, requireAuth, upload.single('file'), (req: AuthRequest, res: Response) => {
-  if (!req.file) {
-    res.status(400).json({ error: 'No file uploaded or file rejected.' });
-    return;
-  }
-  const fileUrl = `/uploads/${req.file.filename}`;
-  const fileId = 'aud_' + crypto.randomUUID().slice(0, 8);
-
-  const isAudio = req.file.mimetype.startsWith('audio/') || Boolean(req.file.originalname.match(/\.(mp3|wav|wave|ogg|flac|m4a|aac|aiff|wma)$/i));
-  const isImage = req.file.mimetype.startsWith('image/') || Boolean(req.file.originalname.match(/\.(jpg|jpeg|png|webp|gif|svg|bmp)$/i));
-  const isVideo = req.file.mimetype.startsWith('video/') || Boolean(req.file.originalname.match(/\.(mp4|webm|mov)$/i));
-
-  // Persist uploaded file binary in SQLite uploaded_blobs (up to 25MB) so serverless cold starts never lose uploads
-  try {
-    if (req.file.path && fs.existsSync(req.file.path) && req.file.size <= 25 * 1024 * 1024) {
-      const fileBuffer = fs.readFileSync(req.file.path);
-      db.prepare(`
-        INSERT INTO uploaded_blobs (filename, mime_type, byte_size, data)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(filename) DO UPDATE SET
-          mime_type = excluded.mime_type,
-          byte_size = excluded.byte_size,
-          data = excluded.data
-      `).run(req.file.filename, req.file.mimetype || 'application/octet-stream', req.file.size, fileBuffer);
-    }
-  } catch (err) {
-    console.warn('[Upload] Failed to store blob in SQLite fallback table:', err);
-  }
-
-  if (isAudio) {
+function indexUploadedMediaMetadata(
+  kind: 'audio' | 'image' | 'video' | null,
+  originalName: string,
+  mimeType: string,
+  byteSize: number,
+  fileUrl: string,
+  userId: string | null
+): string {
+  const fileId = (kind === 'image' ? 'img_' : 'aud_') + crypto.randomUUID().slice(0, 8);
+  if (kind === 'audio') {
     try {
       db.prepare(`
         INSERT INTO audio_files (id, filename, mime_type, byte_size, storage_path, uploaded_by)
         VALUES (?, ?, ?, ?, ?, ?)
-      `).run(fileId, req.file.originalname, req.file.mimetype, req.file.size, fileUrl, req.user?.id || null);
+      `).run(fileId, originalName, mimeType || 'audio/mpeg', byteSize, fileUrl, userId);
     } catch (e) {
       console.error('Failed to index audio file:', e);
     }
-  } else if (isImage) {
+  } else if (kind === 'image') {
     try {
       db.prepare(`
         INSERT INTO archive_images (id, title, storage_path, category, uploaded_by)
         VALUES (?, ?, ?, 'artwork', ?)
-      `).run('img_' + crypto.randomUUID().slice(0, 8), req.file.originalname, fileUrl, req.user?.id || null);
+      `).run(fileId, originalName, fileUrl, userId);
     } catch (e) {
       console.error('Failed to index archive image:', e);
     }
   }
+  return fileId;
+}
+
+// Step 1 of direct cloud upload (bypasses Vercel 4.5MB serverless body limit for large MP3/WAV files)
+app.post('/api/upload/signed-url', uploadRateLimit, requireAuth, async (req: AuthRequest, res: Response) => {
+  const { filename, mimetype, size } = req.body || {};
+  if (typeof filename !== 'string' || !filename.trim()) {
+    res.status(400).json({ error: 'Filename is required.' });
+    return;
+  }
+  const numericSize = Number(size) || 0;
+  if (numericSize > 100 * 1024 * 1024) {
+    res.status(413).json({ error: 'File exceeds maximum allowed size of 100 MB.' });
+    return;
+  }
+  const classified = classifyMediaUpload(filename, typeof mimetype === 'string' ? mimetype : '');
+  if (!classified.allowed) {
+    res.status(400).json({
+      error: 'Disallowed file type. Only audio (MP3, WAV, FLAC, OGG, M4A), images (JPG, PNG, WEBP, GIF), and video (MP4, WEBM, MOV) are accepted.',
+    });
+    return;
+  }
+
+  if (!isSupabaseConfigured()) {
+    res.json({ direct: false, reason: 'supabase-not-configured' });
+    return;
+  }
+
+  const storedFilename = buildSafeUploadFilename(filename, typeof mimetype === 'string' ? mimetype : '');
+  const signed = await createSignedMediaUploadUrl(storedFilename);
+  if (!signed) {
+    res.json({ direct: false, reason: 'signed-url-unavailable' });
+    return;
+  }
+
+  res.json({
+    direct: true,
+    signedUrl: signed.signedUrl,
+    storedFilename,
+    url: `/uploads/${storedFilename}`,
+    kind: classified.kind,
+  });
+});
+
+// Step 2 of direct cloud upload: register file metadata in SQLite + trigger cloud DB snapshot sync
+app.post('/api/upload/complete', uploadRateLimit, requireAuth, (req: AuthRequest, res: Response) => {
+  const { storedFilename, originalName, mimetype, size } = req.body || {};
+  if (typeof storedFilename !== 'string' || !storedFilename.trim() || storedFilename.includes('..') || storedFilename.includes('/')) {
+    res.status(400).json({ error: 'Invalid stored filename.' });
+    return;
+  }
+  const safeOriginal = typeof originalName === 'string' && originalName.trim() ? originalName.trim() : storedFilename;
+  const safeMime = typeof mimetype === 'string' ? mimetype : 'application/octet-stream';
+  const classified = classifyMediaUpload(safeOriginal, safeMime);
+  if (!classified.allowed) {
+    res.status(400).json({ error: 'Disallowed media type.' });
+    return;
+  }
+
+  const fileUrl = `/uploads/${path.basename(storedFilename)}`;
+  const numericSize = Math.max(0, Number(size) || 0);
+  const fileId = indexUploadedMediaMetadata(classified.kind, safeOriginal, safeMime, numericSize, fileUrl, req.user?.id || null);
 
   res.json({
     id: fileId,
     url: fileUrl,
-    filename: req.file.originalname,
-    mimetype: req.file.mimetype,
-    size: req.file.size,
-    is_audio: isAudio,
-    is_image: isImage,
-    is_video: isVideo,
+    filename: safeOriginal,
+    mimetype: safeMime,
+    size: numericSize,
+    is_audio: classified.kind === 'audio',
+    is_image: classified.kind === 'image',
+    is_video: classified.kind === 'video',
+    storage_backend: 'supabase-storage',
   });
 });
 
-// Serve uploaded files from disk first, falling back to SQLite uploaded_blobs for serverless persistence
-app.get('/uploads/:filename', (req: Request, res: Response, next: NextFunction) => {
+app.post('/api/upload', uploadRateLimit, requireAuth, (req: AuthRequest, res: Response) => {
+  upload.single('file')(req, res, async (multerErr: any) => {
+    if (multerErr) {
+      if (multerErr instanceof multer.MulterError && multerErr.code === 'LIMIT_FILE_SIZE') {
+        res.status(413).json({ error: 'File is too large. Maximum size is 100 MB.' });
+        return;
+      }
+      res.status(400).json({ error: multerErr.message || 'File upload rejected.' });
+      return;
+    }
+
+    if (!req.file) {
+      res.status(400).json({ error: 'No file uploaded or file rejected.' });
+      return;
+    }
+
+    const fileUrl = `/uploads/${req.file.filename}`;
+    const classified = classifyMediaUpload(req.file.originalname, req.file.mimetype);
+    const isAudio = classified.kind === 'audio';
+    const isImage = classified.kind === 'image';
+    const isVideo = classified.kind === 'video';
+
+    let fileBuffer: Buffer | null = null;
+    if (req.file.path && fs.existsSync(req.file.path)) {
+      try {
+        fileBuffer = fs.readFileSync(req.file.path);
+      } catch (err) {
+        console.warn('[Upload] Could not read uploaded file into memory:', err);
+      }
+    }
+
+    let uploadedToCloud = false;
+    if (fileBuffer && isSupabaseConfigured()) {
+      uploadedToCloud = await uploadMediaToSupabase(
+        req.file.filename,
+        fileBuffer,
+        req.file.mimetype || 'application/octet-stream'
+      );
+    }
+
+    // Persist uploaded file binary in SQLite uploaded_blobs (up to 25MB) as fallback
+    try {
+      if (fileBuffer && req.file.size <= 25 * 1024 * 1024) {
+        db.prepare(`
+          INSERT INTO uploaded_blobs (filename, mime_type, byte_size, data)
+          VALUES (?, ?, ?, ?)
+          ON CONFLICT(filename) DO UPDATE SET
+            mime_type = excluded.mime_type,
+            byte_size = excluded.byte_size,
+            data = excluded.data
+        `).run(req.file.filename, req.file.mimetype || 'application/octet-stream', req.file.size, fileBuffer);
+      }
+    } catch (err) {
+      console.warn('[Upload] Failed to store blob in SQLite fallback table:', err);
+    }
+
+    const fileId = indexUploadedMediaMetadata(
+      classified.kind,
+      req.file.originalname,
+      req.file.mimetype,
+      req.file.size,
+      fileUrl,
+      req.user?.id || null
+    );
+
+    res.json({
+      id: fileId,
+      url: fileUrl,
+      filename: req.file.originalname,
+      mimetype: req.file.mimetype,
+      size: req.file.size,
+      is_audio: isAudio,
+      is_image: isImage,
+      is_video: isVideo,
+      storage_backend: uploadedToCloud ? 'supabase-storage+local' : 'local+sqlite',
+    });
+  });
+});
+
+// Serve uploaded files from disk first, falling back to SQLite uploaded_blobs, then Supabase Storage (with HTTP Range streaming)
+app.get('/uploads/:filename', async (req: Request, res: Response, next: NextFunction) => {
   const filename = path.basename(req.params.filename || '');
   if (!filename || filename.includes('..')) {
     res.status(400).end();
@@ -2539,8 +2867,12 @@ app.get('/uploads/:filename', (req: Request, res: Response, next: NextFunction) 
   }
 
   const diskCandidate = path.join(uploadDir, filename);
-  const publicCandidate = path.resolve(process.cwd(), 'public', 'uploads', filename);
-  if (fs.existsSync(diskCandidate) || fs.existsSync(publicCandidate)) {
+  const publicUploadsDir = path.resolve(process.cwd(), 'public', 'uploads');
+  const publicCandidate = path.join(publicUploadsDir, filename);
+  if (
+    (isPathInsideDir(uploadDir, diskCandidate) && fs.existsSync(diskCandidate)) ||
+    (isPathInsideDir(publicUploadsDir, publicCandidate) && fs.existsSync(publicCandidate))
+  ) {
     next();
     return;
   }
@@ -2549,35 +2881,51 @@ app.get('/uploads/:filename', (req: Request, res: Response, next: NextFunction) 
     const row = db.prepare('SELECT mime_type, byte_size, data FROM uploaded_blobs WHERE filename = ?').get(filename) as
       | { mime_type: string; byte_size: number; data: Buffer }
       | undefined;
-    if (!row || !row.data) {
-      res.status(404).json({ error: 'Uploaded file not found' });
+
+    if (row && row.data) {
+      const buffer = Buffer.isBuffer(row.data) ? row.data : Buffer.from(row.data);
+      const total = buffer.length;
+      res.setHeader('Content-Type', row.mime_type || 'application/octet-stream');
+      res.setHeader('Accept-Ranges', 'bytes');
+      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+
+      const range = req.headers.range;
+      if (range) {
+        const parts = range.replace(/bytes=/, '').split('-');
+        const start = parseInt(parts[0], 10);
+        const end = parts[1] ? parseInt(parts[1], 10) : total - 1;
+        if (!isNaN(start) && !isNaN(end) && start >= 0 && end < total && start <= end) {
+          res.status(206);
+          res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
+          res.setHeader('Content-Length', String(end - start + 1));
+          res.end(buffer.subarray(start, end + 1));
+          return;
+        }
+      }
+
+      res.setHeader('Content-Length', String(total));
+      res.end(buffer);
       return;
     }
 
-    const buffer = Buffer.isBuffer(row.data) ? row.data : Buffer.from(row.data);
-    const total = buffer.length;
-    res.setHeader('Content-Type', row.mime_type || 'application/octet-stream');
-    res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-
-    const range = req.headers.range;
-    if (range) {
-      const parts = range.replace(/bytes=/, '').split('-');
-      const start = parseInt(parts[0], 10);
-      const end = parts[1] ? parseInt(parts[1], 10) : total - 1;
-      if (!isNaN(start) && !isNaN(end) && start >= 0 && end < total && start <= end) {
-        res.status(206);
-        res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
-        res.setHeader('Content-Length', String(end - start + 1));
-        res.end(buffer.subarray(start, end + 1));
-        return;
+    // Fallback to Supabase Storage (supports large MP3/WAV files >25MB and direct signed uploads)
+    const cloudMedia = await fetchMediaFromSupabase(filename, req.headers.range);
+    if (cloudMedia) {
+      res.status(cloudMedia.status);
+      res.setHeader('Content-Type', cloudMedia.contentType);
+      res.setHeader('Accept-Ranges', 'bytes');
+      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+      if (cloudMedia.contentRange) {
+        res.setHeader('Content-Range', cloudMedia.contentRange);
       }
+      res.setHeader('Content-Length', cloudMedia.contentLength || String(cloudMedia.body.length));
+      res.end(cloudMedia.body);
+      return;
     }
 
-    res.setHeader('Content-Length', String(total));
-    res.end(buffer);
+    res.status(404).json({ error: 'Uploaded file not found' });
   } catch (err) {
-    console.error('[Uploads] Error serving blob from SQLite:', err);
+    console.error('[Uploads] Error serving uploaded media:', err);
     res.status(500).end();
   }
 });
@@ -2615,12 +2963,23 @@ app.use('/api', (err: any, _req: Request, res: Response, _next: NextFunction) =>
 // ----------------------------------------------------------------------------
 
 async function startServer() {
+  const httpServer = http.createServer(app);
+  let viteServer: { close: () => Promise<void> } | null = null;
+
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
+    const disableHmr =
+      process.env.DISABLE_HMR === 'true' || Boolean(process.env.CONTROL_PLANE_PORT);
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        // Never open a separate standalone WebSocket port (24678) that conflicts during restarts
+        hmr: disableHmr ? false : { server: httpServer },
+        watch: disableHmr ? null : undefined,
+      },
       appType: 'spa',
     });
+    viteServer = vite;
     app.use(vite.middlewares);
   } else {
     app.use(express.static(path.resolve(process.cwd(), 'dist')));
@@ -2629,13 +2988,51 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  httpServer.on('error', (err: NodeJS.ErrnoException) => {
+    console.error(`[Apostles of deathmarried] HTTP server error on port ${PORT}:`, err);
+    if (err.code === 'EADDRINUSE' || err.code === 'EACCES') {
+      process.exit(1);
+    }
+  });
+
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`[Apostles of deathmarried] Server running on http://0.0.0.0:${PORT}`);
   });
+
+  let shuttingDown = false;
+  const shutdown = (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[Apostles of deathmarried] Received ${signal}, shutting down cleanly...`);
+    httpServer.close(() => {
+      Promise.resolve(viteServer?.close())
+        .catch(() => {})
+        .finally(() => {
+          closeDatabase();
+          process.exit(0);
+        });
+    });
+    // Force exit if keep-alive connections stall shutdown
+    setTimeout(() => {
+      closeDatabase();
+      process.exit(0);
+    }, 3000).unref();
+  };
+
+  process.once('SIGINT', () => shutdown('SIGINT'));
+  process.once('SIGTERM', () => shutdown('SIGTERM'));
 }
 
 if (!isVercel && process.env.NODE_ENV !== 'test') {
-  startServer();
+  process.on('unhandledRejection', (reason) => {
+    console.error('[Apostles of deathmarried] Unhandled promise rejection:', reason);
+  });
+
+  startServer().catch((err) => {
+    console.error('[Apostles of deathmarried] Fatal startup error:', err);
+    closeDatabase();
+    process.exit(1);
+  });
 }
 
 export { app };

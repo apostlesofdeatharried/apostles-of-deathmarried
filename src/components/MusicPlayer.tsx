@@ -16,6 +16,7 @@ import {
   ListMusic,
   X,
   ChevronDown,
+  AlertCircle,
 } from 'lucide-react';
 
 export const MusicPlayer: React.FC = () => {
@@ -23,6 +24,7 @@ export const MusicPlayer: React.FC = () => {
     currentTrack,
     isPlaying,
     isVisible,
+    playbackError,
     progress,
     duration,
     volume,
@@ -41,10 +43,11 @@ export const MusicPlayer: React.FC = () => {
     toggleRepeat,
     setQueueOpen,
     removeFromQueue,
+    clearPlaybackError,
     playTrack,
     hidePlayer,
   } = usePlayer();
-  const { t } = useI18n();
+  const { t, lang } = useI18n();
 
   if (!isVisible || !currentTrack) return null;
 
@@ -104,6 +107,26 @@ export const MusicPlayer: React.FC = () => {
         aria-label="Audio Console"
       >
         <div className="max-w-7xl mx-auto flex flex-col gap-1.5">
+          {playbackError && (
+            <div className="flex items-center justify-between gap-2 px-3 py-1 rounded bg-[#2a1116] border border-[#721b2b]/60 text-[11px] text-[#f2b8c0] font-sans">
+              <span className="flex items-center gap-1.5 truncate">
+                <AlertCircle className="w-3.5 h-3.5 shrink-0 text-[#e8909c]" />
+                <span className="truncate">
+                  {lang === 'ru'
+                    ? 'Аудиофайл временно недоступен или не удалось загрузить трек.'
+                    : playbackError}
+                </span>
+              </span>
+              <button
+                type="button"
+                onClick={clearPlaybackError}
+                className="text-[#d9a3ab] hover:text-white cursor-pointer shrink-0"
+                aria-label="Dismiss audio error"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
           <div className="flex items-center justify-between gap-3">
             {/* Left: Track Info & Cover */}
             <div className="flex items-center gap-3 min-w-0 w-1/3 sm:w-1/4">

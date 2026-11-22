@@ -667,10 +667,10 @@ export const CreationsView: React.FC = () => {
                     <div className="w-16 h-16 rounded-full bg-white/[0.08] border border-white/20 flex items-center justify-center mx-auto text-white">
                       <Music className="w-8 h-8" />
                     </div>
-                    <audio src={activeCreation.media_url} controls className="w-full" />
+                    <audio src={activeCreation.media_url} controls preload="metadata" className="w-full" />
                   </div>
                 ) : (
-                  <video src={activeCreation.media_url} controls className="max-h-96 w-full" />
+                  <video src={activeCreation.media_url} controls preload="metadata" className="max-h-96 w-full" />
                 )}
               </div>
 

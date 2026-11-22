@@ -68,13 +68,22 @@ function MainApp() {
   const showNotFound = Boolean(route.notFound || isUnauthorizedAdminRoute);
 
   useEffect(() => {
-    document.title = showNotFound
+    const nextTitle = showNotFound
       ? `404 — Apostles of deathmarried`
       : route.profileNickname
         ? `${route.profileNickname} — Apostles of deathmarried`
         : route.tab === 'admin' && !isAdminOrMod
           ? 'Apostles of deathmarried'
           : TAB_TITLES[route.tab];
+    document.title = nextTitle;
+
+    const canonicalUrl = `https://apostlesofdeathmarried.ru${showNotFound ? '/' : buildPath(route.tab, route.profileNickname)}`;
+    const canonicalEl = document.querySelector('link[rel="canonical"]');
+    if (canonicalEl) canonicalEl.setAttribute('href', canonicalUrl);
+    const ogUrlEl = document.querySelector('meta[property="og:url"]');
+    if (ogUrlEl) ogUrlEl.setAttribute('content', canonicalUrl);
+    const ogTitleEl = document.querySelector('meta[property="og:title"]');
+    if (ogTitleEl) ogTitleEl.setAttribute('content', nextTitle);
   }, [route, showNotFound, isAdminOrMod]);
 
   useEffect(() => {

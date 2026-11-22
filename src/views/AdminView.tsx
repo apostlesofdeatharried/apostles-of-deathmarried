@@ -110,8 +110,13 @@ export const AdminView: React.FC = () => {
   const singleAudioInputRef = useRef<HTMLInputElement>(null);
   const mediaStorageInputRef = useRef<HTMLInputElement>(null);
 
-  // Upload loading flags
+  // Upload & form submit loading flags
   const [uploadingField, setUploadingField] = useState<string | null>(null);
+  const [savingAlbum, setSavingAlbum] = useState(false);
+  const [savingSingle, setSavingSingle] = useState(false);
+  const [savingTrack, setSavingTrack] = useState(false);
+  const [savingQuiz, setSavingQuiz] = useState(false);
+  const [healthStatus, setHealthStatus] = useState<any>(null);
 
   // Album Form State
   const [editingAlbumId, setEditingAlbumId] = useState<string | null>(null);
@@ -172,7 +177,7 @@ export const AdminView: React.FC = () => {
   const fetchAdminData = async () => {
     setLoading(true);
     try {
-      const [resStats, resUsers, resAlb, resSng, resAud, resGame, resQuiz, resPosts, resCreations, resReports] = await Promise.all([
+      const [resStats, resUsers, resAlb, resSng, resAud, resGame, resQuiz, resPosts, resCreations, resReports, resHealth] = await Promise.all([
         authFetch('/api/admin/stats'),
         authFetch('/api/admin/users'),
         authFetch('/api/archive/albums'),
@@ -183,6 +188,7 @@ export const AdminView: React.FC = () => {
         authFetch('/api/community/posts?status=all'),
         authFetch('/api/creations?status=all'),
         authFetch('/api/admin/reports'),
+        fetch('/api/health'),
       ]);
 
       if (resStats.ok) setStats((await safeJson<any>(resStats, {})).stats);
@@ -201,6 +207,7 @@ export const AdminView: React.FC = () => {
       if (resPosts.ok) setAllPostsList((await safeJson<any>(resPosts, {})).posts || []);
       if (resCreations.ok) setAllCreationsList((await safeJson<any>(resCreations, {})).creations || []);
       if (resReports.ok) setReportsList((await safeJson<any>(resReports, {})).reports || []);
+      if (resHealth.ok) setHealthStatus(await safeJson<any>(resHealth, null));
     } catch (e) {
       console.error('Error fetching admin data:', e);
     } finally {
@@ -265,6 +272,7 @@ export const AdminView: React.FC = () => {
 
   const handleSaveQuizQuestion = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (savingQuiz) return;
     const opts = [quizOpt0.trim(), quizOpt1.trim(), quizOpt2.trim(), quizOpt3.trim()].filter(Boolean);
     if (!quizQuestionRu.trim() || opts.length < 2) {
       setErrorMessage(lang === 'ru' ? 'Введите вопрос и минимум 2 варианта ответа' : 'Provide question and at least 2 options');
@@ -279,6 +287,7 @@ export const AdminView: React.FC = () => {
       explanation_en: quizExplanationRu.trim(),
       difficulty: parseInt(quizDifficulty, 10) || 1,
     };
+    setSavingQuiz(true);
     try {
       const res = editingQuizId
         ? await authFetch(`/api/admin/quiz-questions/${editingQuizId}`, {
@@ -305,6 +314,8 @@ export const AdminView: React.FC = () => {
       }
     } catch (e: any) {
       setErrorMessage(e?.message || 'Network error');
+    } finally {
+      setSavingQuiz(false);
     }
   };
 
@@ -425,48 +436,142 @@ export const AdminView: React.FC = () => {
     }
   };
 
-  // General Upload Handler
+  // General Upload Handler (supports direct Supabase Storage signed upload for large MP3/WAV + server fallback)
   const handleUploadFile = async (
     file: File,
     targetField: 'albumCover' | 'singleCover' | 'trackAudio' | 'singleAudio' | 'mediaStorage'
   ) => {
+    if (!file || file.size === 0) {
+      setErrorMessage(lang === 'ru' ? 'Выбран пустой файл.' : 'Selected file is empty.');
+      return;
+    }
+    if (file.size > 100 * 1024 * 1024) {
+      setErrorMessage(lang === 'ru' ? 'Файл превышает лимит 100 МБ.' : 'File exceeds the 100 MB limit.');
+      return;
+    }
+
     setUploadingField(targetField);
-    setStatusMessage(lang === 'ru' ? 'Загрузка файла на сервер...' : 'Uploading file to server...');
+    setStatusMessage(lang === 'ru' ? 'Загрузка файла...' : 'Uploading file...');
     setErrorMessage(null);
 
-    const formData = new FormData();
-    formData.append('file', file);
+    const applyUploadedResult = (uploadedUrl: string, uploadedName: string) => {
+      setStatusMessage(
+        lang === 'ru'
+          ? `Файл успешно загружен: ${uploadedName || file.name}`
+          : `Uploaded: ${uploadedName || file.name}`
+      );
+      if (targetField === 'albumCover') {
+        setAlbumCoverUrl(uploadedUrl);
+      } else if (targetField === 'singleCover') {
+        setSingleCoverUrl(uploadedUrl);
+      } else if (targetField === 'trackAudio') {
+        setTrackAudioUrl(uploadedUrl);
+        if (uploadedUrl) autoDetectDuration(uploadedUrl, (sec) => setTrackDuration(String(sec)));
+      } else if (targetField === 'singleAudio') {
+        setSingleAudioUrl(uploadedUrl);
+        if (uploadedUrl) autoDetectDuration(uploadedUrl, (sec) => setSingleDuration(String(sec)));
+      }
+      fetchAdminData();
+    };
 
     try {
+      // Attempt Step 1: direct signed Supabase Storage upload (bypasses Vercel 4.5MB body limit)
+      let directHandled = false;
+      try {
+        const signRes = await authFetch('/api/upload/signed-url', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            filename: file.name,
+            mimetype: file.type || 'application/octet-stream',
+            size: file.size,
+          }),
+        });
+        const signData = await safeJson<{
+          direct?: boolean;
+          signedUrl?: string;
+          storedFilename?: string;
+          url?: string;
+          error?: string;
+        }>(signRes, {});
+
+        if (!signRes.ok) {
+          setErrorMessage(signData.error || (lang === 'ru' ? 'Формат файла не поддерживается.' : 'File rejected.'));
+          setStatusMessage(null);
+          return;
+        }
+
+        if (signData.direct && signData.signedUrl && signData.storedFilename) {
+          const putRes = await fetch(signData.signedUrl, {
+            method: 'PUT',
+            headers: {
+              'Content-Type': file.type || 'application/octet-stream',
+              'x-upsert': 'true',
+            },
+            body: file,
+          });
+          if (!putRes.ok) {
+            throw new Error(
+              lang === 'ru'
+                ? `Ошибка облачного хранилища (HTTP ${putRes.status}). Проверьте настройки Supabase Storage.`
+                : `Cloud storage upload failed (HTTP ${putRes.status}).`
+            );
+          }
+
+          const completeRes = await authFetch('/api/upload/complete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              storedFilename: signData.storedFilename,
+              originalName: file.name,
+              mimetype: file.type || 'application/octet-stream',
+              size: file.size,
+            }),
+          });
+          const completeData = await safeJson<{ url?: string; filename?: string; error?: string }>(completeRes, {});
+          if (!completeRes.ok || !completeData.url) {
+            throw new Error(completeData.error || 'Failed to register uploaded file');
+          }
+          directHandled = true;
+          applyUploadedResult(completeData.url, completeData.filename || file.name);
+        }
+      } catch (directErr: any) {
+        if (file.size > 4 * 1024 * 1024) {
+          throw directErr;
+        }
+      }
+
+      if (directHandled) return;
+
+      // Fallback: standard multipart POST to /api/upload
+      const formData = new FormData();
+      formData.append('file', file);
+
       const res = await authFetch('/api/upload', {
         method: 'POST',
         body: formData,
       });
-      const data = await safeJson<{ url?: string; error?: string; filename?: string }>(res, {});
 
-      if (!res.ok) {
-        setErrorMessage(data.error || 'Upload error');
+      if (res.status === 413) {
+        setErrorMessage(
+          lang === 'ru'
+            ? 'Файл слишком большой для прямого серверного запроса (лимит хостинга ~4.5 МБ). Подключите Supabase Storage для загрузки крупных MP3/WAV.'
+            : 'File exceeds direct serverless upload limit (~4.5 MB). Configure Supabase Storage for large MP3/WAV files.'
+        );
         setStatusMessage(null);
         return;
       }
 
-      setStatusMessage(lang === 'ru' ? `Файл успешно загружен: ${data.filename || ''}` : `Uploaded: ${data.filename || ''}`);
-
-      if (targetField === 'albumCover') {
-        setAlbumCoverUrl(data.url || '');
-      } else if (targetField === 'singleCover') {
-        setSingleCoverUrl(data.url || '');
-      } else if (targetField === 'trackAudio') {
-        setTrackAudioUrl(data.url || '');
-        if (data.url) autoDetectDuration(data.url, (sec) => setTrackDuration(String(sec)));
-      } else if (targetField === 'singleAudio') {
-        setSingleAudioUrl(data.url || '');
-        if (data.url) autoDetectDuration(data.url, (sec) => setSingleDuration(String(sec)));
+      const data = await safeJson<{ url?: string; error?: string; filename?: string }>(res, {});
+      if (!res.ok || !data.url) {
+        setErrorMessage(data.error || (lang === 'ru' ? `Ошибка загрузки (HTTP ${res.status})` : `Upload error (HTTP ${res.status})`));
+        setStatusMessage(null);
+        return;
       }
 
-      fetchAdminData();
+      applyUploadedResult(data.url, data.filename || file.name);
     } catch (err: any) {
-      setErrorMessage(err.message || 'Upload failed due to network error');
+      setErrorMessage(err?.message || (lang === 'ru' ? 'Ошибка сети при загрузке файла' : 'Upload failed due to network error'));
       setStatusMessage(null);
     } finally {
       setUploadingField(null);
@@ -476,7 +581,7 @@ export const AdminView: React.FC = () => {
   // Album Save / Update
   const handleSaveAlbum = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!albumTitle.trim()) return;
+    if (savingAlbum || !albumTitle.trim()) return;
 
     const streaming_links = {
       spotify: albumSpotify.trim() || undefined,
@@ -497,6 +602,7 @@ export const AdminView: React.FC = () => {
       streaming_links,
     };
 
+    setSavingAlbum(true);
     try {
       const res = editingAlbumId
         ? await authFetch(`/api/archive/albums/${editingAlbumId}`, {
@@ -525,6 +631,8 @@ export const AdminView: React.FC = () => {
       fetchAdminData();
     } catch (e: any) {
       setErrorMessage(e.message || 'Server connection error');
+    } finally {
+      setSavingAlbum(false);
     }
   };
 
@@ -564,7 +672,7 @@ export const AdminView: React.FC = () => {
   // Single Save / Update
   const handleSaveSingle = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!singleTitle.trim()) return;
+    if (savingSingle || !singleTitle.trim()) return;
 
     const streaming_links = {
       spotify: singleSpotify.trim() || undefined,
@@ -587,6 +695,7 @@ export const AdminView: React.FC = () => {
       streaming_links,
     };
 
+    setSavingSingle(true);
     try {
       const res = editingSingleId
         ? await authFetch(`/api/archive/singles/${editingSingleId}`, {
@@ -615,6 +724,8 @@ export const AdminView: React.FC = () => {
       fetchAdminData();
     } catch (e: any) {
       setErrorMessage(e.message || 'Server connection error');
+    } finally {
+      setSavingSingle(false);
     }
   };
 
@@ -658,6 +769,7 @@ export const AdminView: React.FC = () => {
   // Track Save / Update (in Album)
   const handleSaveTrack = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (savingTrack) return;
     if (!trackTitle.trim() || !trackAlbumId) {
       setErrorMessage(lang === 'ru' ? 'Укажите название трека и выберите альбом' : 'Provide track title and album');
       return;
@@ -672,6 +784,7 @@ export const AdminView: React.FC = () => {
       lyrics: trackLyrics.trim(),
     };
 
+    setSavingTrack(true);
     try {
       const res = editingTrackId
         ? await authFetch(`/api/archive/tracks/${editingTrackId}`, {
@@ -700,6 +813,8 @@ export const AdminView: React.FC = () => {
       fetchAdminData();
     } catch (e: any) {
       setErrorMessage(e.message || 'Server connection error');
+    } finally {
+      setSavingTrack(false);
     }
   };
 
@@ -1204,11 +1319,14 @@ export const AdminView: React.FC = () => {
 
               <button
                 type="submit"
-                className="w-full py-3 font-mono text-xs uppercase tracking-widest bg-white/[0.1] hover:bg-white/[0.18] text-white border border-white/20 rounded-lg transition-all cursor-pointer font-semibold shadow-md"
+                disabled={savingAlbum}
+                className="w-full py-3 font-mono text-xs uppercase tracking-widest bg-white/[0.1] hover:bg-white/[0.18] disabled:opacity-50 text-white border border-white/20 rounded-lg transition-all cursor-pointer font-semibold shadow-md"
               >
-                {editingAlbumId
-                  ? lang === 'ru' ? 'Сохранить изменения' : 'Save Changes'
-                  : lang === 'ru' ? 'Создать релиз' : 'Create Release'}
+                {savingAlbum
+                  ? lang === 'ru' ? 'Сохранение...' : 'Saving...'
+                  : editingAlbumId
+                    ? lang === 'ru' ? 'Сохранить изменения' : 'Save Changes'
+                    : lang === 'ru' ? 'Создать релиз' : 'Create Release'}
               </button>
             </form>
           </div>
@@ -1523,7 +1641,7 @@ export const AdminView: React.FC = () => {
                         <Volume2 className="w-3 h-3 text-green-400" />
                         <span>{lang === 'ru' ? 'Предпрослушивание трека:' : 'Audio Preview:'}</span>
                       </div>
-                      <audio controls src={trackAudioUrl} className="w-full h-8 rounded" />
+                      <audio controls preload="metadata" src={trackAudioUrl} className="w-full h-8 rounded" />
                     </div>
                   )}
                 </div>
@@ -1543,11 +1661,14 @@ export const AdminView: React.FC = () => {
 
                 <button
                   type="submit"
-                  className="py-2.5 px-6 font-mono text-xs uppercase tracking-widest bg-white/[0.1] hover:bg-white/[0.2] text-white border border-white/20 rounded-lg transition-colors cursor-pointer font-semibold"
+                  disabled={savingTrack}
+                  className="py-2.5 px-6 font-mono text-xs uppercase tracking-widest bg-white/[0.1] hover:bg-white/[0.2] disabled:opacity-50 text-white border border-white/20 rounded-lg transition-colors cursor-pointer font-semibold"
                 >
-                  {editingTrackId
-                    ? lang === 'ru' ? 'Сохранить трек' : 'Update Track'
-                    : lang === 'ru' ? 'Добавить трек' : 'Inscribe Track'}
+                  {savingTrack
+                    ? lang === 'ru' ? 'Сохранение...' : 'Saving...'
+                    : editingTrackId
+                      ? lang === 'ru' ? 'Сохранить трек' : 'Update Track'
+                      : lang === 'ru' ? 'Добавить трек' : 'Inscribe Track'}
                 </button>
               </form>
             </div>
@@ -1774,7 +1895,7 @@ export const AdminView: React.FC = () => {
                       <Volume2 className="w-3 h-3 text-green-400" />
                       <span>{lang === 'ru' ? 'Предпрослушивание сингла:' : 'Audio Preview:'}</span>
                     </div>
-                    <audio controls src={singleAudioUrl} className="w-full h-8 rounded" />
+                    <audio controls preload="metadata" src={singleAudioUrl} className="w-full h-8 rounded" />
                   </div>
                 )}
               </div>
@@ -1858,11 +1979,14 @@ export const AdminView: React.FC = () => {
 
               <button
                 type="submit"
-                className="w-full py-3 font-mono text-xs uppercase tracking-widest bg-white/[0.1] hover:bg-white/[0.2] text-white border border-white/20 rounded-lg transition-all cursor-pointer font-semibold shadow-md"
+                disabled={savingSingle}
+                className="w-full py-3 font-mono text-xs uppercase tracking-widest bg-white/[0.1] hover:bg-white/[0.2] disabled:opacity-50 text-white border border-white/20 rounded-lg transition-all cursor-pointer font-semibold shadow-md"
               >
-                {editingSingleId
-                  ? lang === 'ru' ? 'Сохранить сингл' : 'Save Single'
-                  : lang === 'ru' ? 'Создать сингл' : 'Create Single'}
+                {savingSingle
+                  ? lang === 'ru' ? 'Сохранение...' : 'Saving...'
+                  : editingSingleId
+                    ? lang === 'ru' ? 'Сохранить сингл' : 'Save Single'
+                    : lang === 'ru' ? 'Создать сингл' : 'Create Single'}
               </button>
             </form>
           </div>
@@ -2265,32 +2389,75 @@ export const AdminView: React.FC = () => {
           initial={{ opacity: 0, y: 10 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.2 }}
-          className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5"
+          className="space-y-6"
         >
-          <div className="bg-[#100f13] border border-white/[0.08] p-5 rounded-xl space-y-1">
-            <span className="font-mono text-[10px] uppercase text-ash tracking-wider">
-              {lang === 'ru' ? 'Всего альбомов и EP' : 'Albums & EPs'}
-            </span>
-            <div className="font-title text-3xl text-ivory">{albumsList.length}</div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5">
+            <div className="bg-[#100f13] border border-white/[0.08] p-5 rounded-xl space-y-1">
+              <span className="font-mono text-[10px] uppercase text-ash tracking-wider">
+                {lang === 'ru' ? 'Всего альбомов и EP' : 'Albums & EPs'}
+              </span>
+              <div className="font-title text-3xl text-ivory">{albumsList.length}</div>
+            </div>
+            <div className="bg-[#100f13] border border-white/[0.08] p-5 rounded-xl space-y-1">
+              <span className="font-mono text-[10px] uppercase text-ash tracking-wider">
+                {lang === 'ru' ? 'Официальных синглов' : 'Official Singles'}
+              </span>
+              <div className="font-title text-3xl text-ivory">{singlesList.length}</div>
+            </div>
+            <div className="bg-[#100f13] border border-white/[0.08] p-5 rounded-xl space-y-1">
+              <span className="font-mono text-[10px] uppercase text-ash tracking-wider">
+                {lang === 'ru' ? 'Загруженных файлов' : 'Media Storage Files'}
+              </span>
+              <div className="font-title text-3xl text-ivory">{mediaFilesList.length}</div>
+            </div>
+            <div className="bg-[#100f13] border border-white/[0.08] p-5 rounded-xl space-y-1">
+              <span className="font-mono text-[10px] uppercase text-ash tracking-wider">
+                {lang === 'ru' ? 'Зарегистрировано слушателей' : 'Registered Members'}
+              </span>
+              <div className="font-title text-3xl text-ivory">{usersList.length}</div>
+            </div>
           </div>
-          <div className="bg-[#100f13] border border-white/[0.08] p-5 rounded-xl space-y-1">
-            <span className="font-mono text-[10px] uppercase text-ash tracking-wider">
-              {lang === 'ru' ? 'Официальных синглов' : 'Official Singles'}
-            </span>
-            <div className="font-title text-3xl text-ivory">{singlesList.length}</div>
-          </div>
-          <div className="bg-[#100f13] border border-white/[0.08] p-5 rounded-xl space-y-1">
-            <span className="font-mono text-[10px] uppercase text-ash tracking-wider">
-              {lang === 'ru' ? 'Загруженных файлов' : 'Media Storage Files'}
-            </span>
-            <div className="font-title text-3xl text-ivory">{mediaFilesList.length}</div>
-          </div>
-          <div className="bg-[#100f13] border border-white/[0.08] p-5 rounded-xl space-y-1">
-            <span className="font-mono text-[10px] uppercase text-ash tracking-wider">
-              {lang === 'ru' ? 'Зарегистрировано слушателей' : 'Registered Members'}
-            </span>
-            <div className="font-title text-3xl text-ivory">{usersList.length}</div>
-          </div>
+
+          {healthStatus && (
+            <div className="bg-[#100f13] border border-white/[0.08] p-5 rounded-xl space-y-3 font-mono text-xs">
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/[0.06] pb-2.5">
+                <span className="uppercase tracking-wider text-bone">
+                  {lang === 'ru' ? 'Хранилище и синхронизация Supabase' : 'Storage & Supabase Cloud Sync'}
+                </span>
+                <span
+                  className={`px-2 py-0.5 rounded text-[10px] uppercase border ${
+                    healthStatus.cloud_persistence_enabled
+                      ? 'bg-green-950/60 border-green-700 text-green-300'
+                      : 'bg-yellow-950/40 border-yellow-700/60 text-yellow-300'
+                  }`}
+                >
+                  {healthStatus.cloud_persistence_enabled
+                    ? (lang === 'ru' ? 'Supabase подключён' : 'Supabase Connected')
+                    : (lang === 'ru' ? 'Локальный режим SQLite' : 'Local SQLite Mode')}
+                </span>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-[11px] text-ash">
+                <div>
+                  <span className="text-ash/60 block">{lang === 'ru' ? 'Режим:' : 'Mode:'}</span>
+                  <span className="text-ivory">{healthStatus.storage_mode}</span>
+                </div>
+                <div>
+                  <span className="text-ash/60 block">{lang === 'ru' ? 'Прямая загрузка MP3 в облако:' : 'Direct Cloud MP3 Upload:'}</span>
+                  <span className="text-ivory">
+                    {healthStatus.direct_media_upload_enabled
+                      ? (lang === 'ru' ? 'Активна (до 100 МБ)' : 'Active (up to 100 MB)')
+                      : (lang === 'ru' ? 'Ожидает ключи Supabase' : 'Requires Supabase env keys')}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-ash/60 block">{lang === 'ru' ? 'Последний облачный бэкап:' : 'Last Cloud Backup:'}</span>
+                  <span className="text-ivory">
+                    {healthStatus.last_backup_at ? formatAdminDate(healthStatus.last_backup_at) : '—'}
+                  </span>
+                </div>
+              </div>
+            </div>
+          )}
         </motion.div>
       )}
 
@@ -2465,10 +2632,16 @@ export const AdminView: React.FC = () => {
                   placeholder={lang === 'ru' ? 'Пояснение (опционально)' : 'Explanation (optional)'}
                   className="w-full px-3 py-2 bg-[#16151a] border border-white/[0.1] rounded-lg text-white focus:outline-none"
                 />
-                <button type="submit" className="w-full py-2.5 font-mono text-xs uppercase tracking-widest bg-white/[0.1] hover:bg-white/[0.2] text-white border border-white/20 rounded-lg cursor-pointer">
-                  {editingQuizId
-                    ? t('saveBtn')
-                    : (lang === 'ru' ? 'Добавить вопрос' : 'Add Question')}
+                <button
+                  type="submit"
+                  disabled={savingQuiz}
+                  className="w-full py-2.5 font-mono text-xs uppercase tracking-widest bg-white/[0.1] hover:bg-white/[0.2] disabled:opacity-50 text-white border border-white/20 rounded-lg cursor-pointer"
+                >
+                  {savingQuiz
+                    ? (lang === 'ru' ? 'Сохранение...' : 'Saving...')
+                    : editingQuizId
+                      ? t('saveBtn')
+                      : (lang === 'ru' ? 'Добавить вопрос' : 'Add Question')}
                 </button>
               </form>
             </div>

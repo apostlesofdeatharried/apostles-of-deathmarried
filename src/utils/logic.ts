@@ -263,3 +263,113 @@ export function pickDailyQuizQuestions<T extends { id: string }>(
   }
   return copy.slice(0, limit);
 }
+
+/**
+ * Resolves the HTTP port for server.ts:
+ * 1. Explicit CLI flag (--port 3000, --port=3000, -p 3000) takes highest priority.
+ * 2. process.env.PORT is used unless it collides with process.env.NGINX_PORT (container proxy).
+ * 3. Falls back to process.env.DEFAULT_APP_PORT or 3000.
+ */
+export function resolveServerPort(
+  argv: string[],
+  env: Record<string, string | undefined>
+): number {
+  const parseValidPort = (raw: string | undefined): number | null => {
+    if (!raw) return null;
+    const trimmed = raw.trim();
+    if (!/^\d+$/.test(trimmed)) return null;
+    const num = Number(trimmed);
+    return Number.isInteger(num) && num >= 1 && num <= 65535 ? num : null;
+  };
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg.startsWith('--port=')) {
+      const parsed = parseValidPort(arg.slice('--port='.length));
+      if (parsed !== null) return parsed;
+    } else if (arg === '--port' || arg === '-p') {
+      const parsed = parseValidPort(argv[i + 1]);
+      if (parsed !== null) return parsed;
+    }
+  }
+
+  const defaultPort = parseValidPort(env.DEFAULT_APP_PORT) ?? 3000;
+  const envPort = parseValidPort(env.PORT);
+  const nginxPort = parseValidPort(env.NGINX_PORT);
+
+  if (envPort !== null) {
+    if (nginxPort !== null && envPort === nginxPort) {
+      return defaultPort;
+    }
+    return envPort;
+  }
+
+  return defaultPort;
+}
+
+const ALLOWED_STREAMING_KEYS = new Set([
+  'spotify',
+  'apple_music',
+  'yandex_music',
+  'vk_music',
+  'soundcloud',
+  'youtube_music',
+]);
+
+export function sanitizeStreamingLinks(input: unknown): Record<string, string> {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    return {};
+  }
+  const clean: Record<string, string> = {};
+  for (const [key, rawVal] of Object.entries(input as Record<string, unknown>)) {
+    if (!ALLOWED_STREAMING_KEYS.has(key) || typeof rawVal !== 'string') continue;
+    const trimmed = rawVal.trim();
+    if (!trimmed) continue;
+    try {
+      const parsed = new URL(trimmed);
+      if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
+        clean[key] = trimmed;
+      }
+    } catch {
+      // Ignore invalid or unsafe URLs (e.g. javascript:)
+    }
+  }
+  return clean;
+}
+
+const AUDIO_EXTENSIONS = new Set(['.mp3', '.wav', '.wave', '.ogg', '.m4a', '.flac', '.aac', '.aiff', '.wma']);
+const IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp']);
+const VIDEO_EXTENSIONS = new Set(['.mp4', '.webm', '.mov']);
+
+export function classifyMediaUpload(
+  filename: string,
+  mimeType: string = ''
+): { allowed: boolean; kind: 'audio' | 'image' | 'video' | null; normalizedExt: string } {
+  if (!filename || typeof filename !== 'string') {
+    return { allowed: false, kind: null, normalizedExt: '' };
+  }
+  const dotIdx = filename.lastIndexOf('.');
+  const rawExt = dotIdx >= 0 ? filename.slice(dotIdx).toLowerCase() : '';
+  const mime = (mimeType || '').toLowerCase().trim();
+
+  if (AUDIO_EXTENSIONS.has(rawExt)) {
+    return { allowed: true, kind: 'audio', normalizedExt: rawExt === '.wave' ? '.wav' : rawExt };
+  }
+  if (IMAGE_EXTENSIONS.has(rawExt)) {
+    return { allowed: true, kind: 'image', normalizedExt: rawExt };
+  }
+  if (VIDEO_EXTENSIONS.has(rawExt)) {
+    return { allowed: true, kind: 'video', normalizedExt: rawExt };
+  }
+
+  // Fallback by MIME type only when extension is missing/unknown and not executable
+  if (!rawExt) {
+    if (mime.startsWith('audio/')) return { allowed: true, kind: 'audio', normalizedExt: '.mp3' };
+    if (mime.startsWith('image/') && !mime.includes('svg')) return { allowed: true, kind: 'image', normalizedExt: '.jpg' };
+    if (mime.startsWith('video/')) return { allowed: true, kind: 'video', normalizedExt: '.mp4' };
+  }
+
+  return { allowed: false, kind: null, normalizedExt: rawExt };
+}
+
+

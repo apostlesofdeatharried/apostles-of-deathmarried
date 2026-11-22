@@ -5,6 +5,8 @@ interface PlayerContextType {
   currentTrack: Track | null;
   isPlaying: boolean;
   isVisible: boolean;
+  isLoadingAudio: boolean;
+  playbackError: string | null;
   progress: number;
   duration: number;
   volume: number;
@@ -24,6 +26,7 @@ interface PlayerContextType {
   toggleRepeat: () => void;
   setQueueOpen: (open: boolean) => void;
   removeFromQueue: (index: number) => void;
+  clearPlaybackError: () => void;
   hidePlayer: () => void;
 }
 
@@ -31,6 +34,8 @@ const PlayerContext = createContext<PlayerContextType>({
   currentTrack: null,
   isPlaying: false,
   isVisible: false,
+  isLoadingAudio: false,
+  playbackError: null,
   progress: 0,
   duration: 0,
   volume: 0.8,
@@ -50,6 +55,7 @@ const PlayerContext = createContext<PlayerContextType>({
   toggleRepeat: () => {},
   setQueueOpen: () => {},
   removeFromQueue: () => {},
+  clearPlaybackError: () => {},
   hidePlayer: () => {},
 });
 
@@ -57,6 +63,8 @@ export const PlayerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   const [currentTrack, setCurrentTrack] = useState<Track | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isVisible, setIsVisible] = useState(false);
+  const [isLoadingAudio, setIsLoadingAudio] = useState(false);
+  const [playbackError, setPlaybackError] = useState<string | null>(null);
   const [progress, setProgress] = useState(0);
   const [duration, setDuration] = useState(0);
   const [volume, setVolumeState] = useState(0.8);
@@ -76,11 +84,23 @@ export const PlayerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     audioRef.current = audio;
 
     const onTimeUpdate = () => {
-      setProgress(audio.currentTime);
+      const nextTime = Number.isFinite(audio.currentTime) ? audio.currentTime : 0;
+      setProgress(nextTime);
     };
 
     const onLoadedMetadata = () => {
-      setDuration(audio.duration || 0);
+      const nextDuration = Number.isFinite(audio.duration) ? audio.duration : 0;
+      setDuration(nextDuration);
+      setIsLoadingAudio(false);
+    };
+
+    const onCanPlay = () => {
+      setIsLoadingAudio(false);
+      setPlaybackError(null);
+    };
+
+    const onWaiting = () => {
+      setIsLoadingAudio(true);
     };
 
     const onEnded = () => {
@@ -89,16 +109,22 @@ export const PlayerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
     const onError = () => {
       setIsPlaying(false);
+      setIsLoadingAudio(false);
+      setPlaybackError('Audio file unavailable or failed to load');
     };
 
     audio.addEventListener('timeupdate', onTimeUpdate);
     audio.addEventListener('loadedmetadata', onLoadedMetadata);
+    audio.addEventListener('canplay', onCanPlay);
+    audio.addEventListener('waiting', onWaiting);
     audio.addEventListener('ended', onEnded);
     audio.addEventListener('error', onError);
 
     return () => {
       audio.removeEventListener('timeupdate', onTimeUpdate);
       audio.removeEventListener('loadedmetadata', onLoadedMetadata);
+      audio.removeEventListener('canplay', onCanPlay);
+      audio.removeEventListener('waiting', onWaiting);
       audio.removeEventListener('ended', onEnded);
       audio.removeEventListener('error', onError);
       audio.pause();
@@ -111,6 +137,9 @@ export const PlayerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
     setCurrentTrack(track);
     setIsVisible(true);
+    setPlaybackError(null);
+    setProgress(0);
+    setDuration(track.duration_seconds || 0);
 
     if (newQueue && newQueue.length > 0) {
       setQueue(newQueue);
@@ -123,14 +152,34 @@ export const PlayerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       });
     }
 
+    if (!track.audio_url || !track.audio_url.trim()) {
+      audio.pause();
+      setIsPlaying(false);
+      setIsLoadingAudio(false);
+      setPlaybackError('Audio source is not attached to this track');
+      return;
+    }
+
+    setIsLoadingAudio(true);
     audio.src = track.audio_url;
     audio.volume = isMuted ? 0 : volume;
     audio
       .play()
-      .then(() => setIsPlaying(true))
-      .catch((e) => {
-        console.warn('Playback error or blocked by policy', e);
+      .then(() => {
+        setIsPlaying(true);
+        setIsLoadingAudio(false);
+      })
+      .catch((e: any) => {
         setIsPlaying(false);
+        setIsLoadingAudio(false);
+        if (e?.name !== 'AbortError') {
+          console.warn('Playback error or blocked by policy', e);
+          setPlaybackError(
+            e?.name === 'NotAllowedError'
+              ? 'Press Play to start audio playback'
+              : 'Audio file unavailable or failed to load'
+          );
+        }
       });
   }, [isMuted, volume]);
 
@@ -140,10 +189,17 @@ export const PlayerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       audioRef.current.pause();
       setIsPlaying(false);
     } else {
+      setPlaybackError(null);
       audioRef.current
         .play()
-        .then(() => setIsPlaying(true))
-        .catch(() => setIsPlaying(false));
+        .then(() => {
+          setIsPlaying(true);
+          setIsLoadingAudio(false);
+        })
+        .catch(() => {
+          setIsPlaying(false);
+          setPlaybackError('Audio file unavailable or failed to load');
+        });
     }
   };
 
@@ -200,13 +256,15 @@ export const PlayerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   }, [queue, currentTrack, playTrack]);
 
   const seek = (seconds: number) => {
-    if (!audioRef.current) return;
-    audioRef.current.currentTime = seconds;
-    setProgress(seconds);
+    if (!audioRef.current || !Number.isFinite(seconds)) return;
+    const maxDur = Number.isFinite(audioRef.current.duration) ? audioRef.current.duration : duration;
+    const clamped = Math.max(0, Math.min(seconds, maxDur || seconds));
+    audioRef.current.currentTime = clamped;
+    setProgress(clamped);
   };
 
   const setVolume = (val: number) => {
-    const clamped = Math.max(0, Math.min(1, val));
+    const clamped = Math.max(0, Math.min(1, Number.isFinite(val) ? val : 0.8));
     setVolumeState(clamped);
     if (audioRef.current) {
       audioRef.current.volume = isMuted ? 0 : clamped;
@@ -241,11 +299,15 @@ export const PlayerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     setQueue((prev) => prev.filter((_, i) => i !== index));
   };
 
+  const clearPlaybackError = () => setPlaybackError(null);
+
   const hidePlayer = () => {
     if (audioRef.current) {
       audioRef.current.pause();
     }
     setIsPlaying(false);
+    setIsLoadingAudio(false);
+    setPlaybackError(null);
     setIsVisible(false);
   };
 
@@ -255,6 +317,8 @@ export const PlayerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         currentTrack,
         isPlaying,
         isVisible,
+        isLoadingAudio,
+        playbackError,
         progress,
         duration,
         volume,
@@ -274,6 +338,7 @@ export const PlayerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         toggleRepeat,
         setQueueOpen,
         removeFromQueue,
+        clearPlaybackError,
         hidePlayer,
       }}
     >

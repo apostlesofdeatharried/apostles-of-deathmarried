@@ -38,18 +38,38 @@ function resolveWritableDbPath(): string {
 }
 
 const activeDbPath = resolveWritableDbPath();
-export let db = new Database(activeDbPath);
 
-// Enable WAL mode & foreign keys
-try {
-  db.pragma('journal_mode = WAL');
-} catch {
-  // Fallback if WAL cannot be enabled on underlying mount
+function openConfiguredDatabase(dbPath: string): Database.Database {
+  const instance = new Database(dbPath);
+  try {
+    instance.pragma('busy_timeout = 5000');
+  } catch {}
+  try {
+    // Checkpoint any legacy WAL file before switching to single-file DELETE journal mode
+    instance.pragma('wal_checkpoint(TRUNCATE)');
+  } catch {}
+  try {
+    // Single-file rollback journal prevents -wal/-shm sidecar desyncs during cloud/container snapshots
+    instance.pragma('journal_mode = DELETE');
+    instance.pragma('synchronous = NORMAL');
+  } catch {}
+  instance.pragma('foreign_keys = ON');
+  return instance;
 }
-db.pragma('foreign_keys = ON');
+
+export let db = openConfiguredDatabase(activeDbPath);
 
 export function getDbPath(): string {
   return activeDbPath;
+}
+
+export function closeDatabase(): void {
+  try {
+    db.pragma('wal_checkpoint(TRUNCATE)');
+  } catch {}
+  try {
+    db.close();
+  } catch {}
 }
 
 export function serializeDatabase(): Buffer {
@@ -66,11 +86,7 @@ export function replaceDatabaseWithBuffer(buffer: Buffer): void {
     if (fs.existsSync(`${activeDbPath}-shm`)) fs.unlinkSync(`${activeDbPath}-shm`);
   } catch {}
   fs.writeFileSync(activeDbPath, buffer);
-  db = new Database(activeDbPath);
-  try {
-    db.pragma('journal_mode = WAL');
-  } catch {}
-  db.pragma('foreign_keys = ON');
+  db = openConfiguredDatabase(activeDbPath);
   initDatabase();
 }
 

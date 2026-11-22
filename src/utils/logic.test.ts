@@ -12,6 +12,9 @@ import {
   isSafeMediaUrl,
   computeDailyStreak,
   pickDailyQuizQuestions,
+  resolveServerPort,
+  sanitizeStreamingLinks,
+  classifyMediaUpload,
 } from './logic';
 
 test('calculateLevelFromXp correctly maps XP thresholds to levels and percentages', () => {
@@ -139,4 +142,79 @@ test('pickDailyQuizQuestions deterministically selects up to limit questions', (
   assert.deepEqual(day1A, day1B);
   assert.notDeepEqual(day1A.map((q) => q.id), day2.map((q) => q.id));
 });
+
+test('resolveServerPort respects CLI flags, avoids NGINX_PORT collision, and preserves PaaS PORT', () => {
+  // AI Studio container env: PORT=8080, NGINX_PORT=8080, DEFAULT_APP_PORT=3000
+  assert.equal(
+    resolveServerPort(['node', 'server.ts', '--port', '3000', '--host', '0.0.0.0'], {
+      PORT: '8080',
+      NGINX_PORT: '8080',
+      DEFAULT_APP_PORT: '3000',
+    }),
+    3000
+  );
+  assert.equal(
+    resolveServerPort(['node', 'server.ts'], {
+      PORT: '8080',
+      NGINX_PORT: '8080',
+      DEFAULT_APP_PORT: '3000',
+    }),
+    3000
+  );
+  // Explicit --port= overrides env
+  assert.equal(
+    resolveServerPort(['node', 'server.ts', '--port=4123'], { PORT: '5000' }),
+    4123
+  );
+  // Standard PaaS (Render/Railway/Cloud Run) without NGINX_PORT collision
+  assert.equal(
+    resolveServerPort(['node', 'server.ts'], { PORT: '5050' }),
+    5050
+  );
+  // Empty fallback
+  assert.equal(resolveServerPort(['node', 'server.ts'], {}), 3000);
+});
+
+test('sanitizeStreamingLinks keeps only safe http/https URLs for allowed platforms', () => {
+  const result = sanitizeStreamingLinks({
+    spotify: 'https://open.spotify.com/album/123',
+    apple_music: 'javascript:alert(1)',
+    yandex_music: 'https://music.yandex.ru/album/456',
+    unknown_field: 'https://evil.example/x',
+    vk_music: '',
+  });
+  assert.deepEqual(result, {
+    spotify: 'https://open.spotify.com/album/123',
+    yandex_music: 'https://music.yandex.ru/album/456',
+  });
+});
+
+test('classifyMediaUpload accepts valid audio/image/video and rejects SVG and executables', () => {
+  assert.deepEqual(classifyMediaUpload('track.mp3', 'audio/mpeg'), {
+    allowed: true,
+    kind: 'audio',
+    normalizedExt: '.mp3',
+  });
+  assert.deepEqual(classifyMediaUpload('master.WAVE', 'audio/wav'), {
+    allowed: true,
+    kind: 'audio',
+    normalizedExt: '.wav',
+  });
+  assert.deepEqual(classifyMediaUpload('cover.webp', 'image/webp'), {
+    allowed: true,
+    kind: 'image',
+    normalizedExt: '.webp',
+  });
+  assert.deepEqual(classifyMediaUpload('edit.mp4', 'video/mp4'), {
+    allowed: true,
+    kind: 'video',
+    normalizedExt: '.mp4',
+  });
+  // Security: reject SVG (active script risk), HTML, JS, PHP
+  assert.equal(classifyMediaUpload('payload.svg', 'image/svg+xml').allowed, false);
+  assert.equal(classifyMediaUpload('shell.html', 'text/html').allowed, false);
+  assert.equal(classifyMediaUpload('script.js', 'application/javascript').allowed, false);
+});
+
+
 
