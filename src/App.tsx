@@ -5,6 +5,7 @@
 
 import React, { useState, useEffect, useCallback } from 'react';
 import { MotionConfig } from 'motion/react';
+import { Analytics } from '@vercel/analytics/react';
 import { I18nProvider, useI18n } from './context/I18nContext.js';
 import { AuthProvider, useAuth } from './context/AuthContext.js';
 import { PlayerProvider } from './context/PlayerContext.js';
@@ -172,6 +173,7 @@ export default function App() {
         <AuthProvider>
           <PlayerProvider>
             <MainApp />
+            <Analytics />
           </PlayerProvider>
         </AuthProvider>
       </I18nProvider>
