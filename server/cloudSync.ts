@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import { serializeDatabase, replaceDatabaseWithBuffer, getDbPath } from './db.js';
+import { transliterateToAsciiSlug } from '../src/utils/logic.js';
 
 const DEFAULT_BUCKET_NAME = 'apostles-archive-persistence';
 const DB_OBJECT_PATH = 'db/apostles.db';
@@ -8,8 +9,7 @@ const MEDIA_OBJECT_PREFIX = 'media';
 export interface SyncPullResult {
   updated: boolean;
   notModified?: boolean;
-  initialized?: boolean;
-  etag?: string | null;
+  notFound?: boolean;
   error?: string;
 }
 
@@ -17,7 +17,6 @@ export interface SyncPushResult {
   ok: boolean;
   status?: number;
   bytes?: number;
-  etag?: string | null;
   error?: string;
 }
 
@@ -37,8 +36,6 @@ let initialRestoreCompleted = false;
 let bucketEnsured = false;
 let lastBackupAt = 0;
 let lastBackupError: string | null = null;
-let lastKnownEtag: string | null = null;
-let lastKnownLastModified: string | null = null;
 let lastSyncedSha256: string | null = null;
 let lastSyncCheckedAt = 0;
 
@@ -94,7 +91,15 @@ function encodeObjectPath(objectPath: string): string {
 }
 
 function buildMediaObjectPath(filename: string): string {
-  const safeName = filename.replace(/[/\\]+/g, '').replace(/\.\./g, '');
+  const cleaned = filename.replace(/[/\\]+/g, '').replace(/\.\./g, '');
+  const dotIdx = cleaned.lastIndexOf('.');
+  if (dotIdx > 0) {
+    const base = cleaned.slice(0, dotIdx);
+    const ext = cleaned.slice(dotIdx).toLowerCase().replace(/[^a-z0-9.]/g, '');
+    const safeBase = /^[a-zA-Z0-9_-]+$/.test(base) ? base : transliterateToAsciiSlug(base, 64);
+    return `${MEDIA_OBJECT_PREFIX}/${safeBase}${ext || '.bin'}`;
+  }
+  const safeName = /^[a-zA-Z0-9_-]+$/.test(cleaned) ? cleaned : transliterateToAsciiSlug(cleaned, 64);
   return `${MEDIA_OBJECT_PREFIX}/${safeName}`;
 }
 
@@ -145,35 +150,6 @@ export async function ensureBucketExists(): Promise<void> {
   }
 }
 
-async function refreshRemoteEtagQuietly(): Promise<string | null> {
-  if (!isSupabaseConfigured()) return null;
-  const baseUrl = getSupabaseBaseUrl();
-  const bucketName = getBucketName();
-  try {
-    const headRes = await hooks.fetchImpl(
-      `${baseUrl}/storage/v1/object/${encodeURIComponent(bucketName)}/${encodeObjectPath(DB_OBJECT_PATH)}`,
-      {
-        method: 'HEAD',
-        headers: {
-          ...getSupabaseHeaders(),
-          'Cache-Control': 'no-cache, no-store, max-age=0',
-          Pragma: 'no-cache',
-        },
-        cache: 'no-store',
-        signal: AbortSignal.timeout(3000),
-      }
-    );
-    if (headRes.ok) {
-      const etag = headRes.headers.get('etag');
-      const lastMod = headRes.headers.get('last-modified');
-      if (etag) lastKnownEtag = etag;
-      if (lastMod) lastKnownLastModified = lastMod;
-      return etag;
-    }
-  } catch {}
-  return lastKnownEtag;
-}
-
 async function uploadCurrentDatabaseInternal(): Promise<SyncPushResult> {
   if (!isSupabaseConfigured()) {
     return { ok: false, error: 'Supabase Storage is not configured' };
@@ -207,6 +183,7 @@ async function uploadCurrentDatabaseInternal(): Promise<SyncPushResult> {
           'cache-control': '0',
         },
         body: new Uint8Array(buffer),
+        cache: 'no-store',
         signal: AbortSignal.timeout(15000),
       });
 
@@ -217,19 +194,10 @@ async function uploadCurrentDatabaseInternal(): Promise<SyncPushResult> {
         lastSyncCheckedAt = Date.now();
         initialRestoreCompleted = true;
 
-        const responseEtag = res.headers.get('etag');
-        if (responseEtag) {
-          lastKnownEtag = responseEtag;
-        } else {
-          lastKnownEtag = null;
-          await refreshRemoteEtagQuietly();
-        }
-
         return {
           ok: true,
           status: res.status,
           bytes: buffer.length,
-          etag: lastKnownEtag,
         };
       }
 
@@ -259,6 +227,13 @@ async function uploadCurrentDatabaseInternal(): Promise<SyncPushResult> {
   return { ok: false, error: lastBackupError || 'Unknown backup error' };
 }
 
+/**
+ * Strictly READ-ONLY pull of `db/apostles.db` from Supabase Storage.
+ * - NEVER uploads/overwrites `db/apostles.db` (safe for GET requests on cold/warm Vercel instances).
+ * - Always appends `?t=${Date.now()}` + `Cache-Control: no-cache, no-store` + `Pragma: no-cache` + `cache: 'no-store'`
+ *   and never sends `If-None-Match`, completely bypassing Supabase/CDN/proxy caching.
+ * - Uses SHA-256 comparison on the freshly downloaded bytes so unchanged snapshots skip redundant DB reopens.
+ */
 async function pullDatabaseFromSupabaseInternal(options: {
   force?: boolean;
   minIntervalMs?: number;
@@ -275,41 +250,29 @@ async function pullDatabaseFromSupabaseInternal(options: {
     minInterval > 0 &&
     Date.now() - lastSyncCheckedAt < minInterval
   ) {
-    return { updated: false, notModified: true, etag: lastKnownEtag };
+    return { updated: false, notModified: true };
   }
 
   const baseUrl = getSupabaseBaseUrl();
   const bucketName = getBucketName();
-  const objectUrl = `${baseUrl}/storage/v1/object/${encodeURIComponent(bucketName)}/${encodeObjectPath(DB_OBJECT_PATH)}`;
+  const cacheBuster = Date.now();
+  const objectUrl = `${baseUrl}/storage/v1/object/${encodeURIComponent(bucketName)}/${encodeObjectPath(DB_OBJECT_PATH)}?t=${cacheBuster}`;
 
   try {
     await ensureBucketExists();
 
-    const headers: Record<string, string> = {
-      ...getSupabaseHeaders(),
-      'Cache-Control': 'no-cache, no-store, max-age=0',
-      Pragma: 'no-cache',
-    };
-    if (initialRestoreCompleted && lastKnownEtag) {
-      headers['If-None-Match'] = lastKnownEtag;
-    }
-
     const res = await hooks.fetchImpl(objectUrl, {
       method: 'GET',
-      headers,
+      headers: {
+        ...getSupabaseHeaders(),
+        'Cache-Control': 'no-cache, no-store',
+        Pragma: 'no-cache',
+      },
       cache: 'no-store',
       signal: AbortSignal.timeout(10000),
     });
 
-    if (res.status === 304) {
-      lastSyncCheckedAt = Date.now();
-      initialRestoreCompleted = true;
-      return { updated: false, notModified: true, etag: lastKnownEtag };
-    }
-
     if (res.ok) {
-      const remoteEtag = res.headers.get('etag');
-      const remoteLastMod = res.headers.get('last-modified');
       const arrayBuffer = await res.arrayBuffer();
       const buffer = Buffer.from(arrayBuffer);
 
@@ -330,8 +293,6 @@ async function pullDatabaseFromSupabaseInternal(options: {
         console.log(`[CloudSync] Synced fresh SQLite snapshot from Supabase (${buffer.length} bytes)`);
       }
 
-      if (remoteEtag) lastKnownEtag = remoteEtag;
-      if (remoteLastMod) lastKnownLastModified = remoteLastMod;
       lastSyncCheckedAt = Date.now();
       initialRestoreCompleted = true;
       lastBackupError = null;
@@ -339,27 +300,25 @@ async function pullDatabaseFromSupabaseInternal(options: {
       return {
         updated: shouldReplace,
         notModified: !shouldReplace,
-        etag: lastKnownEtag,
       };
     }
 
-    if (res.status === 404 || res.status === 400) {
-      if (!initialRestoreCompleted) {
-        // First run: upload our local seeded database to initialize cloud storage
-        const initPush = await uploadCurrentDatabaseInternal();
-        initialRestoreCompleted = true;
-        return {
-          updated: false,
-          initialized: initPush.ok,
-          etag: initPush.etag,
-          error: initPush.ok ? undefined : initPush.error,
-        };
-      }
+    if (res.status === 404) {
+      // Remote DB does not exist yet — do NOT upload during a read/pull!
+      // It will be created automatically on the first real mutation (POST/PUT/PATCH/DELETE).
       lastSyncCheckedAt = Date.now();
-      return { updated: false, notModified: true };
+      initialRestoreCompleted = true;
+      return { updated: false, notFound: true };
     }
 
     const errText = await res.text().catch(() => '');
+    // Supabase Storage sometimes wraps object-not-found as HTTP 400 with "not_found" / "Object not found"
+    if (res.status === 400 && /not[_\s-]?found|404/i.test(errText)) {
+      lastSyncCheckedAt = Date.now();
+      initialRestoreCompleted = true;
+      return { updated: false, notFound: true };
+    }
+
     const errMsg = `Restore HTTP ${res.status}${errText ? `: ${errText.slice(0, 180)}` : ''}`;
     lastBackupError = errMsg;
     console.warn(`[CloudSync] Pull failed: ${errMsg}`);
@@ -373,8 +332,9 @@ async function pullDatabaseFromSupabaseInternal(options: {
 }
 
 /**
- * Checks Supabase Storage for a newer SQLite snapshot (using If-None-Match ETag & SHA-256 comparison)
- * and hot-swaps the local /tmp/apostles.db when another serverless instance wrote newer data.
+ * Downloads the latest SQLite snapshot directly from Supabase Storage (cache-busted with `?t=Date.now()`)
+ * and hot-swaps `/tmp/apostles.db` whenever the SHA-256 hash differs from our local state.
+ * Strictly read-only: NEVER uploads to Supabase.
  */
 export async function syncCloudDatabase(options: {
   force?: boolean;
@@ -388,9 +348,7 @@ export async function syncCloudDatabase(options: {
 }
 
 /**
- * Restores the latest SQLite snapshot from Supabase Storage on cold start.
- * If no remote snapshot exists yet, uploads the current seeded database so the cloud
- * store is initialized immediately with zero data loss.
+ * Restores the latest SQLite snapshot from Supabase Storage on cold start (read-only).
  */
 export async function ensureCloudDatabaseRestored(): Promise<void> {
   if (initialRestoreCompleted || !isSupabaseConfigured()) {
@@ -402,7 +360,7 @@ export async function ensureCloudDatabaseRestored(): Promise<void> {
 
 /**
  * Checkpoints SQLite (DELETE journal mode), serializes the database, and uploads it to
- * Supabase Storage with x-upsert: true. Always awaits completion and returns structured status.
+ * Supabase Storage with `x-upsert: true`. MUST ONLY be called after real DB mutations.
  */
 export async function pushDatabaseBackupNow(): Promise<SyncPushResult> {
   if (!isSupabaseConfigured()) {
@@ -588,8 +546,7 @@ export function getCloudSyncStatus() {
         : 'local-persistent-sqlite',
     last_backup_at: lastBackupAt ? new Date(lastBackupAt).toISOString() : null,
     last_backup_error: lastBackupError,
-    last_known_etag: lastKnownEtag,
-    last_known_last_modified: lastKnownLastModified,
+    last_synced_sha256: lastSyncedSha256 ? lastSyncedSha256.slice(0, 12) : null,
   };
 }
 
@@ -601,8 +558,6 @@ export function _configureCloudSyncForTests(partial?: Partial<CloudSyncHooks>) {
   bucketEnsured = false;
   lastBackupAt = 0;
   lastBackupError = null;
-  lastKnownEtag = null;
-  lastKnownLastModified = null;
   lastSyncedSha256 = null;
   lastSyncCheckedAt = 0;
   syncQueue = Promise.resolve();

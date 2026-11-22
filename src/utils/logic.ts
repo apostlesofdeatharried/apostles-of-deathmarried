@@ -372,4 +372,49 @@ export function classifyMediaUpload(
   return { allowed: false, kind: null, normalizedExt: rawExt };
 }
 
+const CYRILLIC_TO_LATIN: Record<string, string> = {
+  а: 'a', б: 'b', в: 'v', г: 'g', д: 'd', е: 'e', ё: 'yo', ж: 'zh', з: 'z',
+  и: 'i', й: 'y', к: 'k', л: 'l', м: 'm', н: 'n', о: 'o', п: 'p', р: 'r',
+  с: 's', т: 't', у: 'u', ф: 'f', х: 'kh', ц: 'ts', ч: 'ch', ш: 'sh', щ: 'shch',
+  ъ: '', ы: 'y', ь: '', э: 'e', ю: 'yu', я: 'ya',
+  і: 'i', ї: 'yi', є: 'ye', ґ: 'g',
+};
 
+export function transliterateToAsciiSlug(input: string, maxLength: number = 40): string {
+  if (!input || typeof input !== 'string') return 'media';
+  let out = '';
+  for (const ch of input.toLowerCase()) {
+    if (ch in CYRILLIC_TO_LATIN) {
+      out += CYRILLIC_TO_LATIN[ch];
+    } else {
+      out += ch;
+    }
+  }
+  const normalized = out
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9_-]+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^[_-]+|[_-]+$/g, '')
+    .slice(0, maxLength)
+    .replace(/^[_-]+|[_-]+$/g, '');
+
+  return normalized || 'media';
+}
+
+export function buildSafeAsciiFilename(
+  originalName: string,
+  mimeType: string = '',
+  timestamp: number = Date.now(),
+  randomSuffix: string = Math.random().toString(16).slice(2, 10)
+): string {
+  const classified = classifyMediaUpload(originalName, mimeType);
+  const dotIdx = typeof originalName === 'string' ? originalName.lastIndexOf('.') : -1;
+  const baseName = dotIdx > 0 ? originalName.slice(0, dotIdx) : (originalName || 'media');
+  const safeExt = classified.allowed
+    ? classified.normalizedExt.replace(/[^a-z0-9.]/g, '')
+    : '.bin';
+  const safeBase = transliterateToAsciiSlug(baseName, 40);
+  const safeRand = String(randomSuffix).toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 12) || 'rnd';
+  return `${timestamp}_${safeBase}_${safeRand}${safeExt}`;
+}

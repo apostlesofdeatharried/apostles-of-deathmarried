@@ -15,6 +15,8 @@ import {
   resolveServerPort,
   sanitizeStreamingLinks,
   classifyMediaUpload,
+  transliterateToAsciiSlug,
+  buildSafeAsciiFilename,
 } from './logic';
 
 test('calculateLevelFromXp correctly maps XP thresholds to levels and percentages', () => {
@@ -216,5 +218,18 @@ test('classifyMediaUpload accepts valid audio/image/video and rejects SVG and ex
   assert.equal(classifyMediaUpload('script.js', 'application/javascript').allowed, false);
 });
 
+test('transliterateToAsciiSlug and buildSafeAsciiFilename produce strictly ASCII Supabase-safe keys', () => {
+  assert.equal(transliterateToAsciiSlug('с мёртвыми (финал) #1!'), 's_myortvymi_final_1');
+  assert.equal(transliterateToAsciiSlug('Любовью<3'), 'lyubovyu_3');
+  assert.equal(transliterateToAsciiSlug('🖤🔥   ???'), 'media');
 
+  const f1 = buildSafeAsciiFilename('с мёртвыми (master v2).mp3', 'audio/mpeg', 1700000000001, 'a1b2c3d4');
+  const f2 = buildSafeAsciiFilename('с мёртвыми (master v2).mp3', 'audio/mpeg', 1700000000002, 'e5f60718');
+  assert.equal(f1, '1700000000001_s_myortvymi_master_v2_a1b2c3d4.mp3');
+  assert.notEqual(f1, f2);
+  assert.match(f1, /^[0-9]+_[a-z0-9_-]+_[a-z0-9]+\.[a-z0-9]+$/);
 
+  const fWave = buildSafeAsciiFilename('Любовью <3 [24-bit].WAVE', 'audio/wav', 1700000000003, 'deadbeef');
+  assert.equal(fWave, '1700000000003_lyubovyu_3_24-bit_deadbeef.wav');
+  assert.match(fWave, /^[\x20-\x7E]+$/);
+});

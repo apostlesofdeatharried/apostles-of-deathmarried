@@ -36,6 +36,7 @@ import {
   resolveServerPort,
   sanitizeStreamingLinks,
   classifyMediaUpload,
+  buildSafeAsciiFilename,
 } from './src/utils/logic.js';
 
 const app = express();
@@ -71,32 +72,31 @@ app.use('/api', (_req: Request, res: Response, next: NextFunction) => {
 });
 
 const STATELESS_POST_PATHS = new Set(['/api/upload/signed-url']);
+const MUTATING_HTTP_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
 // Cloud database freshness check (before reads/writes) & write-through snapshot sync middleware
+// CRITICAL: DB backup upload to Supabase Storage ONLY runs after successful mutating requests (POST/PUT/PATCH/DELETE).
+// GET requests are strictly read-only and NEVER upload apostles.db.
 app.use(async (req: Request, res: Response, next: NextFunction) => {
   if (req.path.startsWith('/api') || req.path.startsWith('/uploads')) {
     const isMutation =
-      ['POST', 'PUT', 'DELETE', 'PATCH'].includes(req.method) &&
-      !STATELESS_POST_PATHS.has(req.path);
+      MUTATING_HTTP_METHODS.has(req.method) && !STATELESS_POST_PATHS.has(req.path);
 
     if (isSupabaseConfigured()) {
-      try {
-        if (isMutation) {
-          // Always pull the latest SQLite snapshot before mutating so a warm Vercel Lambda
-          // never overwrites newer cloud data with a stale /tmp/apostles.db
-          await syncCloudDatabase({ force: true });
-        } else if (req.path.startsWith('/api')) {
-          // On Vercel GET requests, check ETag freshness via If-None-Match so all instances stay in sync
-          await syncCloudDatabase({ force: isVercel, minIntervalMs: isVercel ? 0 : 5000 });
-        } else {
-          await ensureCloudDatabaseRestored();
-        }
-      } catch (err) {
-        console.warn('[CloudSync] Pre-request sync warning:', err instanceof Error ? err.message : err);
-      }
-
       if (isMutation) {
-        // Flush checkpointed SQLite snapshot to Supabase Storage BEFORE sending the HTTP response.
+        // Always download the latest cache-busted apostles.db (?t=Date.now()) directly before mutating
+        // so a warm Vercel Lambda NEVER overwrites newer cloud data with a stale /tmp/apostles.db.
+        const pullResult = await syncCloudDatabase({ force: true });
+        if (pullResult.error && !pullResult.notFound) {
+          console.error('[CloudSync] Aborting mutation because fresh DB pull failed:', pullResult.error);
+          res.status(503).json({
+            error: `Не удалось получить актуальную базу данных из Supabase Storage перед сохранением: ${pullResult.error}`,
+            cloud_sync_error: pullResult.error,
+          });
+          return;
+        }
+
+        // Flush checkpointed SQLite snapshot to Supabase Storage BEFORE sending the HTTP 2xx response.
         // If cloud upload fails, return HTTP 500 with the exact error instead of a false 200 OK.
         const originalJson = res.json.bind(res);
         let cloudSyncHandled = false;
@@ -105,7 +105,7 @@ app.use(async (req: Request, res: Response, next: NextFunction) => {
             return originalJson(body);
           }
           cloudSyncHandled = true;
-          if (res.statusCode >= 200 && res.statusCode < 400) {
+          if (res.statusCode >= 200 && res.statusCode < 300) {
             pushDatabaseBackupNow()
               .then((syncResult) => {
                 if (!syncResult.ok) {
@@ -131,6 +131,18 @@ app.use(async (req: Request, res: Response, next: NextFunction) => {
           }
           return originalJson(body);
         }) as Response['json'];
+      } else if (req.method === 'GET' && req.path.startsWith('/api')) {
+        // Strictly read-only pull: on Vercel, always fetch fresh cache-busted snapshot (?t=Date.now())
+        // so any warm Lambda returns newly saved changes immediately, while NEVER uploading on GET.
+        try {
+          await syncCloudDatabase({ force: isVercel, minIntervalMs: isVercel ? 0 : 5000 });
+        } catch (err) {
+          console.warn('[CloudSync] Read-only sync warning:', err instanceof Error ? err.message : err);
+        }
+      } else if (req.method === 'GET') {
+        try {
+          await ensureCloudDatabaseRestored();
+        } catch {}
       }
     }
   }
@@ -219,14 +231,12 @@ function localAudioExists(audioUrl?: string | null): boolean {
 }
 
 function buildSafeUploadFilename(originalName: string, mimeType: string): string {
-  const classified = classifyMediaUpload(originalName, mimeType);
-  const ext = path.extname(originalName).toLowerCase();
-  const safeExt = classified.allowed ? classified.normalizedExt : '.bin';
-  const cleanBase = path
-    .basename(originalName, ext)
-    .replace(/[^a-zA-Z0-9_\-\u0400-\u04FF]/g, '_')
-    .slice(0, 30) || 'media';
-  return `${Date.now()}_${cleanBase}_${crypto.randomBytes(4).toString('hex')}${safeExt}`;
+  return buildSafeAsciiFilename(
+    originalName,
+    mimeType,
+    Date.now(),
+    crypto.randomBytes(4).toString('hex')
+  );
 }
 
 // Multer storage configuration with strict mime/extension validation
