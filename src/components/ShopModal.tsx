@@ -208,7 +208,7 @@ export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
       aria-modal="true"
       aria-label={t('shopTitle')}
     >
-      <div className="relative w-full max-w-5xl bg-[#0c0b0e] border border-white/[0.12] rounded-xl shadow-[0_24px_70px_rgba(0,0,0,0.92)] overflow-hidden flex flex-col max-h-[92vh]">
+      <div className="relative w-full max-w-5xl bg-[#0c0b0e] border border-white/[0.12] rounded-xl shadow-[0_24px_70px_rgba(0,0,0,0.92)] overflow-hidden flex flex-col max-h-[92dvh]">
         {/* Header Bar */}
         <div className="flex items-center justify-between px-5 sm:px-6 py-4 border-b border-white/[0.08] bg-[#111015]">
           <div className="flex items-center gap-3">

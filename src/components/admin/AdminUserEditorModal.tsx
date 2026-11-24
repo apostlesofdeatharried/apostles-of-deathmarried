@@ -475,7 +475,7 @@ export const AdminUserEditorModal: React.FC<Props> = ({
         initial={{ opacity: 0, scale: 0.96, y: 12 }}
         animate={{ opacity: 1, scale: 1, y: 0 }}
         exit={{ opacity: 0, scale: 0.96, y: 12 }}
-        className="relative w-full max-w-4xl max-h-[92vh] bg-[#121016] border border-white/15 rounded-xl shadow-2xl flex flex-col overflow-hidden z-10"
+        className="relative w-full max-w-4xl max-h-[92dvh] bg-[#121016] border border-white/15 rounded-xl shadow-2xl flex flex-col overflow-hidden z-10"
       >
         {/* Header */}
         <div className="p-4 sm:p-5 border-b border-white/[0.08] flex items-center justify-between gap-3 bg-[#16131c]">

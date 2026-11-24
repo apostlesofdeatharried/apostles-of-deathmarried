@@ -7,7 +7,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { MotionConfig } from 'motion/react';
 import { I18nProvider, useI18n } from './context/I18nContext.js';
 import { AuthProvider, useAuth, authFetch } from './context/AuthContext.js';
-import { PlayerProvider } from './context/PlayerContext.js';
+import { PlayerProvider, usePlayer } from './context/PlayerContext.js';
 import { Navbar } from './components/Navbar.js';
 import { MusicPlayer } from './components/MusicPlayer.js';
 import { Footer } from './components/Footer.js';
@@ -37,6 +37,7 @@ const TAB_TITLES: Record<AppTab, string> = {
 function MainApp() {
   const { t } = useI18n();
   const { user, loading: authLoading, refresh } = useAuth();
+  const { isVisible: playerVisible } = usePlayer();
   const isAdminOrMod = Boolean(user && (user.role_id === 'admin' || user.role_id === 'moderator'));
 
   // Check secret Moscow midnight visitor achievement (00:00-00:15 MSK) once per hour per session
@@ -212,7 +213,7 @@ function MainApp() {
   };
 
   return (
-    <div className="min-h-screen bg-[#08080a] text-[#ded9d2] flex flex-col font-sans selection:bg-[#4d161f] selection:text-[#f7f4ee] relative">
+    <div className="min-h-dvh bg-[#08080a] text-[#ded9d2] flex flex-col font-sans selection:bg-[#4d161f] selection:text-[#f7f4ee] relative overflow-x-hidden">
       {/* Short cinematic prologue running on initial home load */}
       {!introSeen && <IntroAnimation onComplete={handleIntroComplete} />}
 
@@ -220,7 +221,7 @@ function MainApp() {
       <Navbar currentTab={showNotFound ? '' : route.tab} onSelectTab={(tab) => navigate(tab)} />
 
       {/* Active Tab View or 404 */}
-      <main className="flex-1 pb-24">
+      <main className={`flex-1 ${playerVisible ? 'pb-32 sm:pb-28' : 'pb-16 sm:pb-24'}`}>
         {showNotFound ? (
           <div className="max-w-2xl mx-auto px-6 py-28 text-center">
             <p className="text-[11px] font-ui uppercase tracking-[0.35em] text-[#8c857b] mb-3">404</p>

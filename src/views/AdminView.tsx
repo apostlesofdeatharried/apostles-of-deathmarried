@@ -1109,10 +1109,19 @@ export const AdminView: React.FC = () => {
     }
   };
 
+  const copiedTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (copiedTimerRef.current !== null) window.clearTimeout(copiedTimerRef.current);
+    };
+  }, []);
+
   const copyToClipboard = (text: string) => {
     navigator.clipboard?.writeText(text);
     setCopiedUrl(text);
-    setTimeout(() => setCopiedUrl(null), 2500);
+    if (copiedTimerRef.current !== null) window.clearTimeout(copiedTimerRef.current);
+    copiedTimerRef.current = window.setTimeout(() => setCopiedUrl(null), 2500);
   };
 
   // Access Control Guard
@@ -1167,11 +1176,13 @@ export const AdminView: React.FC = () => {
             initial={{ opacity: 0, y: -20 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -20 }}
-            className="fixed top-20 right-6 z-50 bg-[#162218] border border-green-600/60 text-green-200 px-4 py-3 rounded-lg shadow-2xl flex items-center gap-3 font-sans text-xs"
+            className="fixed top-20 left-3 right-3 sm:left-auto sm:right-6 z-50 bg-[#162218] border border-green-600/60 text-green-200 px-4 py-3 rounded-lg shadow-2xl flex items-center justify-between gap-3 font-sans text-xs"
           >
-            <Check className="w-4 h-4 text-green-400 shrink-0" />
-            <span>{statusMessage}</span>
-            <button onClick={() => setStatusMessage(null)} className="text-green-400 hover:text-white ml-2">
+            <div className="flex items-center gap-3 min-w-0">
+              <Check className="w-4 h-4 text-green-400 shrink-0" />
+              <span className="break-words">{statusMessage}</span>
+            </div>
+            <button onClick={() => setStatusMessage(null)} className="text-green-400 hover:text-white ml-2 shrink-0">
               <X className="w-3.5 h-3.5" />
             </button>
           </motion.div>
@@ -1182,11 +1193,13 @@ export const AdminView: React.FC = () => {
             initial={{ opacity: 0, y: -20 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -20 }}
-            className="fixed top-20 right-6 z-50 bg-[#280f14] border border-red-700 text-red-200 px-4 py-3 rounded-lg shadow-2xl flex items-center gap-3 font-sans text-xs"
+            className="fixed top-20 left-3 right-3 sm:left-auto sm:right-6 z-50 bg-[#280f14] border border-red-700 text-red-200 px-4 py-3 rounded-lg shadow-2xl flex items-center justify-between gap-3 font-sans text-xs"
           >
-            <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
-            <span>{errorMessage}</span>
-            <button onClick={() => setErrorMessage(null)} className="text-red-400 hover:text-white ml-2">
+            <div className="flex items-center gap-3 min-w-0">
+              <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
+              <span className="break-words">{errorMessage}</span>
+            </div>
+            <button onClick={() => setErrorMessage(null)} className="text-red-400 hover:text-white ml-2 shrink-0">
               <X className="w-3.5 h-3.5" />
             </button>
           </motion.div>
@@ -1772,7 +1785,7 @@ export const AdminView: React.FC = () => {
 
                   {/* Quick Select from Preserved Media Storage */}
                   {mediaFilesList.length > 0 && (
-                    <div className="flex items-center gap-2 pt-1 text-[11px]">
+                    <div className="flex flex-wrap items-center gap-2 pt-1 text-[11px]">
                       <span className="text-ash/70 font-mono text-[10px]">
                         {lang === 'ru' ? 'Или выбрать из медиатеки:' : 'Or pick from storage:'}
                       </span>
@@ -1784,7 +1797,7 @@ export const AdminView: React.FC = () => {
                             autoDetectDuration(e.target.value, (sec) => setTrackDuration(String(sec)));
                           }
                         }}
-                        className="bg-[#100f13] border border-white/10 rounded px-2 py-1 text-bone text-xs font-mono max-w-xs truncate"
+                        className="min-w-0 max-w-full sm:max-w-xs bg-[#100f13] border border-white/10 rounded px-2 py-1 text-bone text-xs font-mono truncate"
                       >
                         <option value="">{lang === 'ru' ? '-- Выберите файл --' : '-- Select file --'}</option>
                         {mediaFilesList.map((m) => (
@@ -2034,7 +2047,7 @@ export const AdminView: React.FC = () => {
                 />
 
                 {mediaFilesList.length > 0 && (
-                  <div className="flex items-center gap-2 pt-1 text-[11px]">
+                  <div className="flex flex-wrap items-center gap-2 pt-1 text-[11px]">
                     <span className="text-ash/70 font-mono text-[10px]">
                       {lang === 'ru' ? 'Или выбрать из медиатеки:' : 'Or pick from storage:'}
                     </span>
@@ -2046,7 +2059,7 @@ export const AdminView: React.FC = () => {
                           autoDetectDuration(e.target.value, (sec) => setSingleDuration(String(sec)));
                         }
                       }}
-                      className="bg-[#100f13] border border-white/10 rounded px-2 py-1 text-bone text-xs font-mono max-w-xs truncate"
+                      className="min-w-0 max-w-full sm:max-w-xs bg-[#100f13] border border-white/10 rounded px-2 py-1 text-bone text-xs font-mono truncate"
                     >
                       <option value="">{lang === 'ru' ? '-- Выберите файл --' : '-- Select file --'}</option>
                       {mediaFilesList.map((m) => (
@@ -2836,11 +2849,11 @@ export const AdminView: React.FC = () => {
 
           {/* Tracks Table */}
           <div className="bg-[#100f13] border border-white/[0.08] rounded-xl overflow-hidden font-mono text-xs shadow-xl">
-            <div className="grid grid-cols-12 px-5 py-3 border-b border-white/[0.06] text-[10px] uppercase tracking-wider text-ash/80">
+            <div className="grid grid-cols-12 px-3.5 sm:px-5 py-3 border-b border-white/[0.06] text-[10px] uppercase tracking-wider text-ash/80 gap-2">
               <span className="col-span-5 sm:col-span-4">{lang === 'ru' ? 'Название трека' : 'Track Title'}</span>
               <span className="col-span-4 sm:col-span-3">{lang === 'ru' ? 'Релиз / Альбом' : 'Release / Album'}</span>
-              <span className="col-span-2 text-center">{lang === 'ru' ? 'Длительность' : 'Duration'}</span>
-              <span className="col-span-1 hidden sm:block text-center">{lang === 'ru' ? 'Прослушать' : 'Preview'}</span>
+              <span className="hidden sm:block sm:col-span-2 text-center">{lang === 'ru' ? 'Длительность' : 'Duration'}</span>
+              <span className="hidden sm:block sm:col-span-1 text-center">{lang === 'ru' ? 'Прослушать' : 'Preview'}</span>
               <span className="col-span-3 sm:col-span-2 text-right">{lang === 'ru' ? 'Статус' : 'Status'}</span>
             </div>
 
@@ -2856,22 +2869,22 @@ export const AdminView: React.FC = () => {
                   return (
                     <div
                       key={trk.id}
-                      className="grid grid-cols-12 items-center px-5 py-3 text-xs transition-colors hover:bg-white/[0.02]"
+                      className="grid grid-cols-12 items-center px-3.5 sm:px-5 py-3 text-xs transition-colors hover:bg-white/[0.02] gap-2"
                     >
-                      <div className="col-span-5 sm:col-span-4 flex items-center gap-2 truncate">
+                      <div className="col-span-5 sm:col-span-4 flex items-center gap-2 min-w-0">
                         <span className="w-2 h-2 rounded-full shrink-0 bg-[#821c2c]" />
                         <span className="text-white truncate font-medium">{trk.title}</span>
                       </div>
 
-                      <div className="col-span-4 sm:col-span-3 text-ash truncate">
+                      <div className="col-span-4 sm:col-span-3 text-ash truncate min-w-0">
                         {trk.release_title || (lang === 'ru' ? 'Сингл' : 'Single')}
                       </div>
 
-                      <div className="col-span-2 text-center text-ash">
+                      <div className="hidden sm:block sm:col-span-2 text-center text-ash tabular-nums">
                         {formatDuration(trk.duration_seconds || 180)}
                       </div>
 
-                      <div className="col-span-1 hidden sm:flex justify-center">
+                      <div className="hidden sm:flex sm:col-span-1 justify-center">
                         <button
                           type="button"
                           onClick={() => playTrack(trk as any)}
@@ -3821,7 +3834,7 @@ export const AdminView: React.FC = () => {
               initial={{ opacity: 0, scale: 0.95, y: 10 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.95, y: 10 }}
-              className="relative w-full max-w-md bg-[#141217] border border-red-900/60 rounded-xl p-6 shadow-2xl space-y-5 z-10"
+              className="relative w-full max-w-md max-h-[90dvh] overflow-y-auto bg-[#141217] border border-red-900/60 rounded-xl p-5 sm:p-6 shadow-2xl space-y-5 z-10"
             >
               <div className="flex items-center gap-3">
                 <div className="w-10 h-10 rounded-full bg-red-950/60 border border-red-800 flex items-center justify-center text-red-400 shrink-0">
@@ -3909,7 +3922,7 @@ export const AdminView: React.FC = () => {
               initial={{ opacity: 0, scale: 0.95, y: 10 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.95, y: 10 }}
-              className="relative w-full max-w-md bg-[#141217] border border-amber-800/60 rounded-xl p-6 shadow-2xl space-y-5 z-10"
+              className="relative w-full max-w-md max-h-[90dvh] overflow-y-auto bg-[#141217] border border-amber-800/60 rounded-xl p-5 sm:p-6 shadow-2xl space-y-5 z-10"
             >
               <div className="flex items-start justify-between gap-3">
                 <div className="flex items-center gap-3">

@@ -297,7 +297,7 @@ export const AuthModal: React.FC = () => {
       aria-modal="true"
       aria-labelledby="auth-modal-title"
     >
-      <div className="relative w-full max-w-md bg-[#0c0b0e] border border-white/[0.12] rounded-xl p-6 sm:p-8 shadow-2xl my-auto">
+      <div className="relative w-full max-w-md max-h-[92dvh] overflow-y-auto bg-[#0c0b0e] border border-white/[0.12] rounded-xl p-5 sm:p-8 shadow-2xl my-auto">
         {/* Close button */}
         <button
           type="button"

@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useI18n } from '../context/I18nContext.js';
 import { authFetch, useAuth } from '../context/AuthContext.js';
 import { ShopModal } from './ShopModal.js';
@@ -22,12 +22,39 @@ export const Navbar: React.FC<NavbarProps> = ({ currentTab, onSelectTab }) => {
   const [rosePulse, setRosePulse] = useState(false);
   const roseClicksRef = useRef(0);
   const roseTriggeredRef = useRef(false);
+  const roseTimerRef = useRef<number | null>(null);
+  const userMenuRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (roseTimerRef.current !== null) window.clearTimeout(roseTimerRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!userDropdownOpen) return;
+    const handleOutside = (e: MouseEvent) => {
+      if (userMenuRef.current && !userMenuRef.current.contains(e.target as Node)) {
+        setUserDropdownOpen(false);
+      }
+    };
+    const handleEsc = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setUserDropdownOpen(false);
+    };
+    document.addEventListener('mousedown', handleOutside);
+    window.addEventListener('keydown', handleEsc);
+    return () => {
+      document.removeEventListener('mousedown', handleOutside);
+      window.removeEventListener('keydown', handleEsc);
+    };
+  }, [userDropdownOpen]);
 
   const handleRoseClick = (e: React.MouseEvent) => {
     e.stopPropagation();
     roseClicksRef.current += 1;
     setRosePulse(true);
-    window.setTimeout(() => setRosePulse(false), 240);
+    if (roseTimerRef.current !== null) window.clearTimeout(roseTimerRef.current);
+    roseTimerRef.current = window.setTimeout(() => setRosePulse(false), 240);
 
     if (roseClicksRef.current >= 5 && !roseTriggeredRef.current && user) {
       roseTriggeredRef.current = true;
@@ -176,7 +203,7 @@ export const Navbar: React.FC<NavbarProps> = ({ currentTab, onSelectTab }) => {
 
             {/* User profile dropdown or Auth button */}
             {user ? (
-              <div className="relative">
+              <div className="relative" ref={userMenuRef}>
                 <button
                   onClick={() => setUserDropdownOpen(!userDropdownOpen)}
                   className="flex items-center gap-2 p-1 pl-2 rounded-lg border border-white/[0.08] bg-[#100f13] hover:border-white/20 transition-all cursor-pointer"

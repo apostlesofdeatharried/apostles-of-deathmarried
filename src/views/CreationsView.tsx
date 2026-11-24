@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useI18n } from '../context/I18nContext.js';
 import { useAuth, authFetch } from '../context/AuthContext.js';
 import { Creation } from '../types/index.js';
@@ -81,10 +81,23 @@ export const CreationsView: React.FC = () => {
   const [deletingTarget, setDeletingTarget] = useState(false);
 
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const toastTimerRef = useRef<number | null>(null);
   const [rulesModalMode, setRulesModalMode] = useState<'accept' | 'view' | null>(null);
   const pendingRulesActionRef = useRef<(() => void) | null>(null);
 
   const isStaff = Boolean(user && (user.role_id === 'admin' || user.role_id === 'moderator'));
+
+  const showToast = useCallback((msg: string, ms = 3500) => {
+    setToastMessage(msg);
+    if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = window.setTimeout(() => setToastMessage(null), ms);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current);
+    };
+  }, []);
 
   const requireRulesThen = (action: () => void) => {
     if (!user) {
@@ -258,12 +271,12 @@ export const CreationsView: React.FC = () => {
         setNewDesc('');
         setNewMediaUrl('');
         setSelectedCategory('all');
-        setToastMessage(
+        showToast(
           data.status === 'pending'
             ? (lang === 'ru' ? 'Отправлено на модерацию' : 'Submitted for review')
-            : (lang === 'ru' ? 'Публикация добавлена' : 'Creation published')
+            : (lang === 'ru' ? 'Публикация добавлена' : 'Creation published'),
+          4000
         );
-        setTimeout(() => setToastMessage(null), 4000);
         fetchCreations();
         refresh();
       } else {
@@ -451,15 +464,14 @@ export const CreationsView: React.FC = () => {
       const data = await safeJson<{ favorited?: boolean; error?: string }>(res, {});
       if (res.ok) {
         setIsFavorited(Boolean(data.favorited));
-        setToastMessage(
+        showToast(
           data.favorited
             ? (lang === 'ru' ? 'Добавлено в избранное' : 'Added to favorites')
-            : (lang === 'ru' ? 'Убрано из избранного' : 'Removed from favorites')
+            : (lang === 'ru' ? 'Убрано из избранного' : 'Removed from favorites'),
+          3000
         );
-        setTimeout(() => setToastMessage(null), 3000);
       } else {
-        setToastMessage(data.error || 'Failed');
-        setTimeout(() => setToastMessage(null), 4000);
+        showToast(data.error || 'Failed', 4000);
       }
     } catch (e) {
       console.error(e);
@@ -500,8 +512,7 @@ export const CreationsView: React.FC = () => {
       const data = await safeJson<{ error?: string }>(res, {});
       if (res.ok) {
         setEditModalOpen(false);
-        setToastMessage(lang === 'ru' ? 'Работа обновлена' : 'Creation updated');
-        setTimeout(() => setToastMessage(null), 3000);
+        showToast(lang === 'ru' ? 'Работа обновлена' : 'Creation updated', 3000);
         await openCreationDetail(activeCreation);
         fetchCreations();
       } else {
@@ -533,8 +544,7 @@ export const CreationsView: React.FC = () => {
         refresh();
         openCreationDetail(activeCreation);
       } else {
-        setToastMessage(data.error || (lang === 'ru' ? 'Не удалось добавить комментарий' : 'Failed to add comment'));
-        setTimeout(() => setToastMessage(null), 4000);
+        showToast(data.error || (lang === 'ru' ? 'Не удалось добавить комментарий' : 'Failed to add comment'), 4000);
       }
     } catch (e) {
       console.error(e);
@@ -558,8 +568,7 @@ export const CreationsView: React.FC = () => {
         if (res.ok) {
           setDeleteTarget(null);
           setActiveCreation(null);
-          setToastMessage(lang === 'ru' ? 'Публикация удалена' : 'Creation deleted');
-          setTimeout(() => setToastMessage(null), 3000);
+          showToast(lang === 'ru' ? 'Публикация удалена' : 'Creation deleted', 3000);
           fetchCreations();
           refresh();
         }
@@ -597,7 +606,7 @@ export const CreationsView: React.FC = () => {
     <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-10 space-y-8 animate-fadeIn">
       {/* Toast */}
       {toastMessage && (
-        <div className="fixed top-20 right-6 z-50 px-4 py-2.5 rounded-lg bg-[#141d16] border border-[#2b6637] text-xs text-[#6ee7b7] shadow-xl animate-fadeIn">
+        <div className="fixed top-20 left-3 right-3 sm:left-auto sm:right-6 z-50 px-4 py-2.5 rounded-lg bg-[#141d16] border border-[#2b6637] text-xs text-[#6ee7b7] shadow-xl animate-fadeIn">
           {toastMessage}
         </div>
       )}
@@ -812,7 +821,7 @@ export const CreationsView: React.FC = () => {
           aria-modal="true"
           className="fixed inset-0 z-[110] flex items-center justify-center p-3 sm:p-4 bg-black/85 backdrop-blur-md animate-fadeIn"
         >
-          <div className="relative w-full max-w-3xl bg-[#0c0b0e] border border-white/[0.12] rounded-xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
+          <div className="relative w-full max-w-3xl bg-[#0c0b0e] border border-white/[0.12] rounded-xl shadow-2xl overflow-hidden flex flex-col max-h-[90dvh]">
             {/* Top Bar */}
             <div className="flex flex-wrap items-center justify-between gap-3 px-6 py-4 border-b border-white/[0.08] bg-[#111015]">
               <div className="flex flex-wrap items-center gap-3 min-w-0">
@@ -1046,14 +1055,14 @@ export const CreationsView: React.FC = () => {
                             : 'Sign in to comment...'
                       }
                       disabled={!user}
-                      className="flex-1 bg-[#151419] border border-white/[0.08] rounded-lg px-3 py-2 text-xs text-white placeholder-[#736c64] focus:outline-none focus:border-white/30"
+                      className="flex-1 min-w-0 bg-[#151419] border border-white/[0.08] rounded-lg px-3 py-2 text-xs text-white placeholder-[#736c64] focus:outline-none focus:border-white/30"
                     />
                     <button
                       type="submit"
                       disabled={!user || !newComment.trim()}
                       aria-label={lang === 'ru' ? 'Отправить комментарий' : 'Send comment'}
                       title={lang === 'ru' ? 'Отправить' : 'Send'}
-                      className="px-4 bg-white/[0.08] hover:bg-white/[0.16] border border-white/[0.12] disabled:opacity-40 text-white rounded-lg transition-colors cursor-pointer"
+                      className="px-4 bg-white/[0.08] hover:bg-white/[0.16] border border-white/[0.12] disabled:opacity-40 text-white rounded-lg transition-colors cursor-pointer shrink-0"
                     >
                       <Send className="w-3.5 h-3.5" />
                     </button>
@@ -1172,7 +1181,7 @@ export const CreationsView: React.FC = () => {
           aria-modal="true"
           className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fadeIn"
         >
-          <div className="relative w-full max-w-lg bg-[#0c0b0e] border border-white/[0.12] rounded-xl p-6 space-y-5 shadow-2xl">
+          <div className="relative w-full max-w-lg max-h-[90dvh] overflow-y-auto bg-[#0c0b0e] border border-white/[0.12] rounded-xl p-5 sm:p-6 space-y-5 shadow-2xl">
             <div className="flex items-center justify-between border-b border-white/[0.08] pb-3">
               <h2 className="font-display text-lg tracking-wider uppercase text-[#f2eee9] font-medium">
                 {t('publishCreation')}
@@ -1301,7 +1310,7 @@ export const CreationsView: React.FC = () => {
           aria-modal="true"
           className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fadeIn"
         >
-          <div className="relative w-full max-w-lg bg-[#0c0b0e] border border-white/[0.12] rounded-xl p-6 space-y-5 shadow-2xl">
+          <div className="relative w-full max-w-lg max-h-[90dvh] overflow-y-auto bg-[#0c0b0e] border border-white/[0.12] rounded-xl p-5 sm:p-6 space-y-5 shadow-2xl">
             <div className="flex items-center justify-between border-b border-white/[0.08] pb-3">
               <h2 className="font-display text-lg tracking-wider uppercase text-[#f2eee9] font-medium">
                 {t('editBtn')}
@@ -1407,7 +1416,7 @@ export const CreationsView: React.FC = () => {
           aria-modal="true"
           className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fadeIn"
         >
-          <div className="relative w-full max-w-md bg-[#121016] border border-red-900/60 rounded-xl p-6 space-y-4 shadow-2xl">
+          <div className="relative w-full max-w-md max-h-[90dvh] overflow-y-auto bg-[#121016] border border-red-900/60 rounded-xl p-5 sm:p-6 space-y-4 shadow-2xl">
             <div className="flex items-center gap-3">
               <div className="w-10 h-10 rounded-full bg-red-950/60 border border-red-800 flex items-center justify-center text-red-400 shrink-0">
                 <Trash2 className="w-5 h-5" />

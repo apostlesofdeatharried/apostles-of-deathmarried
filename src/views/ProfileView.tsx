@@ -1824,13 +1824,13 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
                       value={verifyEmailInput}
                       onChange={(e) => setVerifyEmailInput(e.target.value)}
                       placeholder="name@example.com"
-                      className="flex-1 px-3 py-2 rounded-md bg-[#14131a] border border-white/[0.1] text-xs text-[#f2eee9] focus:outline-none focus:border-white/30"
+                      className="flex-1 min-w-0 px-3 py-2 rounded-md bg-[#14131a] border border-white/[0.1] text-xs text-[#f2eee9] focus:outline-none focus:border-white/30"
                     />
                     <button
                       type="button"
                       disabled={verifySending || !verifyEmailInput.trim()}
                       onClick={handleSendVerifyEmailCode}
-                      className="px-3 py-2 rounded-md bg-white/[0.08] hover:bg-white/[0.14] border border-white/[0.12] text-[11px] font-mono text-[#f2eee9] cursor-pointer disabled:opacity-40"
+                      className="px-3 py-2 rounded-md bg-white/[0.08] hover:bg-white/[0.14] border border-white/[0.12] text-[11px] font-mono text-[#f2eee9] cursor-pointer disabled:opacity-40 shrink-0"
                     >
                       {verifySending ? '...' : lang === 'ru' ? 'Код' : 'Send'}
                     </button>
@@ -1845,13 +1845,13 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
                         value={verifyCodeInput}
                         onChange={(e) => setVerifyCodeInput(e.target.value.replace(/\D/g, '').slice(0, 6))}
                         placeholder="6-значный код"
-                        className="flex-1 px-3 py-2 rounded-md bg-[#14131a] border border-white/[0.1] text-xs font-mono tracking-widest text-[#f2eee9] focus:outline-none focus:border-white/30"
+                        className="flex-1 min-w-0 px-3 py-2 rounded-md bg-[#14131a] border border-white/[0.1] text-xs font-mono tracking-widest text-[#f2eee9] focus:outline-none focus:border-white/30"
                       />
                       <button
                         type="button"
                         disabled={verifyConfirming || verifyCodeInput.length !== 6}
                         onClick={handleConfirmVerifyEmail}
-                        className="px-3 py-2 rounded-md bg-[#f2eee9] hover:bg-white text-[#09090b] text-[11px] font-mono uppercase font-medium cursor-pointer disabled:opacity-40"
+                        className="px-3 py-2 rounded-md bg-[#f2eee9] hover:bg-white text-[#09090b] text-[11px] font-mono uppercase font-medium cursor-pointer disabled:opacity-40 shrink-0"
                       >
                         {verifyConfirming ? '...' : lang === 'ru' ? 'Ок' : 'Verify'}
                       </button>

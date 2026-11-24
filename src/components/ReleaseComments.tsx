@@ -213,7 +213,7 @@ export const ReleaseComments: React.FC<ReleaseCommentsProps> = ({
                       : 'Поделитесь впечатлением о релизе...'
                     : 'Войдите, чтобы оставить комментарий...'
                 }
-                className="flex-1 bg-[#151419] border border-white/[0.08] rounded-md px-3 py-2 text-xs text-[#f2eee9] placeholder-[#6e675e] focus:outline-none focus:border-white/25"
+                className="flex-1 min-w-0 bg-[#151419] border border-white/[0.08] rounded-md px-3 py-2 text-xs text-[#f2eee9] placeholder-[#6e675e] focus:outline-none focus:border-white/25"
               />
               {user ? (
                 <button

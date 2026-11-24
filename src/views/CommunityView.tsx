@@ -127,14 +127,26 @@ export const CommunityView: React.FC = () => {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [deleteTarget, deletingTarget, reportModalOpen, editModalOpen, createModalOpen]);
 
+  const toastTimerRef = useRef<number | null>(null);
+  const errorTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current);
+      if (errorTimerRef.current !== null) window.clearTimeout(errorTimerRef.current);
+    };
+  }, []);
+
   const showToast = (msg: string) => {
     setToastMessage(msg);
-    setTimeout(() => setToastMessage(null), 4000);
+    if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = window.setTimeout(() => setToastMessage(null), 4000);
   };
 
   const showError = (msg: string) => {
     setErrorBanner(msg);
-    setTimeout(() => setErrorBanner(null), 5000);
+    if (errorTimerRef.current !== null) window.clearTimeout(errorTimerRef.current);
+    errorTimerRef.current = window.setTimeout(() => setErrorBanner(null), 5000);
   };
 
   const getDefaultCategoryId = (cats: PostCategory[]) => {
@@ -657,12 +669,12 @@ export const CommunityView: React.FC = () => {
     <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-10 space-y-8 animate-fadeIn">
       {/* Toast Notifications */}
       {toastMessage && (
-        <div className="fixed top-20 right-6 z-50 px-4 py-2.5 rounded-lg bg-[#141d16] border border-[#2b6637] text-xs text-[#6ee7b7] shadow-xl animate-fadeIn">
+        <div className="fixed top-20 left-3 right-3 sm:left-auto sm:right-6 z-50 px-4 py-2.5 rounded-lg bg-[#141d16] border border-[#2b6637] text-xs text-[#6ee7b7] shadow-xl animate-fadeIn">
           {toastMessage}
         </div>
       )}
       {errorBanner && (
-        <div className="fixed top-20 right-6 z-50 px-4 py-2.5 rounded-lg bg-[#280f14] border border-red-700 text-xs text-red-200 shadow-xl animate-fadeIn">
+        <div className="fixed top-20 left-3 right-3 sm:left-auto sm:right-6 z-50 px-4 py-2.5 rounded-lg bg-[#280f14] border border-red-700 text-xs text-red-200 shadow-xl animate-fadeIn">
           {errorBanner}
         </div>
       )}
@@ -966,14 +978,14 @@ export const CommunityView: React.FC = () => {
                     }
                     disabled={!user || submittingComment}
                     rows={2}
-                    className="flex-1 bg-[#151419] border border-white/[0.08] rounded-lg p-3 text-xs text-white placeholder-[#736c64] focus:outline-none focus:border-white/30 resize-none font-sans"
+                    className="flex-1 min-w-0 bg-[#151419] border border-white/[0.08] rounded-lg p-3 text-xs text-white placeholder-[#736c64] focus:outline-none focus:border-white/30 resize-none font-sans"
                   />
                   <button
                     type="submit"
                     disabled={!user || !newComment.trim() || submittingComment}
                     aria-label={lang === 'ru' ? 'Отправить комментарий' : 'Send comment'}
                     title={lang === 'ru' ? 'Отправить' : 'Send'}
-                    className="px-4 bg-white/[0.08] hover:bg-white/[0.16] border border-white/[0.12] disabled:opacity-40 text-white rounded-lg transition-colors cursor-pointer self-end py-3"
+                    className="px-4 bg-white/[0.08] hover:bg-white/[0.16] border border-white/[0.12] disabled:opacity-40 text-white rounded-lg transition-colors cursor-pointer self-end py-3 shrink-0"
                   >
                     <Send className="w-4 h-4" />
                   </button>
@@ -1360,7 +1372,7 @@ export const CommunityView: React.FC = () => {
           aria-modal="true"
           className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fadeIn"
         >
-          <div className="relative w-full max-w-lg bg-[#0c0b0e] border border-white/[0.12] rounded-xl p-6 space-y-5 shadow-2xl">
+          <div className="relative w-full max-w-lg max-h-[90dvh] overflow-y-auto bg-[#0c0b0e] border border-white/[0.12] rounded-xl p-5 sm:p-6 space-y-5 shadow-2xl">
             <div className="flex items-center justify-between border-b border-white/[0.08] pb-3">
               <h2 className="font-display text-lg tracking-wider uppercase text-[#f2eee9] font-medium">
                 {t('newTopic')}
@@ -1491,7 +1503,7 @@ export const CommunityView: React.FC = () => {
           aria-modal="true"
           className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fadeIn"
         >
-          <div className="relative w-full max-w-lg bg-[#0c0b0e] border border-white/[0.12] rounded-xl p-6 space-y-5 shadow-2xl">
+          <div className="relative w-full max-w-lg max-h-[90dvh] overflow-y-auto bg-[#0c0b0e] border border-white/[0.12] rounded-xl p-5 sm:p-6 space-y-5 shadow-2xl">
             <div className="flex items-center justify-between border-b border-white/[0.08] pb-3">
               <h2 className="font-display text-lg tracking-wider uppercase text-[#f2eee9] font-medium">
                 {t('editBtn')}
@@ -1579,7 +1591,7 @@ export const CommunityView: React.FC = () => {
           aria-modal="true"
           className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fadeIn"
         >
-          <div className="relative w-full max-w-md bg-[#121016] border border-red-900/60 rounded-xl p-6 space-y-4 shadow-2xl">
+          <div className="relative w-full max-w-md max-h-[90dvh] overflow-y-auto bg-[#121016] border border-red-900/60 rounded-xl p-5 sm:p-6 space-y-4 shadow-2xl">
             <div className="flex items-center gap-3">
               <div className="w-10 h-10 rounded-full bg-red-950/60 border border-red-800 flex items-center justify-center text-red-400 shrink-0">
                 <Trash2 className="w-5 h-5" />
@@ -1629,7 +1641,7 @@ export const CommunityView: React.FC = () => {
           aria-modal="true"
           className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fadeIn"
         >
-          <div className="relative w-full max-w-md bg-[#0c0b0e] border border-white/[0.12] rounded-xl p-6 space-y-4 shadow-2xl">
+          <div className="relative w-full max-w-md max-h-[90dvh] overflow-y-auto bg-[#0c0b0e] border border-white/[0.12] rounded-xl p-5 sm:p-6 space-y-4 shadow-2xl">
             <div className="flex items-center justify-between border-b border-white/[0.08] pb-3">
               <h2 className="font-display text-base tracking-wider uppercase text-[#f2eee9]">
                 {lang === 'ru' ? 'Пожаловаться на нарушение' : 'Report Violation'}

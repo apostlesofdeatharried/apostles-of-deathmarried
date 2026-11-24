@@ -851,7 +851,7 @@ export const ArchiveView: React.FC = () => {
           aria-modal="true"
           aria-label={selectedSingle.title}
         >
-          <div className="relative w-full max-w-lg bg-[#100f13] border border-white/[0.12] rounded-lg p-6 sm:p-8 max-h-[90vh] overflow-y-auto space-y-6 shadow-2xl">
+          <div className="relative w-full max-w-lg bg-[#100f13] border border-white/[0.12] rounded-lg p-5 sm:p-8 max-h-[90dvh] overflow-y-auto space-y-6 shadow-2xl">
             <button
               onClick={() => setSelectedSingle(null)}
               className="absolute top-4 right-4 text-ash hover:text-white cursor-pointer p-1"
@@ -946,7 +946,7 @@ export const ArchiveView: React.FC = () => {
           aria-modal="true"
           aria-label={selectedLyricsTrack.title}
         >
-          <div className="relative w-full max-w-lg bg-[#100f13] border border-white/[0.1] rounded-lg p-6 sm:p-8 max-h-[85vh] overflow-y-auto space-y-6">
+          <div className="relative w-full max-w-lg bg-[#100f13] border border-white/[0.1] rounded-lg p-5 sm:p-8 max-h-[88dvh] overflow-y-auto space-y-6">
             <button
               onClick={() => setSelectedLyricsTrack(null)}
               className="absolute top-4 right-4 text-ash hover:text-white cursor-pointer"
@@ -991,7 +991,7 @@ export const ArchiveView: React.FC = () => {
           aria-modal="true"
           aria-label={t('newAlbumBtn')}
         >
-          <div className="relative w-full max-w-md bg-[#100f13] border border-white/[0.1] rounded-lg p-6 space-y-4">
+          <div className="relative w-full max-w-md max-h-[90dvh] overflow-y-auto bg-[#100f13] border border-white/[0.1] rounded-lg p-5 sm:p-6 space-y-4">
             <button
               onClick={() => setNewAlbumModal(false)}
               className="absolute top-4 right-4 text-ash hover:text-white cursor-pointer"
@@ -1090,7 +1090,7 @@ export const ArchiveView: React.FC = () => {
           aria-modal="true"
           aria-label={streamingToast.title}
         >
-          <div className="bg-[#121116] border border-white/[0.12] rounded-lg max-w-md w-full p-6 space-y-4 shadow-2xl relative">
+          <div className="bg-[#121116] border border-white/[0.12] rounded-lg max-w-md w-full max-h-[90dvh] overflow-y-auto p-5 sm:p-6 space-y-4 shadow-2xl relative">
             <button
               onClick={() => setStreamingToast(null)}
               className="absolute top-4 right-4 text-ash hover:text-white p-1 cursor-pointer"

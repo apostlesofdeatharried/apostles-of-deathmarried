@@ -10,6 +10,8 @@ import {
   ArrowDown,
   Save,
   Users,
+  ChevronDown,
+  ChevronUp,
 } from 'lucide-react';
 import { authFetch } from '../../context/AuthContext.js';
 import { safeJson } from '../../utils/logic.js';
@@ -54,6 +56,7 @@ export const AdminNewsTab: React.FC<CommonProps> = ({ lang, onNotify, onError })
   const [routePreset, setRoutePreset] = useState<string>('');
   const [customPath, setCustomPath] = useState<string>('');
   const [sending, setSending] = useState(false);
+  const [expandedNewsIds, setExpandedNewsIds] = useState<Record<string, boolean>>({});
 
   const resolvedLink =
     routePreset === '__custom__'
@@ -166,7 +169,7 @@ export const AdminNewsTab: React.FC<CommonProps> = ({ lang, onNotify, onError })
             <input
               type="text"
               required
-              maxLength={120}
+              maxLength={160}
               value={title}
               onChange={(e) => setTitle(e.target.value)}
               placeholder={lang === 'ru' ? 'Обновление архива и режима викторины' : 'Archive & Quiz Update'}
@@ -174,17 +177,22 @@ export const AdminNewsTab: React.FC<CommonProps> = ({ lang, onNotify, onError })
             />
           </div>
           <div>
-            <label className="block font-mono text-[10px] uppercase tracking-wider text-ash mb-1">
-              {lang === 'ru' ? 'Текст уведомления *' : 'Message *'}
-            </label>
+            <div className="flex items-center justify-between gap-2 mb-1">
+              <label className="block font-mono text-[10px] uppercase tracking-wider text-ash">
+                {lang === 'ru' ? 'Текст уведомления *' : 'Message *'}
+              </label>
+              <span className="font-mono text-[10px] text-ash/60 tabular-nums">
+                {message.length}/2000
+              </span>
+            </div>
             <textarea
               required
-              rows={4}
-              maxLength={300}
+              rows={5}
+              maxLength={2000}
               value={message}
               onChange={(e) => setMessage(e.target.value)}
-              placeholder={lang === 'ru' ? 'Коротко опишите, что изменилось...' : 'Brief summary...'}
-              className="w-full px-3.5 py-2.5 bg-[#16151a] border border-white/[0.1] rounded-lg text-white focus:outline-none focus:border-white/30 resize-none"
+              placeholder={lang === 'ru' ? 'Подробно опишите новость или обновление...' : 'Detailed summary...'}
+              className="w-full px-3.5 py-2.5 bg-[#16151a] border border-white/[0.1] rounded-lg text-white focus:outline-none focus:border-white/30 resize-y min-h-[110px]"
             />
           </div>
           <div className="space-y-2.5">
@@ -246,24 +254,60 @@ export const AdminNewsTab: React.FC<CommonProps> = ({ lang, onNotify, onError })
           <div className="py-10 text-center font-mono text-xs text-ash">{lang === 'ru' ? 'Рассылок ещё не было.' : 'No broadcasts sent yet.'}</div>
         ) : (
           <div className="divide-y divide-white/[0.05] max-h-[520px] overflow-y-auto pr-1">
-            {newsList.map((n) => (
-              <div key={n.id} className="py-3.5 space-y-1.5">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <span className="text-sm text-ivory font-medium">{n.title}</span>
-                  <span className="font-mono text-[10px] px-2 py-0.5 rounded bg-white/[0.06] text-bone">
-                    {lang === 'ru' ? 'Получателей:' : 'Sent:'} {n.sent_count ?? 0}
-                  </span>
+            {newsList.map((n) => {
+              const rawMsg = String(n.message || '');
+              const isLongMsg = rawMsg.length > 130 || rawMsg.includes('\n');
+              const isExpanded = Boolean(expandedNewsIds[n.id]);
+              return (
+                <div key={n.id} className="py-3.5 space-y-1.5">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-sm text-ivory font-medium break-words min-w-0">{n.title}</span>
+                    <span className="font-mono text-[10px] px-2 py-0.5 rounded bg-white/[0.06] text-bone shrink-0">
+                      {lang === 'ru' ? 'Получателей:' : 'Sent:'} {n.sent_count ?? 0}
+                    </span>
+                  </div>
+                  <p
+                    className={`text-xs text-ash leading-relaxed whitespace-pre-wrap break-words ${
+                      isLongMsg && !isExpanded ? 'line-clamp-3' : ''
+                    }`}
+                  >
+                    {rawMsg}
+                  </p>
+                  {isLongMsg && (
+                    <div>
+                      <button
+                        type="button"
+                        aria-expanded={isExpanded}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setExpandedNewsIds((prev) => ({ ...prev, [n.id]: !prev[n.id] }));
+                        }}
+                        className="inline-flex items-center gap-1 font-mono text-[10px] uppercase tracking-wider text-[#e28593] hover:text-white transition-colors cursor-pointer py-0.5"
+                      >
+                        {isExpanded ? (
+                          <>
+                            <ChevronUp className="w-3 h-3" />
+                            <span>{lang === 'ru' ? 'Свернуть' : 'Collapse'}</span>
+                          </>
+                        ) : (
+                          <>
+                            <ChevronDown className="w-3 h-3" />
+                            <span>{lang === 'ru' ? 'Читать полностью' : 'Show more'}</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  )}
+                  <div className="font-mono text-[10px] text-ash/60 flex flex-wrap gap-2">
+                    <span>{formatNewsLinkLabel(n.link, lang)}</span>
+                    <span>·</span>
+                    <span>@{n.author_nickname || 'admin'}</span>
+                    <span>·</span>
+                    <span>{new Date(n.created_at).toLocaleString()}</span>
+                  </div>
                 </div>
-                <p className="text-xs text-ash leading-relaxed">{n.message}</p>
-                <div className="font-mono text-[10px] text-ash/60 flex flex-wrap gap-2">
-                  <span>{formatNewsLinkLabel(n.link, lang)}</span>
-                  <span>·</span>
-                  <span>@{n.author_nickname || 'admin'}</span>
-                  <span>·</span>
-                  <span>{new Date(n.created_at).toLocaleString()}</span>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>

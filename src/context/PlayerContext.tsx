@@ -167,6 +167,8 @@ export const PlayerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       audio.removeEventListener('ended', onEnded);
       audio.removeEventListener('error', onError);
       audio.pause();
+      audio.removeAttribute('src');
+      audio.load();
     };
   }, []);
 

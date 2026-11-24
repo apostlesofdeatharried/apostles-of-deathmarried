@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Award, Crown, Disc, Eye, Flame, Moon, Sparkles, Tag, Trophy, X } from 'lucide-react';
 import { useI18n } from '../context/I18nContext.js';
 
@@ -52,6 +52,7 @@ interface ToastEntry extends UnlockedAchievementToastItem {
 export const AchievementToastContainer: React.FC = () => {
   const { lang } = useI18n();
   const [toasts, setToasts] = useState<ToastEntry[]>([]);
+  const timersRef = useRef<Set<number>>(new Set());
 
   useEffect(() => {
     const handleUnlock = (ev: Event) => {
@@ -67,21 +68,27 @@ export const AchievementToastContainer: React.FC = () => {
       setToasts((prev) => [...prev, ...entries].slice(-4));
 
       entries.forEach((entry, idx) => {
-        window.setTimeout(() => {
+        const timerId = window.setTimeout(() => {
+          timersRef.current.delete(timerId);
           setToasts((prev) => prev.filter((t) => t.toastId !== entry.toastId));
         }, 5600 + idx * 700);
+        timersRef.current.add(timerId);
       });
     };
 
     window.addEventListener(EVENT_NAME, handleUnlock);
-    return () => window.removeEventListener(EVENT_NAME, handleUnlock);
+    return () => {
+      window.removeEventListener(EVENT_NAME, handleUnlock);
+      timersRef.current.forEach((id) => window.clearTimeout(id));
+      timersRef.current.clear();
+    };
   }, []);
 
   if (toasts.length === 0) return null;
 
   return (
     <div
-      className="fixed bottom-24 right-4 sm:right-6 z-[70] flex flex-col gap-2.5 max-w-xs w-[calc(100vw-2rem)] pointer-events-none"
+      className="fixed bottom-28 sm:bottom-24 left-3 right-3 sm:left-auto sm:right-6 z-[70] flex flex-col gap-2.5 sm:max-w-xs w-auto sm:w-80 pointer-events-none"
       aria-live="polite"
     >
       {toasts.map((toast) => {

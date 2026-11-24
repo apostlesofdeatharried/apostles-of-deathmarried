@@ -1449,6 +1449,17 @@ function canEarnDiscussionXp(userId: string, content: string): boolean {
   return Number(dailyRow?.cnt || 0) < 3;
 }
 
+function normalizeMultilineText(raw: unknown, maxLength: number): string {
+  return String(raw ?? '')
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map((line) => line.replace(/[ \t]+/g, ' ').trim())
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+    .slice(0, maxLength);
+}
+
 function createNotificationRecord(params: {
   recipientUserId: string;
   actor: { id: string; nickname: string; display_name?: string };
@@ -1463,8 +1474,8 @@ function createNotificationRecord(params: {
   if (!params.recipientUserId) return;
   if (!params.allowSelf && params.recipientUserId === params.actor.id) return;
   try {
-    const cleanExcerpt = String(params.excerpt || '').replace(/\s+/g, ' ').trim().slice(0, 140);
-    const cleanTitle = String(params.targetTitle || '').trim().slice(0, 120);
+    const cleanExcerpt = normalizeMultilineText(params.excerpt, 2000);
+    const cleanTitle = String(params.targetTitle || '').replace(/\s+/g, ' ').trim().slice(0, 160);
     const actorName = (params.actor.display_name || params.actor.nickname || 'Участник').trim().slice(0, 60);
     db.prepare(`
       INSERT INTO notifications (
@@ -1616,8 +1627,8 @@ app.get('/api/admin/news', requireAdmin, (_req: AuthRequest, res: Response) => {
 });
 
 app.post('/api/admin/news/broadcast', requireAdmin, async (req: AuthRequest, res: Response) => {
-  const cleanTitle = String(req.body?.title || '').replace(/\s+/g, ' ').trim().slice(0, 120);
-  const cleanMessage = String(req.body?.message || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+  const cleanTitle = String(req.body?.title || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+  const cleanMessage = normalizeMultilineText(req.body?.message, 2000);
   const rawLink = typeof req.body?.link === 'string' ? req.body.link.trim() : '';
   const safeLink =
     !rawLink || rawLink === 'none' || rawLink === '__none__'

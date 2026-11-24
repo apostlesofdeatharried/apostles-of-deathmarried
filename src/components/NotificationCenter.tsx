@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useAuth, authFetch } from '../context/AuthContext.js';
+import { useI18n } from '../context/I18nContext.js';
 import { AppNotification } from '../types/index.js';
 import { safeJson } from '../utils/logic.js';
-import { Bell, BellRing, CheckCheck, MessageSquare, X } from 'lucide-react';
+import { Bell, BellRing, CheckCheck, ChevronDown, ChevronUp, MessageSquare, X } from 'lucide-react';
 
 export type BrowserNotifStatus = 'unsupported' | 'default' | 'granted' | 'denied';
 
@@ -186,12 +187,22 @@ function persistShownToastId(userId: string, notifId: string) {
   } catch {}
 }
 
+function isLongNotificationContent(n: Pick<AppNotification, 'target_title' | 'excerpt'>): boolean {
+  const excerpt = (n.excerpt || '').trim();
+  const title = (n.target_title || '').trim();
+  const lineCount = excerpt ? excerpt.split('\n').length : 0;
+  return excerpt.length > 115 || lineCount > 2 || title.length > 68;
+}
+
 export const NotificationCenter: React.FC = () => {
   const { user, refresh } = useAuth();
+  const { lang } = useI18n();
   const [open, setOpen] = useState(false);
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
   const [unreadCount, setUnreadCount] = useState(0);
   const [toastNotif, setToastNotif] = useState<AppNotification | null>(null);
+  const [toastExpanded, setToastExpanded] = useState(false);
+  const [expandedIds, setExpandedIds] = useState<Record<string, boolean>>({});
   const [notifyFollows, setNotifyFollows] = useState<boolean>(user?.notify_follows === 0 ? false : true);
   const [notifyNews, setNotifyNews] = useState<boolean>(Boolean(user?.notify_news));
   const [prefsSaving, setPrefsSaving] = useState<'follows' | 'news' | null>(null);
@@ -202,6 +213,14 @@ export const NotificationCenter: React.FC = () => {
   const optimisticReadAllRef = useRef<boolean>(false);
   const initializedRef = useRef(false);
   const toastTimerRef = useRef<number | null>(null);
+
+  const toggleExpandedId = (id: string) => {
+    setExpandedIds((prev) => ({ ...prev, [id]: !prev[id] }));
+  };
+
+  useEffect(() => {
+    setToastExpanded(false);
+  }, [toastNotif?.id]);
 
   const fetchPreferences = useCallback(async () => {
     if (!user?.id) return;
@@ -474,15 +493,15 @@ export const NotificationCenter: React.FC = () => {
         </button>
 
         {open && (
-          <div className="absolute right-0 mt-2 w-80 sm:w-96 rounded-xl bg-[#100f14] border border-white/[0.1] shadow-2xl overflow-hidden z-50 animate-fadeIn">
-            <div className="flex items-center justify-between px-3.5 py-2.5 border-b border-white/[0.07] bg-[#14131a]">
-              <div className="flex items-center gap-2">
+          <div className="fixed left-2 right-2 top-[4.25rem] w-auto max-h-[calc(100dvh-5.5rem)] flex flex-col sm:absolute sm:left-auto sm:right-0 sm:top-auto sm:mt-2 sm:w-96 sm:max-h-[78dvh] rounded-xl bg-[#100f14] border border-white/[0.1] shadow-2xl overflow-hidden z-50 animate-fadeIn">
+            <div className="shrink-0 flex items-center justify-between px-3.5 py-2.5 border-b border-white/[0.07] bg-[#14131a]">
+              <div className="flex items-center gap-2 min-w-0">
                 <span className="font-mono text-[11px] uppercase tracking-wider text-[#f2eee9]">
-                  Уведомления
+                  {lang === 'ru' ? 'Уведомления' : 'Notifications'}
                 </span>
                 {unreadCount > 0 && (
                   <span className="font-mono text-[10px] text-[#e28593] tabular-nums">
-                    {unreadCount} новых
+                    {unreadCount} {lang === 'ru' ? 'новых' : 'new'}
                   </span>
                 )}
               </div>
@@ -490,37 +509,50 @@ export const NotificationCenter: React.FC = () => {
                 <button
                   type="button"
                   onClick={handleMarkAllRead}
-                  className="inline-flex items-center gap-1 font-mono text-[10px] text-[#8e877e] hover:text-white transition-colors cursor-pointer"
+                  className="inline-flex items-center gap-1 font-mono text-[10px] text-[#8e877e] hover:text-white transition-colors cursor-pointer shrink-0"
                 >
                   <CheckCheck className="w-3.5 h-3.5" />
-                  <span>Прочитать все</span>
+                  <span>{lang === 'ru' ? 'Прочитать все' : 'Mark all read'}</span>
                 </button>
               )}
             </div>
 
-            <div className="max-h-80 overflow-y-auto divide-y divide-white/[0.05]">
+            <div className="flex-1 min-h-0 max-h-80 sm:max-h-96 overflow-y-auto overscroll-contain divide-y divide-white/[0.05]">
               {notifications.length === 0 ? (
                 <div className="py-10 px-4 text-center space-y-1.5">
                   <MessageSquare className="w-5 h-5 text-[#57514b] mx-auto" />
-                  <p className="text-xs text-[#8e877e]">Пока нет уведомлений</p>
+                  <p className="text-xs text-[#8e877e]">
+                    {lang === 'ru' ? 'Пока нет уведомлений' : 'No notifications yet'}
+                  </p>
                   <p className="text-[11px] text-[#635c54]">
-                    Когда кто-то ответит на вашу тему, работу или комментарий, это появится здесь.
+                    {lang === 'ru'
+                      ? 'Когда кто-то ответит на вашу тему, работу или комментарий, это появится здесь.'
+                      : 'Replies to your threads, works, or comments will appear here.'}
                   </p>
                 </div>
               ) : (
                 notifications.map((n) => {
                   const meta = getNotificationActionText(n);
+                  const isLong = isLongNotificationContent(n);
+                  const isExpanded = Boolean(expandedIds[n.id]);
                   return (
-                    <button
+                    <div
                       key={n.id}
-                      type="button"
+                      role="button"
+                      tabIndex={0}
                       onClick={() => openNotificationTarget(n)}
-                      className={`w-full text-left px-3.5 py-3 transition-colors hover:bg-white/[0.04] cursor-pointer space-y-1 ${
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault();
+                          openNotificationTarget(n);
+                        }
+                      }}
+                      className={`w-full text-left px-3.5 py-3 transition-colors hover:bg-white/[0.04] cursor-pointer space-y-1 focus:outline-none focus-visible:bg-white/[0.06] ${
                         n.is_read ? 'opacity-70' : 'bg-[#17121a]/70'
                       }`}
                     >
                       <div className="flex items-center justify-between gap-2 text-[11px]">
-                        <span className="font-medium text-[#f2eee9] truncate">
+                        <span className="font-medium text-[#f2eee9] truncate min-w-0">
                           {meta.hideActorPrefix ? (
                             <span className="text-[#e28593]">{meta.verb}</span>
                           ) : (
@@ -534,21 +566,54 @@ export const NotificationCenter: React.FC = () => {
                           {formatNotifTime(n.created_at)}
                         </span>
                       </div>
-                      <div className="text-[11px] text-[#a39b8b] truncate">
+                      <div
+                        className={`text-[11px] text-[#a39b8b] ${
+                          isExpanded ? 'whitespace-normal break-words' : 'truncate'
+                        }`}
+                      >
                         {targetTypeLabel(n.target_type)} · {n.target_title}
                       </div>
                       {n.excerpt && (
-                        <p className="text-xs text-[#ded8ce] line-clamp-2 leading-snug">
+                        <p
+                          className={`text-xs text-[#ded8ce] leading-snug break-words ${
+                            isExpanded ? 'whitespace-pre-wrap' : 'line-clamp-2'
+                          }`}
+                        >
                           «{n.excerpt}»
                         </p>
                       )}
-                    </button>
+                      {isLong && (
+                        <div className="pt-0.5">
+                          <button
+                            type="button"
+                            aria-expanded={isExpanded}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              toggleExpandedId(n.id);
+                            }}
+                            className="inline-flex items-center gap-1 font-mono text-[10px] uppercase tracking-wider text-[#e28593] hover:text-white transition-colors cursor-pointer py-0.5"
+                          >
+                            {isExpanded ? (
+                              <>
+                                <ChevronUp className="w-3 h-3" />
+                                <span>{lang === 'ru' ? 'Свернуть' : 'Collapse'}</span>
+                              </>
+                            ) : (
+                              <>
+                                <ChevronDown className="w-3 h-3" />
+                                <span>{lang === 'ru' ? 'Ещё' : 'Show more'}</span>
+                              </>
+                            )}
+                          </button>
+                        </div>
+                      )}
+                    </div>
                   );
                 })
               )}
             </div>
 
-            <div className="px-3.5 py-2.5 border-t border-white/[0.06] bg-[#131218] space-y-2">
+            <div className="shrink-0 px-3.5 py-2.5 border-t border-white/[0.06] bg-[#131218] space-y-2">
               <div className="flex items-center justify-between gap-2">
                 <span className="text-[11px] text-[#ded8ce]">Уведомления от подписок</span>
                 <button
@@ -589,37 +654,78 @@ export const NotificationCenter: React.FC = () => {
               </div>
             </div>
 
-            <BrowserNotificationsControl compact />
+            <div className="shrink-0">
+              <BrowserNotificationsControl compact />
+            </div>
           </div>
         )}
       </div>
 
       {/* Live In-App News / Reply Toast Widget */}
       {toastNotif && (
-        <div className="fixed bottom-24 right-4 z-[60] w-80 max-w-[calc(100vw-2rem)] rounded-xl bg-[#121017] border border-[#d92638]/55 shadow-2xl p-3.5 animate-fadeIn space-y-2.5">
+        <div className="fixed bottom-28 sm:bottom-24 left-3 right-3 sm:left-auto sm:right-4 z-[60] w-auto sm:w-80 sm:max-w-[calc(100vw-2rem)] rounded-xl bg-[#121017] border border-[#d92638]/55 shadow-2xl p-3.5 animate-fadeIn space-y-2.5">
           <div className="flex items-start justify-between gap-2">
             <div className="flex-1 text-left space-y-1 min-w-0">
               <div className="flex items-center gap-1.5 text-[11px] font-mono text-[#e28593]">
                 <Bell className="w-3.5 h-3.5 shrink-0" />
                 <span className="truncate">
                   {toastNotif.type === 'news'
-                    ? 'Новости сайта'
+                    ? (lang === 'ru' ? 'Новости сайта' : 'Site News')
                     : `${toastNotif.actor_name} · ${targetTypeLabel(toastNotif.target_type)}`}
                 </span>
               </div>
-              <div className="text-xs font-medium text-[#f2eee9] line-clamp-2">
-                {toastNotif.target_title}
+              <div
+                className={
+                  toastExpanded
+                    ? 'max-h-[42dvh] overflow-y-auto overscroll-contain pr-1 space-y-1.5'
+                    : 'space-y-1'
+                }
+              >
+                <div
+                  className={`text-xs font-medium text-[#f2eee9] break-words ${
+                    toastExpanded ? 'whitespace-normal' : 'line-clamp-2'
+                  }`}
+                >
+                  {toastNotif.target_title}
+                </div>
+                {toastNotif.excerpt && (
+                  <p
+                    className={`text-[11px] text-[#c7c0b6] leading-snug break-words ${
+                      toastExpanded ? 'whitespace-pre-wrap' : 'line-clamp-2'
+                    }`}
+                  >
+                    «{toastNotif.excerpt}»
+                  </p>
+                )}
               </div>
-              {toastNotif.excerpt && (
-                <p className="text-[11px] text-[#c7c0b6] line-clamp-2 leading-snug">
-                  «{toastNotif.excerpt}»
-                </p>
+              {isLongNotificationContent(toastNotif) && (
+                <button
+                  type="button"
+                  aria-expanded={toastExpanded}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setToastExpanded((prev) => !prev);
+                  }}
+                  className="inline-flex items-center gap-1 font-mono text-[10px] uppercase tracking-wider text-[#e28593] hover:text-white transition-colors cursor-pointer pt-0.5"
+                >
+                  {toastExpanded ? (
+                    <>
+                      <ChevronUp className="w-3 h-3" />
+                      <span>{lang === 'ru' ? 'Свернуть' : 'Collapse'}</span>
+                    </>
+                  ) : (
+                    <>
+                      <ChevronDown className="w-3 h-3" />
+                      <span>{lang === 'ru' ? 'Ещё' : 'Show more'}</span>
+                    </>
+                  )}
+                </button>
               )}
             </div>
             <button
               type="button"
               onClick={dismissToastOnly}
-              aria-label="Закрыть уведомление"
+              aria-label={lang === 'ru' ? 'Закрыть уведомление' : 'Dismiss notification'}
               className="p-1 text-[#736c64] hover:text-white cursor-pointer shrink-0"
             >
               <X className="w-3.5 h-3.5" />
@@ -631,14 +737,14 @@ export const NotificationCenter: React.FC = () => {
               onClick={dismissToastOnly}
               className="px-2.5 py-1 rounded-md border border-white/[0.1] bg-white/[0.03] hover:bg-white/[0.08] text-[11px] font-mono text-[#b5aea4] hover:text-white transition-colors cursor-pointer"
             >
-              Закрыть
+              {lang === 'ru' ? 'Закрыть' : 'Close'}
             </button>
             <button
               type="button"
               onClick={() => openNotificationTarget(toastNotif)}
               className="px-2.5 py-1 rounded-md bg-[#821c2c] hover:bg-[#9b2336] text-[11px] font-mono text-white transition-colors cursor-pointer"
             >
-              Открыть
+              {lang === 'ru' ? 'Открыть' : 'Open'}
             </button>
           </div>
         </div>
