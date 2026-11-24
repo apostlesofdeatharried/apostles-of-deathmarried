@@ -50,7 +50,10 @@ let bucketEnsured = false;
 let lastBackupAt = 0;
 let lastBackupError: string | null = null;
 let lastSyncedSha256: string | null = null;
+let lastSyncedEtag: string | null = null;
+let lastSyncedModified: string | null = null;
 let lastSyncCheckedAt = 0;
+let lastCloudFreshCheckAt = 0;
 
 // Serializes all database pull/push operations on this process so concurrent requests
 // never overwrite each other's DB handle or drop a mutation upload.
@@ -215,10 +218,16 @@ async function uploadCurrentDatabaseInternal(): Promise<SyncPushResult> {
       });
 
       if (res.ok) {
-        lastBackupAt = Date.now();
+        const now = Date.now();
+        const uploadedEtag = res.headers.get('etag')?.trim() || null;
+        const uploadedModified = res.headers.get('last-modified')?.trim() || null;
+        lastBackupAt = now;
         lastBackupError = null;
         lastSyncedSha256 = localSha;
-        lastSyncCheckedAt = Date.now();
+        lastSyncedEtag = uploadedEtag;
+        lastSyncedModified = uploadedModified;
+        lastSyncCheckedAt = now;
+        lastCloudFreshCheckAt = now;
         isCloudRestored = true;
         cloudRestoreStatus = 'restored';
         cloudRestoreError = null;
@@ -254,6 +263,21 @@ async function uploadCurrentDatabaseInternal(): Promise<SyncPushResult> {
   }
 
   return { ok: false, error: lastBackupError || 'Unknown backup error' };
+}
+
+function applyDownloadedDatabaseBuffer(buffer: Buffer): boolean {
+  const remoteSha = computeSha256(buffer);
+  const shouldReplace = !isCloudRestored || remoteSha !== lastSyncedSha256;
+
+  if (shouldReplace) {
+    hooks.replaceDb(buffer);
+    if (hooks.replaceDb === replaceDatabaseWithBuffer) {
+      ensureSchemaAndMigrations(getDb());
+    }
+    lastSyncedSha256 = remoteSha;
+  }
+
+  return shouldReplace;
 }
 
 /**
@@ -316,18 +340,12 @@ async function pullDatabaseFromSupabaseInternal(options: {
         return { updated: false, error: msg };
       }
 
-      const remoteSha = computeSha256(buffer);
-      const shouldReplace = !isCloudRestored || remoteSha !== lastSyncedSha256;
-
-      if (shouldReplace) {
-        hooks.replaceDb(buffer);
-        if (hooks.replaceDb === replaceDatabaseWithBuffer) {
-          ensureSchemaAndMigrations(getDb());
-        }
-        lastSyncedSha256 = remoteSha;
-      }
-
-      lastSyncCheckedAt = Date.now();
+      const shouldReplace = applyDownloadedDatabaseBuffer(buffer);
+      const now = Date.now();
+      lastSyncedEtag = res.headers.get('etag')?.trim() || null;
+      lastSyncedModified = res.headers.get('last-modified')?.trim() || null;
+      lastSyncCheckedAt = now;
+      lastCloudFreshCheckAt = now;
       isCloudRestored = true;
       cloudRestoreStatus = 'restored';
       cloudRestoreError = null;
@@ -344,7 +362,9 @@ async function pullDatabaseFromSupabaseInternal(options: {
     }
 
     if (res.status === 404) {
-      lastSyncCheckedAt = Date.now();
+      const now = Date.now();
+      lastSyncCheckedAt = now;
+      lastCloudFreshCheckAt = now;
       isCloudRestored = true;
       cloudRestoreStatus = 'not_found';
       cloudRestoreError = null;
@@ -357,7 +377,9 @@ async function pullDatabaseFromSupabaseInternal(options: {
     const errText = await res.text().catch(() => '');
     // Supabase Storage sometimes wraps object-not-found / bucket-not-found as HTTP 400
     if (res.status === 400 && /not[_\s-]?found|404/i.test(errText)) {
-      lastSyncCheckedAt = Date.now();
+      const now = Date.now();
+      lastSyncCheckedAt = now;
+      lastCloudFreshCheckAt = now;
       isCloudRestored = true;
       cloudRestoreStatus = 'not_found';
       cloudRestoreError = null;
@@ -383,6 +405,136 @@ async function pullDatabaseFromSupabaseInternal(options: {
     console.error('[CloudSync] Cold-start restore failed:', errMsg);
     return { updated: false, error: errMsg };
   }
+}
+
+/**
+ * Lightweight multi-container freshness check for warm serverless instances.
+ * - Uses conditional GET (`If-None-Match: <lastSyncedEtag>` / `If-Modified-Since`) so unchanged remote DB returns HTTP 304 with 0 downloaded bytes.
+ * - Throttled on read requests (`minIntervalMs`, default 2500ms) and mandatory (`force: true`) before write requests.
+ * - Whenever a newer remote snapshot is detected, atomically swaps `/tmp/apostles.db` and runs `ensureSchemaAndMigrations(getDb())`.
+ */
+async function syncIfCloudNewerInternal(options: {
+  force?: boolean;
+  minIntervalMs?: number;
+} = {}): Promise<SyncPullResult> {
+  if (!isSupabaseConfigured()) {
+    isCloudRestored = true;
+    cloudRestoreStatus = 'skipped';
+    cloudRestoreError = null;
+    return { updated: false, notModified: true };
+  }
+
+  if (!isCloudRestored) {
+    return pullDatabaseFromSupabaseInternal({ force: true });
+  }
+
+  const minInterval = options.minIntervalMs ?? 2500;
+  if (!options.force && minInterval > 0 && Date.now() - lastCloudFreshCheckAt < minInterval) {
+    return { updated: false, notModified: true };
+  }
+
+  const baseUrl = getSupabaseBaseUrl();
+  const bucketName = getBucketName();
+  const objectUrl = `${baseUrl}/storage/v1/object/${encodeURIComponent(bucketName)}/${encodeObjectPath(DB_OBJECT_PATH)}`;
+
+  const headers: Record<string, string> = {
+    ...getSupabaseHeaders(),
+    'Cache-Control': 'no-cache, no-store, must-revalidate',
+    Pragma: 'no-cache',
+  };
+  if (lastSyncedEtag) {
+    headers['If-None-Match'] = lastSyncedEtag;
+  } else if (lastSyncedModified) {
+    headers['If-Modified-Since'] = lastSyncedModified;
+  }
+
+  try {
+    const res = await hooks.fetchImpl(objectUrl, {
+      method: 'GET',
+      headers,
+      cache: 'no-store',
+      signal: AbortSignal.timeout(SUPABASE_STARTUP_TIMEOUT_MS),
+    });
+
+    if (res.status === 304) {
+      const now = Date.now();
+      const etag = res.headers.get('etag')?.trim();
+      if (etag) lastSyncedEtag = etag;
+      lastCloudFreshCheckAt = now;
+      lastSyncCheckedAt = now;
+      return { updated: false, notModified: true };
+    }
+
+    if (res.ok) {
+      const remoteEtag = res.headers.get('etag')?.trim() || null;
+      const remoteModified = res.headers.get('last-modified')?.trim() || null;
+      if (remoteEtag && lastSyncedEtag && remoteEtag === lastSyncedEtag) {
+        const now = Date.now();
+        lastCloudFreshCheckAt = now;
+        lastSyncCheckedAt = now;
+        return { updated: false, notModified: true };
+      }
+
+      const arrayBuffer = await res.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+      if (!isValidSqliteBuffer(buffer)) {
+        const msg = `Remote snapshot is not a valid SQLite database (${buffer.length} bytes)`;
+        lastBackupError = msg;
+        console.error(`[CloudSync] ${msg}`);
+        return { updated: false, error: msg };
+      }
+
+      const shouldReplace = applyDownloadedDatabaseBuffer(buffer);
+      const now = Date.now();
+      lastSyncedEtag = remoteEtag;
+      lastSyncedModified = remoteModified;
+      lastCloudFreshCheckAt = now;
+      lastSyncCheckedAt = now;
+      cloudRestoreStatus = 'restored';
+      cloudRestoreError = null;
+      lastBackupError = null;
+      return {
+        updated: shouldReplace,
+        notModified: !shouldReplace,
+      };
+    }
+
+    if (res.status === 404) {
+      const now = Date.now();
+      lastCloudFreshCheckAt = now;
+      lastSyncCheckedAt = now;
+      return { updated: false, notFound: true };
+    }
+
+    const errText = await res.text().catch(() => '');
+    if (res.status === 400 && /not[_\s-]?found|404/i.test(errText)) {
+      const now = Date.now();
+      lastCloudFreshCheckAt = now;
+      lastSyncCheckedAt = now;
+      return { updated: false, notFound: true };
+    }
+
+    const errMsg = `Freshness check HTTP ${res.status}${errText ? `: ${errText.slice(0, 180)}` : ''}`;
+    lastBackupError = errMsg;
+    return { updated: false, error: errMsg };
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : 'freshness check failed';
+    lastBackupError = errMsg;
+    return { updated: false, error: errMsg };
+  }
+}
+
+export async function syncIfCloudNewer(options: {
+  force?: boolean;
+  minIntervalMs?: number;
+} = {}): Promise<SyncPullResult> {
+  if (!isSupabaseConfigured()) {
+    isCloudRestored = true;
+    cloudRestoreStatus = 'skipped';
+    cloudRestoreError = null;
+    return { updated: false, notModified: true };
+  }
+  return enqueueSyncOp(() => syncIfCloudNewerInternal(options));
 }
 
 /**
@@ -648,6 +800,8 @@ export function getCloudSyncStatus() {
     last_backup_at: lastBackupAt ? new Date(lastBackupAt).toISOString() : null,
     last_backup_error: lastBackupError,
     last_synced_sha256: lastSyncedSha256 ? lastSyncedSha256.slice(0, 12) : null,
+    last_synced_etag: lastSyncedEtag,
+    last_synced_modified: lastSyncedModified,
   };
 }
 
@@ -663,7 +817,10 @@ export function _configureCloudSyncForTests(partial?: Partial<CloudSyncHooks>) {
   lastBackupAt = 0;
   lastBackupError = null;
   lastSyncedSha256 = null;
+  lastSyncedEtag = null;
+  lastSyncedModified = null;
   lastSyncCheckedAt = 0;
+  lastCloudFreshCheckAt = 0;
   syncQueue = Promise.resolve();
   hooks = {
     fetchImpl: partial?.fetchImpl || fetch,

@@ -100,6 +100,7 @@ interface DailyLyricsRound {
 
 const GUEST_STORAGE_KEYS = {
   guess: 'apostles_guest_daily_track_v2',
+  quiz: 'apostles_guest_daily_quiz_v1',
   lyrics: 'apostles_guest_daily_lyrics_v1',
   reverse: 'apostles_guest_daily_reverse_v1',
   speed: 'apostles_guest_daily_speed_v1',
@@ -467,9 +468,30 @@ export const GamesView: React.FC = () => {
           setQuizQuestions([]);
         } else {
           setQuizQuestions(data.questions || []);
-          setAlreadyCompletedDaily(Boolean(data.alreadyPlayed || data.completed || data.already_completed));
-          setPreviousScore(data.previous_score || 0);
-          setPreviousXp(data.previous_xp || 0);
+          const serverCompleted = Boolean(data.alreadyPlayed || data.completed || data.already_completed);
+          if (serverCompleted) {
+            setAlreadyCompletedDaily(true);
+            setPreviousScore(data.previous_score || 0);
+            setPreviousXp(data.previous_xp || 0);
+          } else if (!user && data.challenge_date) {
+            const guestSaved = readGuestAttempt<{ score: number; total_xp: number }>(
+              GUEST_STORAGE_KEYS.quiz,
+              data.challenge_date
+            );
+            if (guestSaved) {
+              setAlreadyCompletedDaily(true);
+              setPreviousScore(Number(guestSaved.result?.score) || 0);
+              setPreviousXp(Number(guestSaved.result?.total_xp) || 0);
+            } else {
+              setAlreadyCompletedDaily(false);
+              setPreviousScore(0);
+              setPreviousXp(0);
+            }
+          } else {
+            setAlreadyCompletedDaily(false);
+            setPreviousScore(data.previous_score || 0);
+            setPreviousXp(data.previous_xp || 0);
+          }
           setQuizStartTime(Date.now());
         }
       } else {
@@ -483,7 +505,7 @@ export const GamesView: React.FC = () => {
         setQuizLoading(false);
       }
     }
-  }, []);
+  }, [user]);
 
   const loadLyricsRound = useCallback(async () => {
     const reqId = ++lyricsLoadSeqRef.current;
@@ -1125,6 +1147,12 @@ export const GamesView: React.FC = () => {
         setQuizResult(data);
         setQuizSubmitted(true);
         setAlreadyCompletedDaily(true);
+        if (!user && quizChallengeDate) {
+          saveGuestAttempt(GUEST_STORAGE_KEYS.quiz, quizChallengeDate, 'submitted', {
+            score: Number(data.base_score) || Number(data.correct_count) || 0,
+            total_xp: Number(data.total_xp) || 0,
+          });
+        }
         if (data.correct_count === data.total) confetti({ particleCount: 60, spread: 70, origin: { y: 0.6 } });
         if (data.newly_unlocked_achievements?.length > 0) dispatchAchievementUnlocked(data.newly_unlocked_achievements);
         if (user) await refresh();

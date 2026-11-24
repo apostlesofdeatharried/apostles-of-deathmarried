@@ -438,4 +438,94 @@ describe('Production fixes: profile email verification, notifications, fast reve
     const aliceLb3 = lbData3.leaders.find((l: any) => l.nickname === 'alice');
     assert.equal(aliceLb3, undefined, 'Reset user must be removed from leaderboard');
   });
+
+  it('5. Shop single-source pricing: GET /api/shop & /api/shop/items match POST /api/shop/buy exact XP deduction with no-store headers, and replay returns 409', async () => {
+    // Credit Bob exactly 300 XP so he can buy a 180 XP item cleanly
+    dbMod.db
+      .prepare('UPDATE profiles SET xp = 300, total_xp = 300, level = 2 WHERE user_id = ?')
+      .run('usr_b_test');
+
+    const shopRes1 = await fetch(`${baseUrl}/api/shop/items`, {
+      headers: { Authorization: `Bearer ${userBToken}` },
+    });
+    assert.equal(shopRes1.status, 200);
+    assert.match(shopRes1.headers.get('cache-control') || '', /no-store/i);
+    const shopBody1 = (await shopRes1.json()) as any;
+    assert.equal(shopBody1.items.length, 86, 'Shop API must return all 86 customization items');
+
+    const shopAliasRes = await fetch(`${baseUrl}/api/shop`, {
+      headers: { Authorization: `Bearer ${userBToken}` },
+    });
+    assert.equal(shopAliasRes.status, 200);
+    assert.match(shopAliasRes.headers.get('cache-control') || '', /no-store/i);
+    const shopAliasBody = (await shopAliasRes.json()) as any;
+
+    const targetItem = shopBody1.items.find((i: any) => i.id === 'effect_midnight_ash');
+    const aliasItem = shopAliasBody.items.find((i: any) => i.id === 'effect_midnight_ash');
+    assert.ok(targetItem && aliasItem);
+    assert.equal(targetItem.cost_xp, 180);
+    assert.equal(targetItem.price, 180);
+    assert.equal(aliasItem.cost_xp, 180);
+
+    const buyRes = await fetch(`${baseUrl}/api/shop/buy`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${userBToken}`,
+      },
+      body: JSON.stringify({ item_id: 'effect_midnight_ash' }),
+    });
+    assert.equal(buyRes.status, 200);
+    assert.match(buyRes.headers.get('cache-control') || '', /no-store/i);
+    const buyBody = (await buyRes.json()) as any;
+    assert.equal(buyBody.cost_xp, 180);
+    assert.equal(buyBody.xp_spent, 180);
+    const achBonus = Array.isArray(buyBody.newly_unlocked_achievements)
+      ? buyBody.newly_unlocked_achievements.reduce((s: number, a: any) => s + (Number(a?.xp_reward) || 0), 0)
+      : 0;
+    assert.equal(buyBody.new_xp, 300 - 180 + achBonus);
+    assert.equal(buyBody.profile.total_xp, 300 + achBonus);
+    assert.equal(buyBody.profile.level, buyBody.level);
+
+    // Anti-farm replay check: playing guess-track twice in same 12h MSK window returns 409 and awards 0 XP
+    const r1 = await fetch(`${baseUrl}/api/games/guess-track/round`, {
+      headers: { Authorization: `Bearer ${userBToken}` },
+    });
+    assert.equal(r1.status, 200);
+    assert.match(r1.headers.get('cache-control') || '', /no-store/i);
+    const r1Data = (await r1.json()) as any;
+
+    const v1 = await fetch(`${baseUrl}/api/games/guess-track/verify`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${userBToken}`,
+      },
+      body: JSON.stringify({
+        round_token: r1Data.round_token,
+        challenge_date: r1Data.challenge_date,
+        selected_track_id: r1Data.options[0].id,
+        time_spent: 3,
+      }),
+    });
+    assert.equal(v1.status, 200);
+
+    const v2 = await fetch(`${baseUrl}/api/games/guess-track/verify`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${userBToken}`,
+      },
+      body: JSON.stringify({
+        round_token: r1Data.round_token,
+        challenge_date: r1Data.challenge_date,
+        selected_track_id: r1Data.options[0].id,
+        time_spent: 3,
+      }),
+    });
+    assert.equal(v2.status, 409);
+    const v2Data = (await v2.json()) as any;
+    assert.equal(v2Data.alreadyPlayed, true);
+    assert.equal(v2Data.xp_earned, 0);
+  });
 });

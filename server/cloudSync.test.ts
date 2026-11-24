@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import Database from 'better-sqlite3';
 import {
   syncCloudDatabase,
+  syncIfCloudNewer,
   ensureCloudDatabaseRestored,
   pushDatabaseBackupNow,
   uploadDatabaseToCloud,
@@ -370,6 +371,108 @@ test('CloudSync push surfaces errors cleanly, serializes concurrent writes, and 
     assert.equal(signed.objectPath, 'media/s_myortvymi_test_1.mp3');
     assert.match(signed.objectPath, /^media\/[a-z0-9_.-]+$/);
     assert.ok(signedRequestUrl.endsWith('/media/s_myortvymi_test_1.mp3'));
+  } finally {
+    _configureCloudSyncForTests();
+    if (prevUrl === undefined) delete process.env.SUPABASE_URL;
+    else process.env.SUPABASE_URL = prevUrl;
+    if (prevKey === undefined) delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+    else process.env.SUPABASE_SERVICE_ROLE_KEY = prevKey;
+  }
+});
+
+test('syncIfCloudNewer tracks ETag, returns 304 without replacing DB, throttles reads, and hot-swaps when Container A levels up a user', async () => {
+  const prevUrl = process.env.SUPABASE_URL;
+  const prevKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  process.env.SUPABASE_URL = 'https://test-project.supabase.co';
+  process.env.SUPABASE_SERVICE_ROLE_KEY = 'test-service-role-key';
+
+  try {
+    // Container A initial DB: user at level 1 with 0 achievements
+    const dbContainerA = new Database(':memory:');
+    dbContainerA.exec(`
+      CREATE TABLE profiles (user_id TEXT PRIMARY KEY, level INTEGER NOT NULL, xp INTEGER NOT NULL, total_xp INTEGER NOT NULL);
+      CREATE TABLE user_achievements (user_id TEXT NOT NULL, achievement_slug TEXT NOT NULL, PRIMARY KEY (user_id, achievement_slug));
+      INSERT INTO profiles (user_id, level, xp, total_xp) VALUES ('u_1', 1, 50, 50);
+    `);
+
+    let remoteBuf: Buffer = dbContainerA.serialize();
+    let remoteEtag = '"etag-v1"';
+    let containerBBuf: Buffer = Buffer.alloc(0);
+    let containerBDb: Database.Database | null = null;
+    let replaceCalls = 0;
+    let networkGetCalls = 0;
+    const seenIfNoneMatch: Array<string | null> = [];
+
+    const mockFetch: typeof fetch = async (input, init) => {
+      const url = String(input);
+      const method = (init?.method || 'GET').toUpperCase();
+      const headers = new Headers(init?.headers || {});
+      if (url.includes('/storage/v1/object/') && method === 'GET') {
+        networkGetCalls += 1;
+        const inm = headers.get('if-none-match');
+        seenIfNoneMatch.push(inm);
+        if (inm && inm === remoteEtag) {
+          return new Response(null, { status: 304, headers: { ETag: remoteEtag } });
+        }
+        return new Response(new Uint8Array(remoteBuf), {
+          status: 200,
+          headers: { ETag: remoteEtag },
+        });
+      }
+      return new Response('Not found', { status: 404 });
+    };
+
+    _configureCloudSyncForTests({
+      fetchImpl: mockFetch,
+      serializeDb: () => containerBBuf,
+      replaceDb: (buf) => {
+        replaceCalls += 1;
+        containerBBuf = Buffer.from(buf);
+        containerBDb?.close();
+        containerBDb = new Database(containerBBuf);
+      },
+    });
+
+    // 1. Cold-start restore on Container B pulls v1 and records ETag
+    await ensureCloudDatabaseRestored();
+    assert.equal(replaceCalls, 1);
+    assert.equal(getCloudSyncStatus().last_synced_etag, '"etag-v1"');
+    assert.equal((containerBDb!.prepare('SELECT level FROM profiles WHERE user_id = ?').get('u_1') as any).level, 1);
+
+    // 2. Read check within minIntervalMs is throttled -> 0 network calls
+    const throttledRes = await syncIfCloudNewer({ minIntervalMs: 60000 });
+    assert.equal(throttledRes.notModified, true);
+    assert.equal(networkGetCalls, 1);
+
+    // 3. Forced check sends If-None-Match: "etag-v1" -> receives 304 -> 0 DB swaps
+    const notModifiedRes = await syncIfCloudNewer({ force: true });
+    assert.equal(notModifiedRes.updated, false);
+    assert.equal(notModifiedRes.notModified, true);
+    assert.equal(seenIfNoneMatch.at(-1), '"etag-v1"');
+    assert.equal(replaceCalls, 1);
+    assert.equal(networkGetCalls, 2);
+
+    // 4. Container A levels user up 1 -> 2 and unlocks an achievement, publishing new ETag
+    dbContainerA.exec(`
+      UPDATE profiles SET level = 2, xp = 200, total_xp = 200 WHERE user_id = 'u_1';
+      INSERT INTO user_achievements (user_id, achievement_slug) VALUES ('u_1', 'first_blood');
+    `);
+    remoteBuf = dbContainerA.serialize();
+    remoteEtag = '"etag-v2"';
+
+    // 5. Container B runs pre-write/unthrottled freshness check -> sees ETag mismatch -> hot-swaps!
+    const updatedRes = await syncIfCloudNewer({ minIntervalMs: 0 });
+    assert.equal(updatedRes.updated, true);
+    assert.equal(replaceCalls, 2);
+    assert.equal(getCloudSyncStatus().last_synced_etag, '"etag-v2"');
+    assert.equal((containerBDb!.prepare('SELECT level FROM profiles WHERE user_id = ?').get('u_1') as any).level, 2);
+    const achCount = (
+      containerBDb!.prepare("SELECT COUNT(*) as c FROM user_achievements WHERE user_id = 'u_1' AND achievement_slug = 'first_blood'").get() as any
+    ).c;
+    assert.equal(achCount, 1);
+
+    dbContainerA.close();
+    (containerBDb as Database.Database | null)?.close();
   } finally {
     _configureCloudSyncForTests();
     if (prevUrl === undefined) delete process.env.SUPABASE_URL;

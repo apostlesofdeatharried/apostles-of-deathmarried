@@ -775,7 +775,7 @@ describe('SQLite additive migrations on legacy Stage 1–6 databases', () => {
         ['badge_nocturne', 'Иконка «Луна»', 'Moon Icon', 'Старый значок 2', 'Old badge 2', 'badge', 220, 'Moon'],
         ['theme_ash_velvet', 'Тема «Пепельный бархат»', 'Ash Velvet', 'Старая тема', 'Old theme', 'theme', 190, 'theme_ash_velvet'],
         ['theme_crimson_sanctum', 'Тема «Тёмный кармин»', 'Dark Carmine', 'Старая тема 2', 'Old theme 2', 'theme', 900, 'theme_crimson_sanctum'],
-        ['effect_midnight_ash', 'Эффект «Ночной пепел»', 'Midnight Ash', 'Старый эффект', 'Old effect', 'effect', 180, 'effect_midnight_ash'],
+        ['effect_midnight_ash', 'Эффект «Ночной пепел»', 'Midnight Ash', 'Старый эффект', 'Old effect', 'effect', 80, 'effect_midnight_ash'],
         ['shield_novichok', 'Шилд «новичок»', 'Shield: novichok', 'Старый шилд', 'Old shield', 'title', 100, 'shield_novichok'],
         ['title_nocturne_listener', 'Титул слушателя', 'Listener Title', 'Устаревший титул', 'Legacy title', 'title', 150, 'title_nocturne_listener'],
       ] as const;
@@ -860,6 +860,12 @@ describe('SQLite additive migrations on legacy Stage 1–6 databases', () => {
       assert.equal(prof.equipped_frame, 'border-2 border-white/30');
       assert.equal(prof.equipped_banner, 'banner_tex_graphite_grain');
       assert.equal(prof.equipped_title, 'shield_slushatel');
+
+      // Verify legacy stale shop price (80 XP) was overwritten to canonical 180 XP on migration
+      const updatedEffect = testDb
+        .prepare('SELECT cost_xp FROM shop_items WHERE id = ?')
+        .get('effect_midnight_ash') as { cost_xp: number };
+      assert.equal(updatedEffect.cost_xp, 180, 'Legacy 80 XP price must sync cleanly to canonical 180 XP');
     } finally {
       testDb.close();
     }

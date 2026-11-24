@@ -18,6 +18,7 @@ import { executeAdminUserReset } from './server/adminUserReset.js';
 import {
   ensureCloudDatabaseRestored,
   syncCloudDatabase,
+  syncIfCloudNewer,
   pushDatabaseBackupNow,
   getCloudSyncStatus,
   isSupabaseConfigured,
@@ -133,7 +134,6 @@ initDatabase();
 // Baseline security headers
 app.use((_req: Request, res: Response, next: NextFunction) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   next();
 });
@@ -209,16 +209,32 @@ async function flushCloudBackupAndRespond(
   res.status(statusCode).json(body);
 }
 
-// Cold-start-only restore + write-through backup on mutations.
+// Cold-start restore + ETag-based warm-container sync + write-through backup on mutations.
 // CRITICAL: DB backup upload to Supabase Storage ONLY runs after successful mutating requests (POST/PUT/PATCH/DELETE).
-// GET requests restore strictly once per container cold start and never download/upload afterwards.
+// Reads check ETag freshness at most once every 2.5s (HTTP 304 = 0 bytes), while writes force a fresh ETag check first.
 app.use(async (req: Request, res: Response, next: NextFunction) => {
   if (req.path.startsWith('/api') || req.path.startsWith('/uploads')) {
     if (isSupabaseConfigured()) {
       await ensureCloudDatabaseRestored();
 
+      const isApiRoute = req.path.startsWith('/api') && req.path !== '/api/health';
       const isMutation =
         MUTATING_HTTP_METHODS.has(req.method) && !STATELESS_POST_PATHS.has(req.path);
+
+      if (isApiRoute && isMutation) {
+        const pullRes = await syncIfCloudNewer({ force: true });
+        if (pullRes.error) {
+          res.status(503).json({
+            error: 'Не удалось синхронизировать актуальное состояние базы данных. Повторите попытку через пару секунд.',
+            cloud_sync_error: pullRes.error,
+          });
+          return;
+        }
+        res.locals.cloudSyncPreChecked = true;
+      } else if (isApiRoute && (req.method === 'GET' || req.method === 'HEAD')) {
+        await syncIfCloudNewer({ minIntervalMs: 2500 });
+        res.locals.cloudSyncPreChecked = true;
+      }
 
       if (isMutation) {
         // Flush checkpointed SQLite snapshot to Supabase Storage BEFORE sending the HTTP 2xx response.
@@ -1559,6 +1575,7 @@ function notifyFollowers(params: {
 
 // Strictly read-only GET endpoint for gentle polling (never triggers CloudSync upload)
 app.get('/api/notifications', requireAuth, (req: AuthRequest, res: Response) => {
+  setNoStoreHeaders(res);
   const userId = req.user!.id;
   const notifications = db.prepare(`
     SELECT id, user_id, actor_id, actor_nickname, actor_name, type,
@@ -1580,6 +1597,7 @@ app.get('/api/notifications', requireAuth, (req: AuthRequest, res: Response) => 
 });
 
 app.get('/api/notifications/preferences', requireAuth, (req: AuthRequest, res: Response) => {
+  setNoStoreHeaders(res);
   const row = db
     .prepare('SELECT notify_follows, notify_news FROM profiles WHERE user_id = ?')
     .get(req.user!.id) as { notify_follows?: number; notify_news?: number } | undefined;
@@ -3027,8 +3045,11 @@ function setNoStoreHeaders(res: Response): void {
 
 async function syncLatestCloudDbBeforeGame(res: Response, isMutation = false): Promise<boolean> {
   if (!isSupabaseConfigured()) return true;
+  if (res.locals?.cloudSyncPreChecked && (!isMutation || MUTATING_HTTP_METHODS.has(res.req?.method || ''))) {
+    return true;
+  }
   await ensureCloudDatabaseRestored();
-  const pullRes = await syncCloudDatabase({ force: true });
+  const pullRes = await syncIfCloudNewer({ force: isMutation, minIntervalMs: isMutation ? 0 : 2500 });
   if (isMutation && pullRes.error) {
     res.status(503).json({
       error: 'Не удалось синхронизировать актуальное состояние базы данных. Повторите попытку через пару секунд.',
@@ -4909,7 +4930,8 @@ app.post('/api/promo/redeem', requireAuth, promoRateLimit, async (req: AuthReque
 // API: XP SHOP & INVENTORY
 // ----------------------------------------------------------------------------
 
-app.get('/api/shop/items', (req: Request, res: Response) => {
+const handleGetShopItems = (req: Request, res: Response) => {
+  setNoStoreHeaders(res);
   const user = getSessionUser(req);
   const items = db.prepare(`
     SELECT * FROM shop_items WHERE is_active = 1 ORDER BY category ASC, cost_xp ASC
@@ -4927,15 +4949,21 @@ app.get('/api/shop/items', (req: Request, res: Response) => {
 
   const enriched = items.map((it) => {
     const inv = inventoryMap.get(it.id);
+    const normalizedCost = Math.max(0, Math.floor(Number(it.cost_xp) || 0));
     return {
       ...it,
+      cost_xp: normalizedCost,
+      price: normalizedCost,
       is_owned: Boolean(inv),
       is_equipped: Boolean(inv?.is_equipped),
     };
   });
 
   res.json({ items: enriched });
-});
+};
+
+app.get('/api/shop/items', handleGetShopItems);
+app.get('/api/shop', handleGetShopItems);
 
 const SHOP_CATEGORY_COLUMN_MAP: Record<string, string> = {
   frame: 'equipped_frame',
@@ -4948,22 +4976,29 @@ const SHOP_CATEGORY_COLUMN_MAP: Record<string, string> = {
 };
 
 app.post('/api/shop/buy', requireAuth, async (req: AuthRequest, res: Response) => {
+  setNoStoreHeaders(res);
   const { item_id } = req.body || {};
   if (!item_id || typeof item_id !== 'string') {
     res.status(400).json({ error: 'Item ID is required.' });
     return;
   }
 
-  const item = db.prepare('SELECT * FROM shop_items WHERE id = ? AND is_active = 1').get(item_id) as any;
-  if (!item) {
-    res.status(404).json({ error: 'Предмет не найден в каталоге магазина.' });
-    return;
-  }
-
   const userId = req.user!.id;
   let purchaseError: { status: number; message: string } | null = null;
+  let purchasedItem: any = null;
+  let purchasedCostXp = 0;
 
   db.transaction(() => {
+    const item = db.prepare('SELECT * FROM shop_items WHERE id = ? AND is_active = 1').get(item_id) as any;
+    if (!item) {
+      purchaseError = { status: 404, message: 'Предмет не найден в каталоге магазина.' };
+      return;
+    }
+
+    const costXp = Math.max(0, Math.floor(Number(item.cost_xp) || 0));
+    purchasedItem = item;
+    purchasedCostXp = costXp;
+
     const alreadyOwned = db
       .prepare('SELECT id FROM user_inventory WHERE user_id = ? AND item_id = ?')
       .get(userId, item_id);
@@ -4975,10 +5010,10 @@ app.post('/api/shop/buy', requireAuth, async (req: AuthRequest, res: Response) =
     const currentProfile = db
       .prepare('SELECT xp, total_xp FROM profiles WHERE user_id = ?')
       .get(userId) as any;
-    if (!currentProfile || currentProfile.xp < item.cost_xp) {
+    if (!currentProfile || Number(currentProfile.xp || 0) < costXp) {
       purchaseError = {
         status: 400,
-        message: `Недостаточно XP. Требуется: ${item.cost_xp} XP, доступно: ${currentProfile?.xp ?? 0} XP.`,
+        message: `Недостаточно XP. Требуется: ${costXp} XP, доступно: ${currentProfile?.xp ?? 0} XP.`,
       };
       return;
     }
@@ -4986,7 +5021,7 @@ app.post('/api/shop/buy', requireAuth, async (req: AuthRequest, res: Response) =
     // Atomic conditional deduction of spendable XP only (total_xp & level never decrease!)
     const updateRes = db
       .prepare("UPDATE profiles SET xp = xp - ?, updated_at = datetime('now') WHERE user_id = ? AND xp >= ?")
-      .run(item.cost_xp, userId, item.cost_xp);
+      .run(costXp, userId, costXp);
     if (updateRes.changes === 0) {
       purchaseError = { status: 400, message: 'Недостаточно XP для покупки.' };
       return;
@@ -5000,8 +5035,8 @@ app.post('/api/shop/buy', requireAuth, async (req: AuthRequest, res: Response) =
     db.prepare(`
       INSERT INTO xp_transactions (id, user_id, amount, source, details)
       VALUES (?, ?, ?, 'shop_purchase', ?)
-    `).run('xpt_' + crypto.randomUUID().slice(0, 8), userId, -item.cost_xp, `Покупка: ${item.name_ru}`);
-  })();
+    `).run('xpt_' + crypto.randomUUID().slice(0, 8), userId, -costXp, `Покупка: ${item.name_ru}`);
+  }).immediate();
 
   if (purchaseError) {
     const errObj = purchaseError as { status: number; message: string };
@@ -5012,10 +5047,22 @@ app.post('/api/shop/buy', requireAuth, async (req: AuthRequest, res: Response) =
   const newlyUnlocked = evaluateUserAchievements(userId);
 
   const updatedProfile = db.prepare('SELECT xp, total_xp, level FROM profiles WHERE user_id = ?').get(userId) as any;
-  await flushCloudBackupAndRespond(res, { ok: true, new_xp: updatedProfile.xp, profile: updatedProfile, newly_unlocked_achievements: newlyUnlocked });
+  await flushCloudBackupAndRespond(res, {
+    ok: true,
+    item_id: purchasedItem.id,
+    cost_xp: purchasedCostXp,
+    xp_spent: purchasedCostXp,
+    new_xp: updatedProfile.xp,
+    xp: updatedProfile.xp,
+    total_xp: updatedProfile.total_xp,
+    level: updatedProfile.level,
+    profile: updatedProfile,
+    newly_unlocked_achievements: newlyUnlocked,
+  });
 });
 
 app.post('/api/shop/equip', requireAuth, async (req: AuthRequest, res: Response) => {
+  setNoStoreHeaders(res);
   const { item_id, equip } = req.body || {};
   if (!item_id || typeof item_id !== 'string') {
     res.status(400).json({ error: 'Item ID is required.' });
@@ -5074,6 +5121,7 @@ app.post('/api/shop/equip', requireAuth, async (req: AuthRequest, res: Response)
 });
 
 app.get('/api/shop/inventory', requireAuth, (req: AuthRequest, res: Response) => {
+  setNoStoreHeaders(res);
   const inventory = db.prepare(`
     SELECT ui.*, si.name_ru, si.name_en, si.description_ru, si.description_en, si.category, si.preview_value, si.rarity
     FROM user_inventory ui
@@ -6363,6 +6411,7 @@ app.delete('/api/creations/:id', requireAuth, async (req: AuthRequest, res: Resp
 // ----------------------------------------------------------------------------
 
 app.get('/api/profiles/:nickname', (req: Request, res: Response) => {
+  setNoStoreHeaders(res);
   const currentUser = getSessionUser(req);
   const rawLookup = String(req.params.nickname || '').trim();
   const cleanLookup = normalizeUsername(rawLookup);
@@ -6627,6 +6676,7 @@ app.get('/api/profiles/:nickname', (req: Request, res: Response) => {
 });
 
 app.get('/api/profiles/:nickname/history', (req: Request, res: Response) => {
+  setNoStoreHeaders(res);
   const currentUser = getSessionUser(req);
   const rawLookup = String(req.params.nickname || '').trim();
   const cleanLookup = normalizeUsername(rawLookup);
@@ -8247,6 +8297,7 @@ app.delete('/api/admin/promos/:id', requireAdmin, (req: AuthRequest, res: Respon
 });
 
 app.get('/api/admin/shop/items', requireAdmin, (_req: AuthRequest, res: Response) => {
+  setNoStoreHeaders(res);
   const items = db.prepare(`
     SELECT si.*,
            (SELECT COUNT(*) FROM user_inventory ui WHERE ui.item_id = si.id) as owners_count

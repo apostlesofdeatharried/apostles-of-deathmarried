@@ -49,7 +49,7 @@ export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
   const loadItems = async () => {
     setLoading(true);
     try {
-      const res = await authFetch('/api/shop/items');
+      const res = await authFetch('/api/shop/items', { cache: 'no-store' });
       const data = await safeJson<{ items?: ShopItem[] }>(res, { items: [] });
       if (res.ok) {
         setItems(data.items || []);
