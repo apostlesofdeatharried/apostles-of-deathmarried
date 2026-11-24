@@ -318,6 +318,13 @@ export function executeAdminUserReset(
         if (hasDailyMiniGameAttempts) {
           targetDb.prepare('DELETE FROM daily_mini_game_attempts WHERE user_id = ?').run(uid);
         }
+        if (!scopes.xp && hasXpTransactions) {
+          try {
+            targetDb
+              .prepare("UPDATE xp_transactions SET reference_key = NULL WHERE user_id = ? AND reference_key LIKE 'game:%'")
+              .run(uid);
+          } catch {}
+        }
       }
     }
   })();

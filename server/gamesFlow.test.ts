@@ -498,4 +498,241 @@ describe('All 5 mini-games HTTP flow (tracks + singles, FK safety) and chunked R
     ]);
     assert.ok(Buffer.from(downloaded).equals(fiveMb.subarray(0, AUDIO_MAX_DOWNLOAD_BYTES)));
   });
+
+  it('Anti-farm E2E for ALL 5 games: GET->POST->F5 GET locked->duplicate/parallel POST 409 (0 extra XP)->admin reset unlocks cleanly', async () => {
+    // Seed a fresh player and an admin for end-to-end lock & reset testing
+    dbMod.db.prepare(`
+      INSERT OR REPLACE INTO users (id, nickname, password_hash, role_id, email_verified, accepted_rules)
+      VALUES
+        ('usr_antifarm_1', 'antifarm1', 'hash', 'user', 1, 1),
+        ('usr_antifarm_2', 'antifarm2', 'hash', 'user', 1, 1),
+        ('usr_admin_reset', 'adminreset', 'hash', 'admin', 1, 1)
+    `).run();
+    dbMod.db.prepare(`
+      INSERT OR REPLACE INTO profiles (user_id, display_name, level, xp, total_xp, daily_streak)
+      VALUES
+        ('usr_antifarm_1', 'AntiFarm One', 1, 0, 0, 0),
+        ('usr_antifarm_2', 'AntiFarm Two', 1, 0, 0, 0),
+        ('usr_admin_reset', 'Admin Reset', 1, 0, 0, 0)
+    `).run();
+
+    const user1Token = tokenMod.signSessionToken({
+      sid: 'sess_af_1',
+      uid: 'usr_antifarm_1',
+      nick: 'antifarm1',
+      role: 'user',
+    }).token;
+    const user2Token = tokenMod.signSessionToken({
+      sid: 'sess_af_2',
+      uid: 'usr_antifarm_2',
+      nick: 'antifarm2',
+      role: 'user',
+    }).token;
+    const adminToken = tokenMod.signSessionToken({
+      sid: 'sess_af_admin',
+      uid: 'usr_admin_reset',
+      nick: 'adminreset',
+      role: 'admin',
+    }).token;
+
+    const u1Headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${user1Token}` };
+    const u2Headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${user2Token}` };
+    const adminHeaders = { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` };
+
+    const getProfileXp = (uid: string) =>
+      dbMod.db.prepare('SELECT xp, total_xp FROM profiles WHERE user_id = ?').get(uid) as {
+        xp: number;
+        total_xp: number;
+      };
+
+    type GameCase = {
+      id: string;
+      getPath: string;
+      postPath: string;
+      buildBody: (getPayload: any) => any;
+    };
+
+    const allFiveGames: GameCase[] = [
+      {
+        id: 'guess-track',
+        getPath: '/api/games/guess-track/round',
+        postPath: '/api/games/guess-track/verify',
+        buildBody: (d) => ({
+          round_token: d.round_token,
+          challenge_date: d.challenge_date,
+          selected_track_id: d.options[0].id,
+          time_spent: 5,
+        }),
+      },
+      {
+        id: 'daily-quiz',
+        getPath: '/api/games/quiz/daily',
+        postPath: '/api/games/quiz/submit',
+        buildBody: (d) => {
+          const answers: Record<string, number> = {};
+          for (const q of d.questions) answers[q.id] = 0;
+          return { answers, challenge_date: d.challenge_date };
+        },
+      },
+      {
+        id: 'guess-lyrics',
+        getPath: '/api/games/guess-lyrics/round',
+        postPath: '/api/games/guess-lyrics/verify',
+        buildBody: (d) => ({
+          challenge_date: d.challenge_date,
+          selected_option_id: d.options[0].id,
+        }),
+      },
+      {
+        id: 'reverse-track',
+        getPath: '/api/games/reverse-track/round',
+        postPath: '/api/games/reverse-track/verify',
+        buildBody: (d) => ({
+          challenge_date: d.challenge_date,
+          selected_track_id: d.options[0].id,
+        }),
+      },
+      {
+        id: 'speed-track',
+        getPath: '/api/games/speed-track/round',
+        postPath: '/api/games/speed-track/verify',
+        buildBody: (d) => ({
+          challenge_date: d.challenge_date,
+          selected_track_id: d.options[0].id,
+        }),
+      },
+    ];
+
+    // Step 1..4: Sequential GET -> POST -> F5 GET -> duplicate POST 409 for EVERY ONE of the 5 games
+    for (const game of allFiveGames) {
+      const beforeXp = getProfileXp('usr_antifarm_1');
+
+      // 1) Initial GET: unlocked & no-store
+      const g1 = await fetch(`${baseUrl}${game.getPath}`, { headers: u1Headers });
+      assert.equal(g1.status, 200, `${game.id} initial GET failed`);
+      assert.ok(String(g1.headers.get('cache-control') || '').includes('no-store'), `${game.id} missing Cache-Control: no-store`);
+      const g1Json = (await g1.json()) as any;
+      assert.equal(g1Json.alreadyPlayed, false, `${game.id} initial alreadyPlayed must be false`);
+      assert.equal(g1Json.completed, false, `${game.id} initial completed must be false`);
+      assert.ok(g1Json.next_reset_at, `${game.id} missing next_reset_at`);
+
+      // 2) First POST: 200 OK & awards XP
+      const body = game.buildBody(g1Json);
+      const p1 = await fetch(`${baseUrl}${game.postPath}`, {
+        method: 'POST',
+        headers: u1Headers,
+        body: JSON.stringify(body),
+      });
+      assert.equal(p1.status, 200, `${game.id} first POST failed: ${await p1.clone().text()}`);
+      const p1Json = (await p1.json()) as any;
+      const xpFromResp = Number(p1Json.xp_earned ?? p1Json.total_xp ?? 0);
+      assert.ok(xpFromResp > 0, `${game.id} must award positive XP on completion`);
+
+      const afterFirstXp = getProfileXp('usr_antifarm_1');
+      assert.ok(afterFirstXp.total_xp > beforeXp.total_xp, `${game.id} total_xp must increase`);
+      assert.ok(afterFirstXp.xp > beforeXp.xp, `${game.id} xp must increase`);
+
+      // 3) Second GET (F5 reload): locked & no-store & previous_attempt returned
+      const g2 = await fetch(`${baseUrl}${game.getPath}`, { headers: u1Headers });
+      assert.equal(g2.status, 200, `${game.id} F5 GET failed`);
+      assert.ok(String(g2.headers.get('cache-control') || '').includes('no-store'), `${game.id} F5 missing Cache-Control: no-store`);
+      const g2Json = (await g2.json()) as any;
+      assert.equal(g2Json.alreadyPlayed, true, `${game.id} F5 alreadyPlayed must be true`);
+      assert.equal(g2Json.completed, true, `${game.id} F5 completed must be true`);
+      assert.equal(g2Json.already_completed, true, `${game.id} F5 already_completed must be true`);
+      assert.ok(g2Json.previous_attempt, `${game.id} F5 must return previous_attempt`);
+
+      // 4) Second POST (repeat farm attempt): HTTP 409 & zero extra XP
+      const p2 = await fetch(`${baseUrl}${game.postPath}`, {
+        method: 'POST',
+        headers: u1Headers,
+        body: JSON.stringify(body),
+      });
+      assert.equal(p2.status, 409, `${game.id} duplicate POST must return 409`);
+      const p2Json = (await p2.json()) as any;
+      assert.equal(p2Json.xp_earned, 0, `${game.id} duplicate POST must return xp_earned=0`);
+      assert.equal(p2Json.completed, true);
+
+      const afterDupXp = getProfileXp('usr_antifarm_1');
+      assert.equal(afterDupXp.total_xp, afterFirstXp.total_xp, `${game.id} total_xp changed on duplicate POST`);
+      assert.equal(afterDupXp.xp, afterFirstXp.xp, `${game.id} xp changed on duplicate POST`);
+    }
+
+    // Step 5: Concurrent parallel double-POST race for ALL 5 games on user2
+    for (const game of allFiveGames) {
+      const gRes = await fetch(`${baseUrl}${game.getPath}`, { headers: u2Headers });
+      const gJson = (await gRes.json()) as any;
+      const body = game.buildBody(gJson);
+      const xpBeforeRace = getProfileXp('usr_antifarm_2');
+
+      const [rA, rB] = await Promise.all([
+        fetch(`${baseUrl}${game.postPath}`, { method: 'POST', headers: u2Headers, body: JSON.stringify(body) }),
+        fetch(`${baseUrl}${game.postPath}`, { method: 'POST', headers: u2Headers, body: JSON.stringify(body) }),
+      ]);
+      const statuses = [rA.status, rB.status].sort((a, b) => a - b);
+      assert.deepEqual(statuses, [200, 409], `${game.id} concurrent double POST must yield [200, 409], got ${JSON.stringify(statuses)}`);
+
+      const xpAfterRace = getProfileXp('usr_antifarm_2');
+      assert.ok(xpAfterRace.total_xp > xpBeforeRace.total_xp, `${game.id} race winner must receive XP`);
+
+      const txCount = (
+        dbMod.db
+          .prepare("SELECT COUNT(*) as c FROM xp_transactions WHERE user_id = 'usr_antifarm_2' AND reference_key LIKE ?")
+          .get(`game:${game.id}:%:usr_antifarm_2`) as { c: number }
+      ).c;
+      assert.equal(txCount, 1, `${game.id} concurrent race created ${txCount} XP transactions instead of 1`);
+    }
+
+    // Step 6A: Admin /reset-cycle unlocks ALL 5 games cleanly and allows one replay with XP
+    const resetCycleRes = await fetch(`${baseUrl}/api/admin/users/usr_antifarm_1/reset-cycle`, {
+      method: 'POST',
+      headers: adminHeaders,
+    });
+    assert.equal(resetCycleRes.status, 200);
+
+    for (const game of allFiveGames) {
+      const beforeReplay = getProfileXp('usr_antifarm_1');
+      const gUnlocked = await fetch(`${baseUrl}${game.getPath}`, { headers: u1Headers });
+      assert.equal(gUnlocked.status, 200);
+      const gUnlockedJson = (await gUnlocked.json()) as any;
+      assert.equal(gUnlockedJson.alreadyPlayed, false, `${game.id} should unlock after admin reset-cycle`);
+      assert.equal(gUnlockedJson.completed, false);
+
+      const pReplay = await fetch(`${baseUrl}${game.postPath}`, {
+        method: 'POST',
+        headers: u1Headers,
+        body: JSON.stringify(game.buildBody(gUnlockedJson)),
+      });
+      assert.equal(pReplay.status, 200, `${game.id} replay after admin reset-cycle failed`);
+      const afterReplay = getProfileXp('usr_antifarm_1');
+      assert.ok(afterReplay.total_xp > beforeReplay.total_xp, `${game.id} replay after admin reset-cycle must award XP`);
+
+      const pReplayDup = await fetch(`${baseUrl}${game.postPath}`, {
+        method: 'POST',
+        headers: u1Headers,
+        body: JSON.stringify(game.buildBody(gUnlockedJson)),
+      });
+      assert.equal(pReplayDup.status, 409, `${game.id} post-replay duplicate must return 409`);
+    }
+
+    // Step 6B: Admin /api/admin/users/reset with scopes.games=true also unlocks cleanly
+    const fullGameResetRes = await fetch(`${baseUrl}/api/admin/users/reset`, {
+      method: 'POST',
+      headers: adminHeaders,
+      body: JSON.stringify({
+        mode: 'single',
+        target_user_id: 'usr_antifarm_1',
+        scopes: { xp: false, achievements: false, cosmetics: false, games: true },
+      }),
+    });
+    assert.equal(fullGameResetRes.status, 200);
+
+    for (const game of allFiveGames) {
+      const gAfterFullReset = await fetch(`${baseUrl}${game.getPath}`, { headers: u1Headers });
+      const gAfterJson = (await gAfterFullReset.json()) as any;
+      assert.equal(gAfterJson.alreadyPlayed, false, `${game.id} should be unlocked after scopes.games reset`);
+      assert.equal(gAfterJson.completed, false);
+    }
+  });
 });
+

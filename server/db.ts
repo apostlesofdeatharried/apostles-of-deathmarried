@@ -1103,6 +1103,64 @@ export function ensureSchemaAndMigrations(targetDb: Database.Database = db) {
   ensureColumn('daily_track_challenges', 'snippet_start_ratio', 'REAL NOT NULL DEFAULT 0');
   ensureColumn('daily_track_challenges', 'snippet_duration_seconds', 'INTEGER NOT NULL DEFAULT 5');
 
+  ensureColumn('game_completions', 'game_type', "TEXT NOT NULL DEFAULT ''");
+  ensureColumn('game_completions', 'cycle_id', "TEXT NOT NULL DEFAULT ''");
+  ensureColumn('game_completions', 'is_correct', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('game_completions', 'score', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('game_completions', 'xp_earned', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('game_completions', 'created_at', "TEXT NOT NULL DEFAULT ''");
+
+  ensureColumn('daily_mini_game_attempts', 'game_id', "TEXT NOT NULL DEFAULT ''");
+  ensureColumn('daily_mini_game_attempts', 'cycle_id', "TEXT NOT NULL DEFAULT ''");
+  ensureColumn('daily_mini_game_attempts', 'is_correct', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('daily_mini_game_attempts', 'score', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('daily_mini_game_attempts', 'xp_earned', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('daily_mini_game_attempts', 'selected_value', 'TEXT');
+  ensureColumn('daily_mini_game_attempts', 'correct_value', 'TEXT');
+  ensureColumn('daily_mini_game_attempts', 'details_json', 'TEXT');
+  ensureColumn('daily_mini_game_attempts', 'created_at', "TEXT NOT NULL DEFAULT ''");
+
+  // Enforce strict UNIQUE indexes on all 4 game lock tables even on legacy migrated DBs
+  // (deduplicating any historical duplicates by keeping the earliest rowid before index creation).
+  const enforceGameUniqueIndex = (tableName: string, indexName: string, colsExpr: string, whereNotEmpty: string) => {
+    try {
+      targetDb.exec(`
+        DELETE FROM ${tableName}
+        WHERE rowid NOT IN (
+          SELECT MIN(rowid) FROM ${tableName} GROUP BY ${colsExpr}
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS ${indexName}
+          ON ${tableName}(${colsExpr})${whereNotEmpty ? ` WHERE ${whereNotEmpty}` : ''};
+      `);
+    } catch (err) {
+      recordMigrationError(`${tableName}:unique_index_${indexName}`, err);
+    }
+  };
+  enforceGameUniqueIndex(
+    'game_completions',
+    'idx_game_completions_unique',
+    'user_id, game_type, cycle_id',
+    "trim(game_type) <> '' AND trim(cycle_id) <> ''"
+  );
+  enforceGameUniqueIndex(
+    'daily_track_attempts',
+    'idx_daily_track_attempts_unique',
+    'user_id, challenge_date',
+    "trim(challenge_date) <> ''"
+  );
+  enforceGameUniqueIndex(
+    'quiz_attempts',
+    'idx_quiz_attempts_unique',
+    'user_id, challenge_date',
+    "trim(challenge_date) <> ''"
+  );
+  enforceGameUniqueIndex(
+    'daily_mini_game_attempts',
+    'idx_daily_mini_game_attempts_unique',
+    'user_id, game_id, cycle_id',
+    "trim(game_id) <> '' AND trim(cycle_id) <> ''"
+  );
+
   try {
     targetDb.exec(`
       INSERT OR IGNORE INTO app_meta (key, value) VALUES

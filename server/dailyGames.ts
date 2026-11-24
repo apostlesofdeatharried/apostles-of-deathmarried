@@ -18,6 +18,26 @@ export {
   getPreviousMoscow12hCycle,
 };
 
+export interface GameCycleInfo {
+  cycleKey: string;
+  cycleId: string;
+  dateStr: string;
+  half: 'AM' | 'PM';
+  nextResetAt: string;
+}
+
+/**
+ * Single source of truth for the current 12-hour Moscow Time (00:00 / 12:00 MSK) game cycle key.
+ * Both GET and POST handlers across all 5 daily games MUST call this helper.
+ */
+export function getCurrentGameCycle(nowMs: number = Date.now()): GameCycleInfo {
+  const cycle = getMoscow12hCycle(nowMs);
+  return {
+    cycleKey: cycle.cycleId,
+    ...cycle,
+  };
+}
+
 export interface PlayableTrackCandidate {
   id: string;
   title: string;

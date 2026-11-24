@@ -17,6 +17,7 @@ import {
 import { executeAdminUserReset } from './server/adminUserReset.js';
 import {
   ensureCloudDatabaseRestored,
+  syncCloudDatabase,
   pushDatabaseBackupNow,
   getCloudSyncStatus,
   isSupabaseConfigured,
@@ -66,6 +67,7 @@ import {
   isValidUtc12HourSlot,
   getNextUtc12HourResetIso,
   getMoscow12hCycle,
+  getCurrentGameCycle,
   isValidMoscow12hCycle,
   getPreviousMoscow12hCycle,
   pickDailyTrackChallenge,
@@ -1252,7 +1254,9 @@ app.post('/api/auth/logout', (req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
-app.get('/api/auth/me', (req: Request, res: Response) => {
+app.get('/api/auth/me', async (req: Request, res: Response) => {
+  setNoStoreHeaders(res);
+  await syncLatestCloudDbBeforeGame(res, false);
   const user = getSessionUser(req);
   if (!user) {
     res.json({ user: null });
@@ -3013,11 +3017,66 @@ function getOrCreateDailyQuizChallenge(cycleId: string): ValidatedQuizQuestion[]
   return selected;
 }
 
+function setNoStoreHeaders(res: Response): void {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  res.setHeader('CDN-Cache-Control', 'no-store');
+  res.setHeader('Vercel-CDN-Cache-Control', 'no-store');
+}
+
+async function syncLatestCloudDbBeforeGame(res: Response, isMutation = false): Promise<boolean> {
+  if (!isSupabaseConfigured()) return true;
+  await ensureCloudDatabaseRestored();
+  const pullRes = await syncCloudDatabase({ force: true });
+  if (isMutation && pullRes.error) {
+    res.status(503).json({
+      error: 'Не удалось синхронизировать актуальное состояние базы данных. Повторите попытку через пару секунд.',
+      cloud_sync_error: pullRes.error,
+    });
+    return false;
+  }
+  return true;
+}
+
+function getGameCycleLockStatus(userId: string, gameId: KnownGameId, cycleKey: string): {
+  completed: boolean;
+  completion: any;
+  attempt: any;
+} {
+  const completion = db
+    .prepare(`SELECT * FROM game_completions WHERE user_id = ? AND game_type = ? AND cycle_id = ?`)
+    .get(userId, gameId, cycleKey) as any;
+
+  let attempt: any = null;
+  if (gameId === 'guess-track') {
+    attempt = db
+      .prepare(`SELECT * FROM daily_track_attempts WHERE user_id = ? AND challenge_date = ?`)
+      .get(userId, cycleKey) as any;
+  } else if (gameId === 'daily-quiz') {
+    attempt = db
+      .prepare(`SELECT * FROM quiz_attempts WHERE user_id = ? AND challenge_date = ?`)
+      .get(userId, cycleKey) as any;
+  } else {
+    attempt = db
+      .prepare(`SELECT * FROM daily_mini_game_attempts WHERE user_id = ? AND game_id = ? AND cycle_id = ?`)
+      .get(userId, gameId, cycleKey) as any;
+  }
+
+  return {
+    completed: Boolean(completion || attempt),
+    completion,
+    attempt,
+  };
+}
+
 // 1. Guess The Track (shared 12-hour MSK challenge: 00:00 & 12:00 МСК, exact 5-second snippet)
-app.get('/api/games/guess-track/round', (req: Request, res: Response) => {
+app.get('/api/games/guess-track/round', async (req: Request, res: Response) => {
+  setNoStoreHeaders(res);
+  await syncLatestCloudDbBeforeGame(res, false);
   const sessionUser = getSessionUser(req);
   const user = sessionUser && hasValidDbUserAndProfile(sessionUser.id) ? sessionUser : null;
-  const { cycleId: slotKey, nextResetAt } = getMoscow12hCycle();
+  const { cycleKey: slotKey, nextResetAt } = getCurrentGameCycle();
 
   const daily = getOrCreateDailyTrackChallenge(slotKey);
   if (!daily) {
@@ -3036,14 +3095,8 @@ app.get('/api/games/guess-track/round', (req: Request, res: Response) => {
   } | null = null;
 
   if (user) {
-    const completion = db.prepare(`
-      SELECT * FROM game_completions WHERE user_id = ? AND game_type = 'guess-track' AND cycle_id = ?
-    `).get(user.id, slotKey) as any;
-    const attempt = db.prepare(`
-      SELECT * FROM daily_track_attempts WHERE user_id = ? AND challenge_date = ?
-    `).get(user.id, slotKey) as any;
-
-    if (completion || attempt) {
+    const { completed, completion, attempt } = getGameCycleLockStatus(user.id, 'guess-track', slotKey);
+    if (completed) {
       alreadyCompleted = true;
       const trackId = attempt?.track_id || daily.track.id;
       previousAttempt = {
@@ -3068,6 +3121,7 @@ app.get('/api/games/guess-track/round', (req: Request, res: Response) => {
     snippet_start_ratio: daily.snippet_start_ratio,
     snippet_duration: daily.snippet_duration_seconds,
     options: daily.options,
+    alreadyPlayed: alreadyCompleted,
     completed: alreadyCompleted,
     already_completed: alreadyCompleted,
     previous_attempt: previousAttempt,
@@ -3075,6 +3129,9 @@ app.get('/api/games/guess-track/round', (req: Request, res: Response) => {
 });
 
 app.post('/api/games/guess-track/verify', async (req: AuthRequest, res: Response) => {
+  setNoStoreHeaders(res);
+  if (!(await syncLatestCloudDbBeforeGame(res, true))) return;
+
   const { round_token, challenge_date, selected_track_id, time_spent } = req.body || {};
   if (!selected_track_id || typeof selected_track_id !== 'string') {
     res.status(400).json({ error: 'Missing selected_track_id' });
@@ -3083,7 +3140,7 @@ app.post('/api/games/guess-track/verify', async (req: AuthRequest, res: Response
 
   const sessionUser = getSessionUser(req);
   const user = sessionUser && hasValidDbUserAndProfile(sessionUser.id) ? sessionUser : null;
-  const { cycleId: slotKey, nextResetAt } = getMoscow12hCycle();
+  const { cycleKey: slotKey, nextResetAt } = getCurrentGameCycle();
 
   let clientSlot: string | null = null;
   if (isValidMoscow12hCycle(challenge_date)) {
@@ -3117,15 +3174,12 @@ app.post('/api/games/guess-track/verify', async (req: AuthRequest, res: Response
   }
 
   if (user) {
-    const existingCompletion = db.prepare(`
-      SELECT id FROM game_completions WHERE user_id = ? AND game_type = 'guess-track' AND cycle_id = ?
-    `).get(user.id, slotKey);
-    const existingAttempt = db.prepare(`
-      SELECT id FROM daily_track_attempts WHERE user_id = ? AND challenge_date = ?
-    `).get(user.id, slotKey);
-    if (existingCompletion || existingAttempt) {
+    const lockStatus = getGameCycleLockStatus(user.id, 'guess-track', slotKey);
+    if (lockStatus.completed) {
       res.status(409).json({
         error: 'Вы уже прошли текущий раунд «Угадай трек». Обновление в 00:00 и 12:00 МСК!',
+        code: 'ALREADY_COMPLETED',
+        alreadyPlayed: true,
         completed: true,
         already_completed: true,
         xp_earned: 0,
@@ -3169,7 +3223,15 @@ app.post('/api/games/guess-track/verify', async (req: AuthRequest, res: Response
   if (user) {
     let duplicateCompletion = false;
     try {
-      db.transaction(() => {
+      const saveTx = db.transaction(() => {
+        const existingAttempt = db
+          .prepare('SELECT id FROM daily_track_attempts WHERE user_id = ? AND challenge_date = ?')
+          .get(user.id, slotKey);
+        if (existingAttempt) {
+          duplicateCompletion = true;
+          return;
+        }
+
         const gcInsert = db.prepare(`
           INSERT OR IGNORE INTO game_completions (id, user_id, game_type, cycle_id, is_correct, score, xp_earned)
           VALUES (?, ?, 'guess-track', ?, ?, ?, ?)
@@ -3246,7 +3308,8 @@ app.post('/api/games/guess-track/verify', async (req: AuthRequest, res: Response
         `).run(nextStreak, todayMoscowDate, user.id);
 
         newlyUnlockedAchievements = evaluateUserAchievements(user.id);
-      })();
+      });
+      saveTx.immediate();
     } catch (err: any) {
       if (String(err?.message || '').includes('UNIQUE')) {
         duplicateCompletion = true;
@@ -3258,6 +3321,8 @@ app.post('/api/games/guess-track/verify', async (req: AuthRequest, res: Response
     if (duplicateCompletion) {
       res.status(409).json({
         error: 'Вы уже прошли текущий раунд «Угадай трек». Обновление в 00:00 и 12:00 МСК!',
+        code: 'ALREADY_COMPLETED',
+        alreadyPlayed: true,
         completed: true,
         already_completed: true,
         xp_earned: 0,
@@ -3281,15 +3346,20 @@ app.post('/api/games/guess-track/verify', async (req: AuthRequest, res: Response
     challenge_date: slotKey,
     next_reset_at: nextResetAt,
     refresh_interval_hours: 12,
+    alreadyPlayed: Boolean(user),
+    completed: Boolean(user),
+    already_completed: Boolean(user),
     newly_unlocked_achievements: newlyUnlockedAchievements,
   });
 });
 
 // 2. Daily Quiz (12-hour MSK schedule: 00:00 & 12:00 МСК, quiz_enabled toggle, active_quiz_ids manual mode, difficulty XP + Fisher-Yates options)
-app.get('/api/games/quiz/daily', (req: Request, res: Response) => {
+app.get('/api/games/quiz/daily', async (req: Request, res: Response) => {
+  setNoStoreHeaders(res);
+  await syncLatestCloudDbBeforeGame(res, false);
   const sessionUser = getSessionUser(req);
   const user = sessionUser && hasValidDbUserAndProfile(sessionUser.id) ? sessionUser : null;
-  const { cycleId, nextResetAt } = getMoscow12hCycle();
+  const { cycleKey: cycleId, nextResetAt } = getCurrentGameCycle();
   const quizSecret = getDailyChallengeSecret();
   const { quiz_enabled } = getQuizSettingsFromDb();
 
@@ -3298,10 +3368,12 @@ app.get('/api/games/quiz/daily', (req: Request, res: Response) => {
       disabled: true,
       message: 'Зайдите позже, добавляются новые вопросы',
       questions: [],
+      alreadyPlayed: false,
       completed: false,
       already_completed: false,
       previous_score: 0,
       previous_xp: 0,
+      previous_attempt: null,
       challenge_date: cycleId,
       next_reset_at: nextResetAt,
       refresh_interval_hours: 12,
@@ -3313,18 +3385,15 @@ app.get('/api/games/quiz/daily', (req: Request, res: Response) => {
   let alreadyCompleted = false;
   let previousScore = 0;
   let previousXp = 0;
+  let previousAttempt: { score: number; xp_earned: number } | null = null;
 
   if (user) {
-    const completion = db.prepare(`
-      SELECT * FROM game_completions WHERE user_id = ? AND game_type = 'daily-quiz' AND cycle_id = ?
-    `).get(user.id, cycleId) as any;
-    const attempt = db.prepare(`
-      SELECT * FROM quiz_attempts WHERE user_id = ? AND challenge_date = ?
-    `).get(user.id, cycleId) as any;
-    if (completion || attempt) {
+    const { completed, completion, attempt } = getGameCycleLockStatus(user.id, 'daily-quiz', cycleId);
+    if (completed) {
       alreadyCompleted = true;
       previousScore = Number(attempt?.score ?? completion?.score) || 0;
       previousXp = Number(attempt?.xp_earned ?? completion?.xp_earned) || 0;
+      previousAttempt = { score: previousScore, xp_earned: previousXp };
     }
   }
 
@@ -3342,10 +3411,12 @@ app.get('/api/games/quiz/daily', (req: Request, res: Response) => {
   res.json({
     disabled: false,
     questions: sanitized,
+    alreadyPlayed: alreadyCompleted,
     completed: alreadyCompleted,
     already_completed: alreadyCompleted,
     previous_score: previousScore,
     previous_xp: previousXp,
+    previous_attempt: previousAttempt,
     challenge_date: cycleId,
     next_reset_at: nextResetAt,
     refresh_interval_hours: 12,
@@ -3354,6 +3425,9 @@ app.get('/api/games/quiz/daily', (req: Request, res: Response) => {
 });
 
 app.post('/api/games/quiz/submit', async (req: AuthRequest, res: Response) => {
+  setNoStoreHeaders(res);
+  if (!(await syncLatestCloudDbBeforeGame(res, true))) return;
+
   const { answers, challenge_date } = req.body || {};
   if (!answers || typeof answers !== 'object' || Array.isArray(answers)) {
     res.status(400).json({ error: 'Answers must be provided.' });
@@ -3371,7 +3445,7 @@ app.post('/api/games/quiz/submit', async (req: AuthRequest, res: Response) => {
 
   const sessionUser = getSessionUser(req);
   const user = sessionUser && hasValidDbUserAndProfile(sessionUser.id) ? sessionUser : null;
-  const { cycleId, nextResetAt } = getMoscow12hCycle();
+  const { cycleKey: cycleId, nextResetAt } = getCurrentGameCycle();
   const quizSecret = getDailyChallengeSecret();
 
   if (isValidMoscow12hCycle(challenge_date) && challenge_date !== cycleId) {
@@ -3385,16 +3459,12 @@ app.post('/api/games/quiz/submit', async (req: AuthRequest, res: Response) => {
   }
 
   if (user) {
-    const existingCompletion = db.prepare(`
-      SELECT id FROM game_completions WHERE user_id = ? AND game_type = 'daily-quiz' AND cycle_id = ?
-    `).get(user.id, cycleId);
-    const existingAttempt = db.prepare(`
-      SELECT id FROM quiz_attempts WHERE user_id = ? AND challenge_date = ?
-    `).get(user.id, cycleId);
-
-    if (existingCompletion || existingAttempt) {
+    const lockStatus = getGameCycleLockStatus(user.id, 'daily-quiz', cycleId);
+    if (lockStatus.completed) {
       res.status(409).json({
         error: 'Вы уже прошли викторину в этом раунде. Обновление в 00:00 и 12:00 МСК!',
+        code: 'ALREADY_COMPLETED',
+        alreadyPlayed: true,
         completed: true,
         already_completed: true,
         xp_earned: 0,
@@ -3462,7 +3532,15 @@ app.post('/api/games/quiz/submit', async (req: AuthRequest, res: Response) => {
 
     let duplicateCompletion = false;
     try {
-      db.transaction(() => {
+      const saveTx = db.transaction(() => {
+        const existingQuiz = db
+          .prepare('SELECT id FROM quiz_attempts WHERE user_id = ? AND challenge_date = ?')
+          .get(user.id, cycleId);
+        if (existingQuiz) {
+          duplicateCompletion = true;
+          return;
+        }
+
         const gcInsert = db.prepare(`
           INSERT OR IGNORE INTO game_completions (id, user_id, game_type, cycle_id, is_correct, score, xp_earned)
           VALUES (?, ?, 'daily-quiz', ?, ?, ?, ?)
@@ -3528,7 +3606,8 @@ app.post('/api/games/quiz/submit', async (req: AuthRequest, res: Response) => {
         `).run(nextStreak, todayMoscowDate, user.id);
 
         newlyUnlockedAchievements = evaluateUserAchievements(user.id);
-      })();
+      });
+      saveTx.immediate();
     } catch (err: any) {
       if (String(err?.message || '').includes('UNIQUE')) {
         duplicateCompletion = true;
@@ -3540,6 +3619,8 @@ app.post('/api/games/quiz/submit', async (req: AuthRequest, res: Response) => {
     if (duplicateCompletion) {
       res.status(409).json({
         error: 'Вы уже прошли викторину в этом раунде. Обновление в 00:00 и 12:00 МСК!',
+        code: 'ALREADY_COMPLETED',
+        alreadyPlayed: true,
         completed: true,
         already_completed: true,
         xp_earned: 0,
@@ -3564,6 +3645,9 @@ app.post('/api/games/quiz/submit', async (req: AuthRequest, res: Response) => {
     next_reset_at: nextResetAt,
     refresh_interval_hours: 12,
     timezone: 'MSK',
+    alreadyPlayed: Boolean(user),
+    completed: Boolean(user),
+    already_completed: Boolean(user),
     newly_unlocked_achievements: newlyUnlockedAchievements,
   });
 });
@@ -3608,8 +3692,16 @@ function recordMiniGameAttempt(params: {
   let newlyUnlockedAchievements: UnlockedAchievementInfo[] = [];
   let duplicate = false;
 
-  db.transaction(() => {
+  const saveTx = db.transaction(() => {
     const resolvedGameId = ensureGameCatalogRow(gameId);
+
+    const existingMini = db
+      .prepare('SELECT id FROM daily_mini_game_attempts WHERE user_id = ? AND game_id = ? AND cycle_id = ?')
+      .get(userId, gameId, cycleId);
+    if (existingMini) {
+      duplicate = true;
+      return;
+    }
 
     const gcInsert = db.prepare(`
       INSERT OR IGNORE INTO game_completions (id, user_id, game_type, cycle_id, is_correct, score, xp_earned)
@@ -3671,7 +3763,8 @@ function recordMiniGameAttempt(params: {
     `).run(nextStreak, todayMoscowDate, userId);
 
     newlyUnlockedAchievements = evaluateUserAchievements(userId);
-  })();
+  });
+  saveTx.immediate();
 
   if (duplicate) {
     return {
@@ -3713,10 +3806,12 @@ function resolveLyricsChallengeForCycle(cycleId: string) {
   });
 }
 
-app.get('/api/games/guess-lyrics/round', (req: Request, res: Response) => {
+app.get('/api/games/guess-lyrics/round', async (req: Request, res: Response) => {
+  setNoStoreHeaders(res);
+  await syncLatestCloudDbBeforeGame(res, false);
   const sessionUser = getSessionUser(req);
   const user = sessionUser && hasValidDbUserAndProfile(sessionUser.id) ? sessionUser : null;
-  const { cycleId, nextResetAt } = getMoscow12hCycle();
+  const { cycleKey: cycleId, nextResetAt } = getCurrentGameCycle();
   const round = resolveLyricsChallengeForCycle(cycleId);
 
   if (!round) {
@@ -3727,13 +3822,8 @@ app.get('/api/games/guess-lyrics/round', (req: Request, res: Response) => {
   let alreadyCompleted = false;
   let previousAttempt: any = null;
   if (user) {
-    const completion = db.prepare(`
-      SELECT * FROM game_completions WHERE user_id = ? AND game_type = 'guess-lyrics' AND cycle_id = ?
-    `).get(user.id, cycleId) as any;
-    const row = db.prepare(`
-      SELECT * FROM daily_mini_game_attempts WHERE user_id = ? AND game_id = 'guess-lyrics' AND cycle_id = ?
-    `).get(user.id, cycleId) as any;
-    if (completion || row) {
+    const { completed, completion, attempt: row } = getGameCycleLockStatus(user.id, 'guess-lyrics', cycleId);
+    if (completed) {
       alreadyCompleted = true;
       let parsedDetails: any = {};
       try {
@@ -3764,6 +3854,7 @@ app.get('/api/games/guess-lyrics/round', (req: Request, res: Response) => {
     round_token: `lyrics:${cycleId}`,
     prompt_line: round.prompt_line,
     options: round.options,
+    alreadyPlayed: alreadyCompleted,
     completed: alreadyCompleted,
     already_completed: alreadyCompleted,
     previous_attempt: previousAttempt,
@@ -3771,6 +3862,9 @@ app.get('/api/games/guess-lyrics/round', (req: Request, res: Response) => {
 });
 
 app.post('/api/games/guess-lyrics/verify', async (req: AuthRequest, res: Response) => {
+  setNoStoreHeaders(res);
+  if (!(await syncLatestCloudDbBeforeGame(res, true))) return;
+
   const { challenge_date, selected_option_id } = req.body || {};
   if (!selected_option_id || typeof selected_option_id !== 'string') {
     res.status(400).json({ error: 'Не выбран вариант ответа.' });
@@ -3779,7 +3873,7 @@ app.post('/api/games/guess-lyrics/verify', async (req: AuthRequest, res: Respons
 
   const sessionUser = getSessionUser(req);
   const user = sessionUser && hasValidDbUserAndProfile(sessionUser.id) ? sessionUser : null;
-  const { cycleId, nextResetAt } = getMoscow12hCycle();
+  const { cycleKey: cycleId, nextResetAt } = getCurrentGameCycle();
 
   if (isValidMoscow12hCycle(challenge_date) && challenge_date !== cycleId) {
     res.status(409).json({
@@ -3803,15 +3897,12 @@ app.post('/api/games/guess-lyrics/verify', async (req: AuthRequest, res: Respons
   }
 
   if (user) {
-    const existingGc = db.prepare(`
-      SELECT id FROM game_completions WHERE user_id = ? AND game_type = 'guess-lyrics' AND cycle_id = ?
-    `).get(user.id, cycleId);
-    const existing = db.prepare(`
-      SELECT id FROM daily_mini_game_attempts WHERE user_id = ? AND game_id = 'guess-lyrics' AND cycle_id = ?
-    `).get(user.id, cycleId);
-    if (existingGc || existing) {
+    const lockStatus = getGameCycleLockStatus(user.id, 'guess-lyrics', cycleId);
+    if (lockStatus.completed) {
       res.status(409).json({
         error: 'Вы уже прошли текущий раунд «Угадай строчку». Обновление в 00:00 и 12:00 МСК!',
+        code: 'ALREADY_COMPLETED',
+        alreadyPlayed: true,
         completed: true,
         already_completed: true,
         xp_earned: 0,
@@ -3857,6 +3948,8 @@ app.post('/api/games/guess-lyrics/verify', async (req: AuthRequest, res: Respons
       if (saved.duplicate) {
         res.status(409).json({
           error: 'Вы уже прошли текущий раунд «Угадай строчку». Обновление в 00:00 и 12:00 МСК!',
+          code: 'ALREADY_COMPLETED',
+          alreadyPlayed: true,
           completed: true,
           already_completed: true,
           xp_earned: 0,
@@ -3873,6 +3966,8 @@ app.post('/api/games/guess-lyrics/verify', async (req: AuthRequest, res: Respons
       if (String(err?.message || '').includes('UNIQUE')) {
         res.status(409).json({
           error: 'Вы уже прошли этот раунд.',
+          code: 'ALREADY_COMPLETED',
+          alreadyPlayed: true,
           completed: true,
           already_completed: true,
           xp_earned: 0,
@@ -3900,6 +3995,9 @@ app.post('/api/games/guess-lyrics/verify', async (req: AuthRequest, res: Respons
     next_reset_at: nextResetAt,
     refresh_interval_hours: 12,
     timezone: 'MSK',
+    alreadyPlayed: Boolean(user),
+    completed: Boolean(user),
+    already_completed: Boolean(user),
     newly_unlocked_achievements: newlyUnlockedAchievements,
   });
 });
@@ -3932,10 +4030,12 @@ function resolveReverseTrackForCycle(
   });
 }
 
-app.get('/api/games/reverse-track/round', (req: Request, res: Response) => {
+app.get('/api/games/reverse-track/round', async (req: Request, res: Response) => {
+  setNoStoreHeaders(res);
+  await syncLatestCloudDbBeforeGame(res, false);
   const sessionUser = getSessionUser(req);
   const user = sessionUser && hasValidDbUserAndProfile(sessionUser.id) ? sessionUser : null;
-  const { cycleId, nextResetAt } = getMoscow12hCycle();
+  const { cycleKey: cycleId, nextResetAt } = getCurrentGameCycle();
   const round = resolveReverseTrackForCycle(cycleId);
 
   if (!round) {
@@ -3946,13 +4046,8 @@ app.get('/api/games/reverse-track/round', (req: Request, res: Response) => {
   let alreadyCompleted = false;
   let previousAttempt: any = null;
   if (user) {
-    const completion = db.prepare(`
-      SELECT * FROM game_completions WHERE user_id = ? AND game_type = 'reverse-track' AND cycle_id = ?
-    `).get(user.id, cycleId) as any;
-    const row = db.prepare(`
-      SELECT * FROM daily_mini_game_attempts WHERE user_id = ? AND game_id = 'reverse-track' AND cycle_id = ?
-    `).get(user.id, cycleId) as any;
-    if (completion || row) {
+    const { completed, completion, attempt: row } = getGameCycleLockStatus(user.id, 'reverse-track', cycleId);
+    if (completed) {
       alreadyCompleted = true;
       const trackReveal = getTrackRevealInfo(row?.correct_value || round.track.id) || {
         id: round.track.id,
@@ -3980,6 +4075,7 @@ app.get('/api/games/reverse-track/round', (req: Request, res: Response) => {
     snippet_start_ratio: round.snippet_start_ratio,
     snippet_duration: round.snippet_duration_seconds,
     options: round.options,
+    alreadyPlayed: alreadyCompleted,
     completed: alreadyCompleted,
     already_completed: alreadyCompleted,
     previous_attempt: previousAttempt,
@@ -3987,6 +4083,9 @@ app.get('/api/games/reverse-track/round', (req: Request, res: Response) => {
 });
 
 app.post('/api/games/reverse-track/verify', async (req: AuthRequest, res: Response) => {
+  setNoStoreHeaders(res);
+  if (!(await syncLatestCloudDbBeforeGame(res, true))) return;
+
   const { challenge_date, selected_track_id } = req.body || {};
   if (!selected_track_id || typeof selected_track_id !== 'string') {
     res.status(400).json({ error: 'Missing selected_track_id' });
@@ -3995,7 +4094,7 @@ app.post('/api/games/reverse-track/verify', async (req: AuthRequest, res: Respon
 
   const sessionUser = getSessionUser(req);
   const user = sessionUser && hasValidDbUserAndProfile(sessionUser.id) ? sessionUser : null;
-  const { cycleId, nextResetAt } = getMoscow12hCycle();
+  const { cycleKey: cycleId, nextResetAt } = getCurrentGameCycle();
 
   if (isValidMoscow12hCycle(challenge_date) && challenge_date !== cycleId) {
     res.status(409).json({
@@ -4019,15 +4118,12 @@ app.post('/api/games/reverse-track/verify', async (req: AuthRequest, res: Respon
   }
 
   if (user) {
-    const existingGc = db.prepare(`
-      SELECT id FROM game_completions WHERE user_id = ? AND game_type = 'reverse-track' AND cycle_id = ?
-    `).get(user.id, cycleId);
-    const existing = db.prepare(`
-      SELECT id FROM daily_mini_game_attempts WHERE user_id = ? AND game_id = 'reverse-track' AND cycle_id = ?
-    `).get(user.id, cycleId);
-    if (existingGc || existing) {
+    const lockStatus = getGameCycleLockStatus(user.id, 'reverse-track', cycleId);
+    if (lockStatus.completed) {
       res.status(409).json({
         error: 'Вы уже прошли текущий раунд «Задом наперёд». Обновление в 00:00 и 12:00 МСК!',
+        code: 'ALREADY_COMPLETED',
+        alreadyPlayed: true,
         completed: true,
         already_completed: true,
         xp_earned: 0,
@@ -4069,6 +4165,8 @@ app.post('/api/games/reverse-track/verify', async (req: AuthRequest, res: Respon
       if (saved.duplicate) {
         res.status(409).json({
           error: 'Вы уже прошли текущий раунд «Задом наперёд». Обновление в 00:00 и 12:00 МСК!',
+          code: 'ALREADY_COMPLETED',
+          alreadyPlayed: true,
           completed: true,
           already_completed: true,
           xp_earned: 0,
@@ -4085,6 +4183,8 @@ app.post('/api/games/reverse-track/verify', async (req: AuthRequest, res: Respon
       if (String(err?.message || '').includes('UNIQUE')) {
         res.status(409).json({
           error: 'Вы уже прошли этот раунд.',
+          code: 'ALREADY_COMPLETED',
+          alreadyPlayed: true,
           completed: true,
           already_completed: true,
           xp_earned: 0,
@@ -4111,6 +4211,9 @@ app.post('/api/games/reverse-track/verify', async (req: AuthRequest, res: Respon
     next_reset_at: nextResetAt,
     refresh_interval_hours: 12,
     timezone: 'MSK',
+    alreadyPlayed: Boolean(user),
+    completed: Boolean(user),
+    already_completed: Boolean(user),
     newly_unlocked_achievements: newlyUnlockedAchievements,
   });
 });
@@ -4146,10 +4249,12 @@ function resolveSpeedTrackForCycle(
   });
 }
 
-app.get('/api/games/speed-track/round', (req: Request, res: Response) => {
+app.get('/api/games/speed-track/round', async (req: Request, res: Response) => {
+  setNoStoreHeaders(res);
+  await syncLatestCloudDbBeforeGame(res, false);
   const sessionUser = getSessionUser(req);
   const user = sessionUser && hasValidDbUserAndProfile(sessionUser.id) ? sessionUser : null;
-  const { cycleId, nextResetAt } = getMoscow12hCycle();
+  const { cycleKey: cycleId, nextResetAt } = getCurrentGameCycle();
   const round = resolveSpeedTrackForCycle(cycleId);
 
   if (!round) {
@@ -4160,13 +4265,8 @@ app.get('/api/games/speed-track/round', (req: Request, res: Response) => {
   let alreadyCompleted = false;
   let previousAttempt: any = null;
   if (user) {
-    const completion = db.prepare(`
-      SELECT * FROM game_completions WHERE user_id = ? AND game_type = 'speed-track' AND cycle_id = ?
-    `).get(user.id, cycleId) as any;
-    const row = db.prepare(`
-      SELECT * FROM daily_mini_game_attempts WHERE user_id = ? AND game_id = 'speed-track' AND cycle_id = ?
-    `).get(user.id, cycleId) as any;
-    if (completion || row) {
+    const { completed, completion, attempt: row } = getGameCycleLockStatus(user.id, 'speed-track', cycleId);
+    if (completed) {
       alreadyCompleted = true;
       const trackReveal = getTrackRevealInfo(row?.correct_value || round.track.id) || {
         id: round.track.id,
@@ -4196,6 +4296,7 @@ app.get('/api/games/speed-track/round', (req: Request, res: Response) => {
     snippet_start_ratio: round.snippet_start_ratio,
     snippet_duration: round.snippet_duration_seconds,
     options: round.options,
+    alreadyPlayed: alreadyCompleted,
     completed: alreadyCompleted,
     already_completed: alreadyCompleted,
     previous_attempt: previousAttempt,
@@ -4203,6 +4304,9 @@ app.get('/api/games/speed-track/round', (req: Request, res: Response) => {
 });
 
 app.post('/api/games/speed-track/verify', async (req: AuthRequest, res: Response) => {
+  setNoStoreHeaders(res);
+  if (!(await syncLatestCloudDbBeforeGame(res, true))) return;
+
   const { challenge_date, selected_track_id } = req.body || {};
   if (!selected_track_id || typeof selected_track_id !== 'string') {
     res.status(400).json({ error: 'Missing selected_track_id' });
@@ -4211,7 +4315,7 @@ app.post('/api/games/speed-track/verify', async (req: AuthRequest, res: Response
 
   const sessionUser = getSessionUser(req);
   const user = sessionUser && hasValidDbUserAndProfile(sessionUser.id) ? sessionUser : null;
-  const { cycleId, nextResetAt } = getMoscow12hCycle();
+  const { cycleKey: cycleId, nextResetAt } = getCurrentGameCycle();
 
   if (isValidMoscow12hCycle(challenge_date) && challenge_date !== cycleId) {
     res.status(409).json({
@@ -4235,15 +4339,12 @@ app.post('/api/games/speed-track/verify', async (req: AuthRequest, res: Response
   }
 
   if (user) {
-    const existingGc = db.prepare(`
-      SELECT id FROM game_completions WHERE user_id = ? AND game_type = 'speed-track' AND cycle_id = ?
-    `).get(user.id, cycleId);
-    const existing = db.prepare(`
-      SELECT id FROM daily_mini_game_attempts WHERE user_id = ? AND game_id = 'speed-track' AND cycle_id = ?
-    `).get(user.id, cycleId);
-    if (existingGc || existing) {
+    const lockStatus = getGameCycleLockStatus(user.id, 'speed-track', cycleId);
+    if (lockStatus.completed) {
       res.status(409).json({
         error: 'Вы уже прошли текущий раунд «0.5x / 2.5x». Обновление в 00:00 и 12:00 МСК!',
+        code: 'ALREADY_COMPLETED',
+        alreadyPlayed: true,
         completed: true,
         already_completed: true,
         xp_earned: 0,
@@ -4285,6 +4386,8 @@ app.post('/api/games/speed-track/verify', async (req: AuthRequest, res: Response
       if (saved.duplicate) {
         res.status(409).json({
           error: 'Вы уже прошли текущий раунд «0.5x / 2.5x». Обновление в 00:00 и 12:00 МСК!',
+          code: 'ALREADY_COMPLETED',
+          alreadyPlayed: true,
           completed: true,
           already_completed: true,
           xp_earned: 0,
@@ -4301,6 +4404,8 @@ app.post('/api/games/speed-track/verify', async (req: AuthRequest, res: Response
       if (String(err?.message || '').includes('UNIQUE')) {
         res.status(409).json({
           error: 'Вы уже прошли этот раунд.',
+          code: 'ALREADY_COMPLETED',
+          alreadyPlayed: true,
           completed: true,
           already_completed: true,
           xp_earned: 0,
@@ -4328,6 +4433,9 @@ app.post('/api/games/speed-track/verify', async (req: AuthRequest, res: Response
     next_reset_at: nextResetAt,
     refresh_interval_hours: 12,
     timezone: 'MSK',
+    alreadyPlayed: Boolean(user),
+    completed: Boolean(user),
+    already_completed: Boolean(user),
     newly_unlocked_achievements: newlyUnlockedAchievements,
   });
 });
@@ -4565,7 +4673,9 @@ app.post('/api/achievements/easter-egg', requireAuth, async (req: AuthRequest, r
 });
 
 // 3. Leaderboard (All-Time sorted strictly by Level DESC, Total XP DESC; Weekly/Monthly + optional Game filter)
-app.get('/api/games/leaderboard', (req: Request, res: Response) => {
+app.get('/api/games/leaderboard', async (req: Request, res: Response) => {
+  setNoStoreHeaders(res);
+  await syncLatestCloudDbBeforeGame(res, false);
   const rawTimeframe = String(req.query.timeframe || 'all');
   const timeframe = rawTimeframe === 'weekly' || rawTimeframe === 'monthly' ? rawTimeframe : 'all';
   const rawGame = String(req.query.game || 'all');
@@ -7273,6 +7383,9 @@ app.put('/api/admin/users/:id/full', requireAdmin, async (req: AuthRequest, res:
 });
 
 app.post('/api/admin/users/:id/reset-cycle', requireAdmin, async (req: AuthRequest, res: Response) => {
+  setNoStoreHeaders(res);
+  if (!(await syncLatestCloudDbBeforeGame(res, true))) return;
+
   const targetId = req.params.id;
   const target = db.prepare('SELECT id, nickname FROM users WHERE id = ?').get(targetId) as any;
   if (!target) {
@@ -7280,7 +7393,7 @@ app.post('/api/admin/users/:id/reset-cycle', requireAdmin, async (req: AuthReque
     return;
   }
 
-  const { cycleId } = getMoscow12hCycle();
+  const { cycleKey: cycleId } = getCurrentGameCycle();
   const dateOnly = cycleId.slice(0, 10);
   let cleared = 0;
 
@@ -7289,6 +7402,12 @@ app.post('/api/admin/users/:id/reset-cycle', requireAdmin, async (req: AuthReque
     const r2 = db.prepare('DELETE FROM daily_track_attempts WHERE user_id = ? AND challenge_date IN (?, ?)').run(targetId, cycleId, dateOnly);
     const r3 = db.prepare('DELETE FROM quiz_attempts WHERE user_id = ? AND challenge_date IN (?, ?)').run(targetId, cycleId, dateOnly);
     const r4 = db.prepare('DELETE FROM daily_mini_game_attempts WHERE user_id = ? AND cycle_id = ?').run(targetId, cycleId);
+    try {
+      db.prepare(`UPDATE xp_transactions SET reference_key = NULL WHERE user_id = ? AND reference_key LIKE ?`).run(
+        targetId,
+        `game:%:${cycleId}:${targetId}`
+      );
+    } catch {}
     cleared = Number(r1.changes || 0) + Number(r2.changes || 0) + Number(r3.changes || 0) + Number(r4.changes || 0);
   })();
 
@@ -7446,6 +7565,8 @@ app.post('/api/admin/users/:id/custom-shield', requireAdmin, async (req: AuthReq
 });
 
 app.post('/api/admin/users/reset', requireAdmin, async (req: AuthRequest, res: Response) => {
+  setNoStoreHeaders(res);
+  if (!(await syncLatestCloudDbBeforeGame(res, true))) return;
   const mode = req.body?.mode === 'bulk' ? 'bulk' : 'single';
   const result = executeAdminUserReset(getDb(), {
     adminUserId: req.user!.id,
@@ -8403,6 +8524,9 @@ app.get('/api/admin/leaderboard', requireAdmin, (req: Request, res: Response) =>
 });
 
 app.post('/api/admin/leaderboard/clear', requireAdmin, async (req: AuthRequest, res: Response) => {
+  setNoStoreHeaders(res);
+  if (!(await syncLatestCloudDbBeforeGame(res, true))) return;
+
   const rawScope = String(req.body?.scope || 'all').trim();
   const allowedScopes = new Set(['all', 'weekly', 'monthly', 'guess-track', 'daily-quiz', 'guess-lyrics', 'reverse-track', 'speed-track', 'daily-attempts']);
   if (!allowedScopes.has(rawScope)) {
@@ -8410,7 +8534,7 @@ app.post('/api/admin/leaderboard/clear', requireAdmin, async (req: AuthRequest, 
     return;
   }
 
-  const { cycleId } = getMoscow12hCycle();
+  const { cycleKey: cycleId } = getCurrentGameCycle();
   const removed = {
     game_attempts: 0,
     daily_track_attempts: 0,
@@ -8487,6 +8611,7 @@ app.post('/api/admin/leaderboard/clear', requireAdmin, async (req: AuthRequest, 
       removed.quiz_attempts = db.prepare('DELETE FROM quiz_attempts WHERE challenge_date = ?').run(cycleId).changes;
       try { db.prepare('DELETE FROM daily_mini_game_attempts WHERE cycle_id = ?').run(cycleId); } catch {}
       removed.game_completions = db.prepare('DELETE FROM game_completions WHERE cycle_id = ?').run(cycleId).changes;
+      try { db.prepare('UPDATE xp_transactions SET reference_key = NULL WHERE reference_key LIKE ?').run(`game:%:${cycleId}:%`); } catch {}
     }
 
   })();
@@ -8509,6 +8634,9 @@ app.post('/api/admin/leaderboard/clear', requireAdmin, async (req: AuthRequest, 
 });
 
 app.delete('/api/admin/leaderboard/users/:userId', requireAdmin, async (req: AuthRequest, res: Response) => {
+  setNoStoreHeaders(res);
+  if (!(await syncLatestCloudDbBeforeGame(res, true))) return;
+
   const userId = String(req.params.userId || '').trim();
   const rawScope = String(req.query.scope || req.body?.scope || 'all').trim();
   const allowedScopes = new Set(['all', 'guess-track', 'daily-quiz', 'guess-lyrics', 'reverse-track', 'speed-track', 'daily-attempts']);
@@ -8525,7 +8653,7 @@ app.delete('/api/admin/leaderboard/users/:userId', requireAdmin, async (req: Aut
     return;
   }
 
-  const { cycleId } = getMoscow12hCycle();
+  const { cycleKey: cycleId } = getCurrentGameCycle();
   const removed = {
     game_attempts: 0,
     daily_track_attempts: 0,
@@ -8573,6 +8701,7 @@ app.delete('/api/admin/leaderboard/users/:userId', requireAdmin, async (req: Aut
       removed.quiz_attempts = db.prepare('DELETE FROM quiz_attempts WHERE user_id = ? AND challenge_date = ?').run(userId, cycleId).changes;
       try { db.prepare('DELETE FROM daily_mini_game_attempts WHERE user_id = ? AND cycle_id = ?').run(userId, cycleId); } catch {}
       removed.game_completions = db.prepare('DELETE FROM game_completions WHERE user_id = ? AND cycle_id = ?').run(userId, cycleId).changes;
+      try { db.prepare('UPDATE xp_transactions SET reference_key = NULL WHERE user_id = ? AND reference_key LIKE ?').run(userId, `game:%:${cycleId}:${userId}`); } catch {}
     }
 
   })();

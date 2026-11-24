@@ -68,6 +68,7 @@ interface DailyTrackRound {
   snippet_duration: number;
   speed_mode?: 0.5 | 2.5;
   options: { id: string; title: string }[];
+  alreadyPlayed?: boolean;
   completed?: boolean;
   already_completed?: boolean;
   previous_attempt?: GuessResultState | null;
@@ -91,6 +92,7 @@ interface DailyLyricsRound {
   round_token: string;
   prompt_line: string;
   options: { id: string; text: string }[];
+  alreadyPlayed?: boolean;
   completed?: boolean;
   already_completed?: boolean;
   previous_attempt?: LyricsResultState | null;
@@ -160,7 +162,7 @@ function getDifficultyBadge(difficulty?: number) {
 
 export const GamesView: React.FC = () => {
   const { t, lang } = useI18n();
-  const { user, refresh, openAuth } = useAuth();
+  const { user, loading: authLoading, refresh, openAuth } = useAuth();
 
   const [activeTab, setActiveTab] = useState<GameTabId>(() => {
     try {
@@ -279,6 +281,11 @@ export const GamesView: React.FC = () => {
   }>({ start: 0, sourceDur: 2.5, listenDur: 5, rate: 0.5 });
 
   const autoReloadedCycleRef = useRef<Record<string, string>>({});
+  const guessLoadSeqRef = useRef<number>(0);
+  const quizLoadSeqRef = useRef<number>(0);
+  const lyricsLoadSeqRef = useRef<number>(0);
+  const reverseLoadSeqRef = useRef<number>(0);
+  const speedLoadSeqRef = useRef<number>(0);
 
   // -------------------------------------------------------------------------
   // LEADERBOARD
@@ -384,6 +391,7 @@ export const GamesView: React.FC = () => {
   // LOADERS
   // -------------------------------------------------------------------------
   const loadGuessRound = useCallback(async () => {
+    const reqId = ++guessLoadSeqRef.current;
     setGuessLoading(true);
     setGuessError(null);
     setGuessResult(null);
@@ -394,6 +402,8 @@ export const GamesView: React.FC = () => {
     try {
       const res = await authFetch('/api/games/guess-track/round', { cache: 'no-store' });
       const data = await safeJson<DailyTrackRound & { error?: string }>(res, null as any);
+      if (reqId !== guessLoadSeqRef.current) return;
+
       if (res.ok && data) {
         const clampedDur = Math.min(5, Math.max(1, Number(data.snippet_duration) || 5));
         snippetBoundsRef.current = {
@@ -404,7 +414,7 @@ export const GamesView: React.FC = () => {
         setGuessRound(data);
         setGuessStartTime(Date.now());
 
-        if (data.completed || data.already_completed) {
+        if (data.alreadyPlayed || data.completed || data.already_completed) {
           setGuessCompleted(true);
           if (data.previous_attempt) {
             setGuessResult(data.previous_attempt);
@@ -423,24 +433,31 @@ export const GamesView: React.FC = () => {
         setGuessError(data?.error || 'Не удалось загрузить аудиофрагмент.');
       }
     } catch (e: any) {
+      if (reqId !== guessLoadSeqRef.current) return;
       setGuessRound(null);
       setGuessError(e?.message || 'Ошибка соединения');
     } finally {
-      setGuessLoading(false);
+      if (reqId === guessLoadSeqRef.current) {
+        setGuessLoading(false);
+      }
     }
   }, [destroySnippetAudio, user]);
 
   const loadDailyQuiz = useCallback(async () => {
+    const reqId = ++quizLoadSeqRef.current;
     setQuizLoading(true);
     setQuizError(null);
     setQuizDisabled(false);
     setQuizDisabledMessage('');
     setQuizSubmitted(false);
     setQuizResult(null);
+    setAlreadyCompletedDaily(false);
     setQuizAnswers({});
     try {
       const res = await authFetch('/api/games/quiz/daily', { cache: 'no-store' });
       const data = await safeJson<any>(res, null);
+      if (reqId !== quizLoadSeqRef.current) return;
+
       if (res.ok && data) {
         setQuizChallengeDate(data.challenge_date || '');
         setQuizNextResetAt(data.next_reset_at || null);
@@ -450,7 +467,7 @@ export const GamesView: React.FC = () => {
           setQuizQuestions([]);
         } else {
           setQuizQuestions(data.questions || []);
-          setAlreadyCompletedDaily(Boolean(data.completed || data.already_completed));
+          setAlreadyCompletedDaily(Boolean(data.alreadyPlayed || data.completed || data.already_completed));
           setPreviousScore(data.previous_score || 0);
           setPreviousXp(data.previous_xp || 0);
           setQuizStartTime(Date.now());
@@ -459,13 +476,17 @@ export const GamesView: React.FC = () => {
         setQuizError(data?.error || 'Не удалось загрузить викторину.');
       }
     } catch (e: any) {
+      if (reqId !== quizLoadSeqRef.current) return;
       setQuizError(e?.message || 'Ошибка соединения');
     } finally {
-      setQuizLoading(false);
+      if (reqId === quizLoadSeqRef.current) {
+        setQuizLoading(false);
+      }
     }
   }, []);
 
   const loadLyricsRound = useCallback(async () => {
+    const reqId = ++lyricsLoadSeqRef.current;
     setLyricsLoading(true);
     setLyricsError(null);
     setLyricsResult(null);
@@ -475,9 +496,11 @@ export const GamesView: React.FC = () => {
     try {
       const res = await authFetch('/api/games/guess-lyrics/round', { cache: 'no-store' });
       const data = await safeJson<DailyLyricsRound & { error?: string }>(res, null as any);
+      if (reqId !== lyricsLoadSeqRef.current) return;
+
       if (res.ok && data) {
         setLyricsRound(data);
-        if (data.completed || data.already_completed) {
+        if (data.alreadyPlayed || data.completed || data.already_completed) {
           setLyricsCompleted(true);
           if (data.previous_attempt) {
             setLyricsResult(data.previous_attempt);
@@ -496,14 +519,18 @@ export const GamesView: React.FC = () => {
         setLyricsError(data?.error || 'Не удалось загрузить игру «Угадай строчку».');
       }
     } catch (e: any) {
+      if (reqId !== lyricsLoadSeqRef.current) return;
       setLyricsRound(null);
       setLyricsError(e?.message || 'Ошибка соединения');
     } finally {
-      setLyricsLoading(false);
+      if (reqId === lyricsLoadSeqRef.current) {
+        setLyricsLoading(false);
+      }
     }
   }, [user]);
 
   const loadReverseRound = useCallback(async () => {
+    const reqId = ++reverseLoadSeqRef.current;
     setReverseLoading(true);
     setReverseError(null);
     setReverseResult(null);
@@ -515,10 +542,12 @@ export const GamesView: React.FC = () => {
     try {
       const res = await authFetch('/api/games/reverse-track/round', { cache: 'no-store' });
       const data = await safeJson<DailyTrackRound & { error?: string }>(res, null as any);
+      if (reqId !== reverseLoadSeqRef.current) return;
+
       if (res.ok && data) {
         setReverseRound(data);
         setReverseDuration(Math.min(5, Math.max(1, Number(data.snippet_duration) || 5)));
-        if (data.completed || data.already_completed) {
+        if (data.alreadyPlayed || data.completed || data.already_completed) {
           setReverseCompleted(true);
           if (data.previous_attempt) {
             setReverseResult(data.previous_attempt);
@@ -537,14 +566,18 @@ export const GamesView: React.FC = () => {
         setReverseError(data?.error || 'Не удалось загрузить раунд «Задом наперёд».');
       }
     } catch (e: any) {
+      if (reqId !== reverseLoadSeqRef.current) return;
       setReverseRound(null);
       setReverseError(e?.message || 'Ошибка соединения');
     } finally {
-      setReverseLoading(false);
+      if (reqId === reverseLoadSeqRef.current) {
+        setReverseLoading(false);
+      }
     }
   }, [abortReverseFetch, stopWebAudioPlayback, user]);
 
   const loadSpeedRound = useCallback(async () => {
+    const reqId = ++speedLoadSeqRef.current;
     setSpeedLoading(true);
     setSpeedError(null);
     setSpeedResult(null);
@@ -555,6 +588,8 @@ export const GamesView: React.FC = () => {
     try {
       const res = await authFetch('/api/games/speed-track/round', { cache: 'no-store' });
       const data = await safeJson<DailyTrackRound & { error?: string }>(res, null as any);
+      if (reqId !== speedLoadSeqRef.current) return;
+
       if (res.ok && data) {
         const rate: 0.5 | 2.5 = data.speed_mode === 2.5 ? 2.5 : 0.5;
         const listenDur = Math.min(5, Math.max(1, Number(data.snippet_duration) || 5));
@@ -566,7 +601,7 @@ export const GamesView: React.FC = () => {
         };
         setSpeedRound(data);
         setSpeedDuration(listenDur);
-        if (data.completed || data.already_completed) {
+        if (data.alreadyPlayed || data.completed || data.already_completed) {
           setSpeedCompleted(true);
           if (data.previous_attempt) {
             setSpeedResult(data.previous_attempt);
@@ -585,10 +620,13 @@ export const GamesView: React.FC = () => {
         setSpeedError(data?.error || 'Не удалось загрузить раунд «0.5x / 2.5x».');
       }
     } catch (e: any) {
+      if (reqId !== speedLoadSeqRef.current) return;
       setSpeedRound(null);
       setSpeedError(e?.message || 'Ошибка соединения');
     } finally {
-      setSpeedLoading(false);
+      if (reqId === speedLoadSeqRef.current) {
+        setSpeedLoading(false);
+      }
     }
   }, [destroySpeedAudio, user]);
 
@@ -619,6 +657,8 @@ export const GamesView: React.FC = () => {
       closeWebAudioContext().catch(() => {});
     }
 
+    if (authLoading) return;
+
     if (activeTab === 'guess') loadGuessRound();
     else if (activeTab === 'quiz') loadDailyQuiz();
     else if (activeTab === 'lyrics') loadLyricsRound();
@@ -632,7 +672,7 @@ export const GamesView: React.FC = () => {
       abortReverseFetch();
       stopWebAudioPlayback();
     };
-  }, [activeTab, user?.id]);
+  }, [activeTab, user?.id, authLoading]);
 
   useEffect(() => {
     if (activeTab === 'leaderboard') {
@@ -1009,6 +1049,7 @@ export const GamesView: React.FC = () => {
     try {
       const res = await authFetch('/api/games/guess-track/verify', {
         method: 'POST',
+        cache: 'no-store',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           round_token: guessRound.round_token,
@@ -1045,7 +1086,7 @@ export const GamesView: React.FC = () => {
       } else {
         setSelectedGuessOption(null);
         setGuessError(data?.error || 'Не удалось проверить ответ.');
-        if (res.status === 409 || data?.already_completed) {
+        if (res.status === 409 || data?.alreadyPlayed || data?.already_completed) {
           setGuessCompleted(true);
           await loadGuessRound();
         }
@@ -1066,6 +1107,7 @@ export const GamesView: React.FC = () => {
     try {
       const res = await authFetch('/api/games/quiz/submit', {
         method: 'POST',
+        cache: 'no-store',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           answers: quizAnswers,
@@ -1088,7 +1130,7 @@ export const GamesView: React.FC = () => {
         if (user) await refresh();
       } else {
         setQuizError(data?.error || 'Не удалось отправить ответы.');
-        if (res.status === 409 || data?.already_completed) {
+        if (res.status === 409 || data?.alreadyPlayed || data?.already_completed) {
           setAlreadyCompletedDaily(true);
           await loadDailyQuiz();
         }
@@ -1109,6 +1151,7 @@ export const GamesView: React.FC = () => {
     try {
       const res = await authFetch('/api/games/guess-lyrics/verify', {
         method: 'POST',
+        cache: 'no-store',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           challenge_date: lyricsRound.challenge_date,
@@ -1144,7 +1187,7 @@ export const GamesView: React.FC = () => {
       } else {
         setSelectedLyricOption(null);
         setLyricsError(data?.error || 'Не удалось проверить ответ.');
-        if (res.status === 409 || data?.already_completed) {
+        if (res.status === 409 || data?.alreadyPlayed || data?.already_completed) {
           setLyricsCompleted(true);
           await loadLyricsRound();
         }
@@ -1167,6 +1210,7 @@ export const GamesView: React.FC = () => {
     try {
       const res = await authFetch('/api/games/reverse-track/verify', {
         method: 'POST',
+        cache: 'no-store',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           challenge_date: reverseRound.challenge_date,
@@ -1201,7 +1245,7 @@ export const GamesView: React.FC = () => {
       } else {
         setSelectedReverseOption(null);
         setReverseError(data?.error || 'Не удалось проверить ответ.');
-        if (res.status === 409 || data?.already_completed) {
+        if (res.status === 409 || data?.alreadyPlayed || data?.already_completed) {
           setReverseCompleted(true);
           await loadReverseRound();
         }
@@ -1224,6 +1268,7 @@ export const GamesView: React.FC = () => {
     try {
       const res = await authFetch('/api/games/speed-track/verify', {
         method: 'POST',
+        cache: 'no-store',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           challenge_date: speedRound.challenge_date,
@@ -1259,7 +1304,7 @@ export const GamesView: React.FC = () => {
       } else {
         setSelectedSpeedOption(null);
         setSpeedError(data?.error || 'Не удалось проверить ответ.');
-        if (res.status === 409 || data?.already_completed) {
+        if (res.status === 409 || data?.alreadyPlayed || data?.already_completed) {
           setSpeedCompleted(true);
           await loadSpeedRound();
         }
@@ -1516,6 +1561,18 @@ export const GamesView: React.FC = () => {
                   })}
                 </div>
 
+                {!guessResult && guessCompleted && (
+                  <div className="p-4 rounded-lg bg-[#16151a] border border-white/[0.08] space-y-2 animate-fadeIn font-mono text-center">
+                    <div className="flex items-center justify-center gap-2 text-xs font-semibold text-[#48bb78]">
+                      <CheckCircle2 className="w-4 h-4" />
+                      <span>Раунд уже сыгран</span>
+                    </div>
+                    <div className="text-[11px] text-[#8e877e]">
+                      Следующий раунд через {guessCountdown} (00:00 / 12:00 МСК)
+                    </div>
+                  </div>
+                )}
+
                 {guessResult && (
                   <div className="p-4 rounded-lg bg-[#16151a] border border-white/[0.08] space-y-3 animate-fadeIn font-mono">
                     <div className="flex flex-wrap items-center justify-center gap-2 text-xs font-semibold">
@@ -1593,7 +1650,7 @@ export const GamesView: React.FC = () => {
                   </div>
                 )}
               </div>
-            ) : guessLoading ? (
+            ) : guessLoading || authLoading ? (
               <div className="py-12 font-mono text-xs text-[#8e877e]">Загрузка аудиофрагмента...</div>
             ) : null}
           </div>
@@ -1699,7 +1756,7 @@ export const GamesView: React.FC = () => {
                 </button>
               </div>
             </div>
-          ) : quizLoading ? (
+          ) : quizLoading || authLoading ? (
             <div className="py-12 text-center font-mono text-xs text-[#8e877e]">
               Загрузка вопросов викторины...
             </div>
@@ -1913,6 +1970,18 @@ export const GamesView: React.FC = () => {
                 </div>
 
                 {/* Result Banner */}
+                {!lyricsResult && lyricsCompleted && (
+                  <div className="p-4 rounded-lg bg-[#16151a] border border-white/[0.08] space-y-2 animate-fadeIn font-mono text-center">
+                    <div className="flex items-center justify-center gap-2 text-xs font-semibold text-[#48bb78]">
+                      <CheckCircle2 className="w-4 h-4" />
+                      <span>Раунд уже сыгран</span>
+                    </div>
+                    <div className="text-[11px] text-[#8e877e]">
+                      Новая строчка через {lyricsCountdown} (00:00 / 12:00 МСК)
+                    </div>
+                  </div>
+                )}
+
                 {lyricsResult && (
                   <div className="p-4 rounded-lg bg-[#16151a] border border-white/[0.08] space-y-3 text-center animate-fadeIn font-mono">
                     <div className="flex flex-wrap items-center justify-center gap-2 text-xs font-semibold">
@@ -1977,7 +2046,7 @@ export const GamesView: React.FC = () => {
                   </div>
                 )}
               </div>
-            ) : lyricsLoading ? (
+            ) : lyricsLoading || authLoading ? (
               <div className="py-12 text-center font-mono text-xs text-[#8e877e]">Загрузка строчки...</div>
             ) : null}
           </div>
@@ -2099,6 +2168,18 @@ export const GamesView: React.FC = () => {
                   })}
                 </div>
 
+                {!reverseResult && reverseCompleted && (
+                  <div className="p-4 rounded-lg bg-[#16151a] border border-white/[0.08] space-y-2 animate-fadeIn font-mono text-center">
+                    <div className="flex items-center justify-center gap-2 text-xs font-semibold text-[#48bb78]">
+                      <CheckCircle2 className="w-4 h-4" />
+                      <span>Раунд уже сыгран</span>
+                    </div>
+                    <div className="text-[11px] text-[#8e877e]">
+                      Новый трек через {reverseCountdown} (00:00 / 12:00 МСК)
+                    </div>
+                  </div>
+                )}
+
                 {reverseResult && (
                   <div className="p-4 rounded-lg bg-[#16151a] border border-white/[0.08] space-y-3 animate-fadeIn font-mono">
                     <div className="flex flex-wrap items-center justify-center gap-2 text-xs font-semibold">
@@ -2163,7 +2244,7 @@ export const GamesView: React.FC = () => {
                   </div>
                 )}
               </div>
-            ) : reverseLoading ? (
+            ) : reverseLoading || authLoading ? (
               <div className="py-12 font-mono text-xs text-[#8e877e]">Загрузка реверс-раунда...</div>
             ) : null}
           </div>
@@ -2290,6 +2371,18 @@ export const GamesView: React.FC = () => {
                   })}
                 </div>
 
+                {!speedResult && speedCompleted && (
+                  <div className="p-4 rounded-lg bg-[#16151a] border border-white/[0.08] space-y-2 animate-fadeIn font-mono text-center">
+                    <div className="flex items-center justify-center gap-2 text-xs font-semibold text-[#48bb78]">
+                      <CheckCircle2 className="w-4 h-4" />
+                      <span>Раунд уже сыгран</span>
+                    </div>
+                    <div className="text-[11px] text-[#8e877e]">
+                      Новый трек через {speedCountdown} (00:00 / 12:00 МСК)
+                    </div>
+                  </div>
+                )}
+
                 {speedResult && (
                   <div className="p-4 rounded-lg bg-[#16151a] border border-white/[0.08] space-y-3 animate-fadeIn font-mono">
                     <div className="flex flex-wrap items-center justify-center gap-2 text-xs font-semibold">
@@ -2357,7 +2450,7 @@ export const GamesView: React.FC = () => {
                   </div>
                 )}
               </div>
-            ) : speedLoading ? (
+            ) : speedLoading || authLoading ? (
               <div className="py-12 font-mono text-xs text-[#8e877e]">Загрузка раунда...</div>
             ) : null}
           </div>
