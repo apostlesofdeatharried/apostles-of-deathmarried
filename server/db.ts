@@ -72,6 +72,10 @@ export const db: Database.Database = new Proxy({} as Database.Database, {
   },
 });
 
+export function getDb(): Database.Database {
+  return currentDb;
+}
+
 export function getDbPath(): string {
   return activeDbPath;
 }
@@ -126,7 +130,7 @@ export function replaceDatabaseWithBuffer(buffer: Buffer): void {
   fs.writeFileSync(tmpFile, buffer);
   fs.renameSync(tmpFile, activeDbPath);
   currentDb = openConfiguredDatabase(activeDbPath);
-  ensureSchemaAndMigrations();
+  ensureSchemaAndMigrations(currentDb);
 }
 
 export function ensureSchemaAndMigrations(targetDb: Database.Database = db) {

@@ -6,7 +6,7 @@ import fs from 'fs';
 import http from 'http';
 import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
-import { db, initDatabase, closeDatabase } from './server/db.js';
+import { db, getDb, getDbPath, initDatabase, closeDatabase } from './server/db.js';
 import {
   ensureCloudDatabaseRestored,
   pushDatabaseBackupNow,
@@ -164,23 +164,13 @@ app.use('/api', (req: Request, res: Response, next: NextFunction) => {
 const STATELESS_POST_PATHS = new Set(['/api/upload/signed-url']);
 const MUTATING_HTTP_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
-let coldStartRestorePromise: Promise<void> | null = null;
-function triggerColdStartRestoreOnce(): Promise<void> {
-  if (!coldStartRestorePromise) {
-    coldStartRestorePromise = ensureCloudDatabaseRestored().catch((err) => {
-      console.warn('[CloudSync] Cold-start restore warning:', err instanceof Error ? err.message : err);
-    });
-  }
-  return coldStartRestorePromise;
-}
-
 // Cold-start-only restore + write-through backup on mutations.
 // CRITICAL: DB backup upload to Supabase Storage ONLY runs after successful mutating requests (POST/PUT/PATCH/DELETE).
-// GET requests NEVER download or upload apostles.db (cold-start restore runs once only when local DB did not exist).
+// GET requests restore strictly once per container cold start and never download/upload afterwards.
 app.use(async (req: Request, res: Response, next: NextFunction) => {
   if (req.path.startsWith('/api') || req.path.startsWith('/uploads')) {
     if (isSupabaseConfigured()) {
-      await triggerColdStartRestoreOnce();
+      await ensureCloudDatabaseRestored();
 
       const isMutation =
         MUTATING_HTTP_METHODS.has(req.method) && !STATELESS_POST_PATHS.has(req.path);
@@ -8753,10 +8743,32 @@ app.use('/assets', express.static(path.resolve(process.cwd(), 'public', 'assets'
 
 // Health & deployment diagnostic endpoint
 app.get('/api/health', (_req: Request, res: Response) => {
+  let dbFileSizeBytes = 0;
+  let albumsCount = 0;
+  let usersCount = 0;
+
+  try {
+    const dbPath = getDbPath();
+    if (fs.existsSync(dbPath)) {
+      dbFileSizeBytes = fs.statSync(dbPath).size;
+    }
+  } catch {}
+
+  try {
+    const activeDb = getDb();
+    const albumRow = activeDb.prepare('SELECT COUNT(*) as cnt FROM albums').get() as { cnt?: number } | undefined;
+    const userRow = activeDb.prepare('SELECT COUNT(*) as cnt FROM users').get() as { cnt?: number } | undefined;
+    albumsCount = Number(albumRow?.cnt || 0);
+    usersCount = Number(userRow?.cnt || 0);
+  } catch {}
+
   res.json({
     ok: true,
     service: 'Apostles of deathmarried API',
     ...getCloudSyncStatus(),
+    dbFileSizeBytes,
+    albumsCount,
+    usersCount,
   });
 });
 
@@ -8779,7 +8791,7 @@ app.use('/api', (err: any, _req: Request, res: Response, _next: NextFunction) =>
 
 async function startServer() {
   if (isSupabaseConfigured()) {
-    await triggerColdStartRestoreOnce();
+    await ensureCloudDatabaseRestored();
   }
 
   const httpServer = http.createServer(app);

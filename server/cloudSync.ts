@@ -3,7 +3,6 @@ import {
   serializeDatabase,
   replaceDatabaseWithBuffer,
   getDbPath,
-  didDatabaseExistOnBoot,
   checkpointDatabase,
 } from './db.js';
 import { transliterateToAsciiSlug } from '../src/utils/logic.js';
@@ -11,7 +10,9 @@ import { transliterateToAsciiSlug } from '../src/utils/logic.js';
 const DEFAULT_BUCKET_NAME = 'apostles-archive-persistence';
 const DB_OBJECT_PATH = 'db/apostles.db';
 const MEDIA_OBJECT_PREFIX = 'media';
-const SUPABASE_STARTUP_TIMEOUT_MS = 4000;
+const SUPABASE_STARTUP_TIMEOUT_MS = 15000;
+
+export type CloudRestoreStatus = 'restored' | 'not_found' | 'failed' | 'skipped';
 
 export interface SyncPullResult {
   updated: boolean;
@@ -39,7 +40,10 @@ let hooks: CloudSyncHooks = {
   replaceDb: replaceDatabaseWithBuffer,
 };
 
-let initialRestoreCompleted = false;
+let isCloudRestored = false;
+let restorePromise: Promise<void> | null = null;
+let cloudRestoreStatus: CloudRestoreStatus = 'skipped';
+let cloudRestoreError: string | null = null;
 let bucketEnsured = false;
 let lastBackupAt = 0;
 let lastBackupError: string | null = null;
@@ -65,13 +69,13 @@ function getBucketName(): string {
 
 export function isSupabaseConfigured(): boolean {
   return Boolean(
-    process.env.SUPABASE_URL &&
-    (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY)
+    process.env.SUPABASE_URL?.trim() &&
+    process.env.SUPABASE_SERVICE_ROLE_KEY?.trim()
   );
 }
 
 function getSupabaseKey(): string {
-  return (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || '').trim();
+  return (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
 }
 
 function getSupabaseHeaders(contentType?: string): Record<string, string> {
@@ -162,6 +166,19 @@ async function uploadCurrentDatabaseInternal(): Promise<SyncPushResult> {
     return { ok: false, error: 'Supabase Storage is not configured' };
   }
 
+  // If no cold-start check has verified the remote DB yet, pull state before ever allowing an upload.
+  if (cloudRestoreStatus === 'skipped') {
+    await pullDatabaseFromSupabaseInternal({ force: true });
+  }
+
+  // Protection against overwriting the live remote DB with an empty local DB after failed/timed-out restore.
+  if (cloudRestoreStatus !== 'restored' && cloudRestoreStatus !== 'not_found') {
+    const errMsg = `Upload blocked: cold-start restore status is '${cloudRestoreStatus}' (${cloudRestoreError || 'remote state unverified'}). Refusing to overwrite remote database.`;
+    lastBackupError = errMsg;
+    console.error(`[CloudSync] ${errMsg}`);
+    return { ok: false, error: errMsg };
+  }
+
   const baseUrl = getSupabaseBaseUrl();
   const bucketName = getBucketName();
   const objectUrl = `${baseUrl}/storage/v1/object/${encodeURIComponent(bucketName)}/${encodeObjectPath(DB_OBJECT_PATH)}`;
@@ -200,7 +217,9 @@ async function uploadCurrentDatabaseInternal(): Promise<SyncPushResult> {
         lastBackupError = null;
         lastSyncedSha256 = localSha;
         lastSyncCheckedAt = Date.now();
-        initialRestoreCompleted = true;
+        isCloudRestored = true;
+        cloudRestoreStatus = 'restored';
+        cloudRestoreError = null;
 
         return {
           ok: true,
@@ -238,6 +257,7 @@ async function uploadCurrentDatabaseInternal(): Promise<SyncPushResult> {
 /**
  * Strictly READ-ONLY pull of `db/apostles.db` from Supabase Storage.
  * - NEVER uploads/overwrites `db/apostles.db` (safe for GET requests on cold/warm Vercel instances).
+ * - Downloads directly without an extra ensureBucketExists() round-trip so cold start stays fast.
  * - Always appends `?t=${Date.now()}` + `Cache-Control: no-cache, no-store` + `Pragma: no-cache` + `cache: 'no-store'`
  *   and never sends `If-None-Match`, completely bypassing Supabase/CDN/proxy caching.
  * - Uses SHA-256 comparison on the freshly downloaded bytes so unchanged snapshots skip redundant DB reopens.
@@ -247,14 +267,16 @@ async function pullDatabaseFromSupabaseInternal(options: {
   minIntervalMs?: number;
 }): Promise<SyncPullResult> {
   if (!isSupabaseConfigured()) {
-    initialRestoreCompleted = true;
+    isCloudRestored = true;
+    cloudRestoreStatus = 'skipped';
+    cloudRestoreError = null;
     return { updated: false, notModified: true };
   }
 
   const minInterval = options.minIntervalMs ?? 0;
   if (
     !options.force &&
-    initialRestoreCompleted &&
+    isCloudRestored &&
     minInterval > 0 &&
     Date.now() - lastSyncCheckedAt < minInterval
   ) {
@@ -267,8 +289,6 @@ async function pullDatabaseFromSupabaseInternal(options: {
   const objectUrl = `${baseUrl}/storage/v1/object/${encodeURIComponent(bucketName)}/${encodeObjectPath(DB_OBJECT_PATH)}?t=${cacheBuster}`;
 
   try {
-    await ensureBucketExists();
-
     const res = await hooks.fetchImpl(objectUrl, {
       method: 'GET',
       headers: {
@@ -287,23 +307,30 @@ async function pullDatabaseFromSupabaseInternal(options: {
       if (!isValidSqliteBuffer(buffer)) {
         const msg = `Remote snapshot is not a valid SQLite database (${buffer.length} bytes)`;
         lastBackupError = msg;
-        console.warn(`[CloudSync] ${msg}`);
-        initialRestoreCompleted = true;
+        cloudRestoreStatus = 'failed';
+        cloudRestoreError = msg;
+        isCloudRestored = false;
+        console.error(`[CloudSync] ${msg}`);
         return { updated: false, error: msg };
       }
 
       const remoteSha = computeSha256(buffer);
-      const shouldReplace = !initialRestoreCompleted || remoteSha !== lastSyncedSha256;
+      const shouldReplace = !isCloudRestored || remoteSha !== lastSyncedSha256;
 
       if (shouldReplace) {
         hooks.replaceDb(buffer);
         lastSyncedSha256 = remoteSha;
-        console.log(`[CloudSync] Synced fresh SQLite snapshot from Supabase (${buffer.length} bytes)`);
       }
 
       lastSyncCheckedAt = Date.now();
-      initialRestoreCompleted = true;
+      isCloudRestored = true;
+      cloudRestoreStatus = 'restored';
+      cloudRestoreError = null;
       lastBackupError = null;
+
+      console.log(
+        `[CloudSync] Cold-start restore succeeded: bucket=${bucketName}, path=${DB_OBJECT_PATH}, bytes=${buffer.length}, replaced=${shouldReplace}`
+      );
 
       return {
         updated: shouldReplace,
@@ -312,29 +339,43 @@ async function pullDatabaseFromSupabaseInternal(options: {
     }
 
     if (res.status === 404) {
-      // Remote DB does not exist yet — do NOT upload during a read/pull!
-      // It will be created automatically on the first real mutation (POST/PUT/PATCH/DELETE).
       lastSyncCheckedAt = Date.now();
-      initialRestoreCompleted = true;
+      isCloudRestored = true;
+      cloudRestoreStatus = 'not_found';
+      cloudRestoreError = null;
+      console.log(
+        `[CloudSync] Cold-start restore: remote file not found (HTTP 404) at ${bucketName}/${DB_OBJECT_PATH}; continuing with local DB.`
+      );
       return { updated: false, notFound: true };
     }
 
     const errText = await res.text().catch(() => '');
-    // Supabase Storage sometimes wraps object-not-found as HTTP 400 with "not_found" / "Object not found"
+    // Supabase Storage sometimes wraps object-not-found / bucket-not-found as HTTP 400
     if (res.status === 400 && /not[_\s-]?found|404/i.test(errText)) {
       lastSyncCheckedAt = Date.now();
-      initialRestoreCompleted = true;
+      isCloudRestored = true;
+      cloudRestoreStatus = 'not_found';
+      cloudRestoreError = null;
+      console.log(
+        `[CloudSync] Cold-start restore: remote file not found (HTTP 400) at ${bucketName}/${DB_OBJECT_PATH}; continuing with local DB.`
+      );
       return { updated: false, notFound: true };
     }
 
     const errMsg = `Restore HTTP ${res.status}${errText ? `: ${errText.slice(0, 180)}` : ''}`;
     lastBackupError = errMsg;
-    console.warn(`[CloudSync] Pull failed: ${errMsg}`);
+    cloudRestoreStatus = 'failed';
+    cloudRestoreError = errMsg;
+    isCloudRestored = false;
+    console.error(`[CloudSync] Cold-start restore failed: ${errMsg}`);
     return { updated: false, error: errMsg };
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : 'restore failed';
     lastBackupError = errMsg;
-    console.warn('[CloudSync] Pull skipped or failed:', errMsg);
+    cloudRestoreStatus = 'failed';
+    cloudRestoreError = errMsg;
+    isCloudRestored = false;
+    console.error('[CloudSync] Cold-start restore failed:', errMsg);
     return { updated: false, error: errMsg };
   }
 }
@@ -349,40 +390,51 @@ export async function syncCloudDatabase(options: {
   minIntervalMs?: number;
 } = {}): Promise<SyncPullResult> {
   if (!isSupabaseConfigured()) {
-    initialRestoreCompleted = true;
+    isCloudRestored = true;
+    cloudRestoreStatus = 'skipped';
+    cloudRestoreError = null;
     return { updated: false, notModified: true };
   }
   return enqueueSyncOp(() => pullDatabaseFromSupabaseInternal(options));
 }
 
 /**
- * Restores the latest SQLite snapshot from Supabase Storage ONLY on cold start
- * (when the local DB file did not exist yet in `/tmp` or `data/`), with a strict
- * 4-second timeout so startup falls back to local DB immediately if cloud is unreachable.
+ * Restores the latest SQLite snapshot from Supabase Storage once per container lifetime.
+ * - While `isCloudRestored === false`, any incoming request awaits the shared `restorePromise`.
+ * - Once restored (`isCloudRestored === true`), subsequent requests return immediately with 0 Supabase calls.
+ * - If restore fails due to network/timeout/error, resets `restorePromise = null` so the next request retries.
  */
 export async function ensureCloudDatabaseRestored(): Promise<void> {
-  if (initialRestoreCompleted || !isSupabaseConfigured() || didDatabaseExistOnBoot()) {
-    initialRestoreCompleted = true;
+  if (!isSupabaseConfigured()) {
+    cloudRestoreStatus = 'skipped';
+    cloudRestoreError = null;
+    isCloudRestored = true;
     return;
   }
 
-  let timeoutId: ReturnType<typeof setTimeout> | undefined;
-  try {
-    await Promise.race([
-      syncCloudDatabase({ force: true }),
-      new Promise<void>((resolve) => {
-        timeoutId = setTimeout(() => {
-          console.warn(
-            `[CloudSync] Cold-start restore timed out after ${SUPABASE_STARTUP_TIMEOUT_MS}ms — continuing on local database`
-          );
-          resolve();
-        }, SUPABASE_STARTUP_TIMEOUT_MS);
-      }),
-    ]);
-  } finally {
-    if (timeoutId !== undefined) clearTimeout(timeoutId);
-    initialRestoreCompleted = true;
+  if (isCloudRestored) {
+    return;
   }
+
+  if (!restorePromise) {
+    restorePromise = syncCloudDatabase({ force: true })
+      .then((res) => {
+        if (res.error) {
+          restorePromise = null;
+        }
+      })
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : 'restore failed';
+        cloudRestoreStatus = 'failed';
+        cloudRestoreError = msg;
+        lastBackupError = msg;
+        isCloudRestored = false;
+        restorePromise = null;
+        console.error('[CloudSync] Cold-start restore exception:', msg);
+      });
+  }
+
+  await restorePromise;
 }
 
 /**
@@ -395,6 +447,8 @@ export async function pushDatabaseBackupNow(): Promise<SyncPushResult> {
   }
   return enqueueSyncOp(() => uploadCurrentDatabaseInternal());
 }
+
+export const uploadDatabaseToCloud = pushDatabaseBackupNow;
 
 /**
  * Mirrors an uploaded media file (MP3, WAV, cover image, video) into Supabase Storage
@@ -560,12 +614,19 @@ export async function deleteMediaFromSupabase(filename: string): Promise<boolean
 export function getCloudSyncStatus() {
   const isVercel = Boolean(process.env.VERCEL);
   const supabaseReady = isSupabaseConfigured();
+  const bucketName = getBucketName();
   return {
     environment: isVercel ? 'vercel-serverless' : 'node-server',
     database_path: getDbPath(),
+    supabaseConfigured: supabaseReady,
+    bucketName,
+    dbObjectPath: DB_OBJECT_PATH,
+    cloudRestoreStatus,
+    cloudRestoreError,
+    isCloudRestored,
     cloud_persistence_enabled: supabaseReady,
     direct_media_upload_enabled: supabaseReady,
-    storage_bucket: supabaseReady ? getBucketName() : null,
+    storage_bucket: supabaseReady ? bucketName : null,
     storage_mode: supabaseReady
       ? 'supabase-cloud-synced-sqlite'
       : isVercel
@@ -581,7 +642,10 @@ export function getCloudSyncStatus() {
  * Internal helper for unit tests to inject mock fetch/db hooks and reset in-memory sync state.
  */
 export function _configureCloudSyncForTests(partial?: Partial<CloudSyncHooks>) {
-  initialRestoreCompleted = false;
+  isCloudRestored = false;
+  restorePromise = null;
+  cloudRestoreStatus = 'skipped';
+  cloudRestoreError = null;
   bucketEnsured = false;
   lastBackupAt = 0;
   lastBackupError = null;

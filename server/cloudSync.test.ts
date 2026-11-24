@@ -1,9 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import Database from 'better-sqlite3';
 import {
   syncCloudDatabase,
+  ensureCloudDatabaseRestored,
   pushDatabaseBackupNow,
+  uploadDatabaseToCloud,
   createSignedMediaUploadUrl,
+  getCloudSyncStatus,
   _configureCloudSyncForTests,
 } from './cloudSync.js';
 
@@ -11,6 +15,19 @@ function makeFakeSqliteBuffer(tag: string): Buffer {
   const header = Buffer.from('SQLite format 3\0', 'utf8');
   const body = Buffer.from(tag.padEnd(128, '_'), 'utf8');
   return Buffer.concat([header, body]);
+}
+
+function makeRealSeededSqliteBuffer(): Buffer {
+  const mem = new Database(':memory:');
+  mem.exec(`
+    CREATE TABLE albums (id TEXT PRIMARY KEY, title TEXT NOT NULL);
+    CREATE TABLE users (id TEXT PRIMARY KEY, nickname TEXT NOT NULL);
+    INSERT INTO albums (id, title) VALUES ('alb_test', 'nightmortan');
+    INSERT INTO users (id, nickname) VALUES ('u_test', 'apostle_prod');
+  `);
+  const buf = mem.serialize();
+  mem.close();
+  return buf;
 }
 
 test('CloudSync pulls with ?t= cache-buster + no-store (never If-None-Match), never uploads on GET/404/400, and hot-swaps on change', async () => {
@@ -26,6 +43,7 @@ test('CloudSync pulls with ?t= cache-buster + no-store (never If-None-Match), ne
     const seenGetHeaders: Array<{ cacheControl: string | null; pragma: string | null; ifNoneMatch: string | null }> = [];
     const seenCacheModes: Array<RequestCache | undefined> = [];
     const seenUpsertHeaders: string[] = [];
+    let bucketCheckCallsDuringGet = 0;
     let postUploadCount = 0;
     let replaceCount = 0;
 
@@ -35,6 +53,7 @@ test('CloudSync pulls with ?t= cache-buster + no-store (never If-None-Match), ne
       const headers = new Headers(init?.headers || {});
 
       if (url.includes('/storage/v1/bucket/')) {
+        if (postUploadCount === 0) bucketCheckCallsDuringGet += 1;
         return new Response(JSON.stringify({ id: 'apostles-archive-persistence' }), { status: 200 });
       }
 
@@ -73,10 +92,11 @@ test('CloudSync pulls with ?t= cache-buster + no-store (never If-None-Match), ne
       },
     });
 
-    // 1. Cold-start GET when remote does not exist yet MUST NOT upload local DB!
+    // 1. Cold-start GET when remote does not exist yet MUST NOT upload local DB and MUST NOT call bucket check!
     const missingPull = await syncCloudDatabase({ force: true });
     assert.equal(missingPull.notFound, true);
     assert.equal(postUploadCount, 0, 'GET/pull must NEVER upload apostles.db even on 404/400');
+    assert.equal(bucketCheckCallsDuringGet, 0, 'Pull must download directly without calling ensureBucketExists()');
 
     // 2. Remote DB exists (v1) -> pull downloads with ?t= timestamp, no-cache headers, cache: no-store, no If-None-Match
     remoteBuf = makeFakeSqliteBuffer('v1-remote');
@@ -113,6 +133,170 @@ test('CloudSync pulls with ?t= cache-buster + no-store (never If-None-Match), ne
     assert.equal(postUploadCount, 1);
     assert.equal(seenUpsertHeaders.at(-1), 'true');
     assert.ok(remoteBuf!.toString('utf8').includes('v3-edited-track'));
+  } finally {
+    _configureCloudSyncForTests();
+    if (prevUrl === undefined) delete process.env.SUPABASE_URL;
+    else process.env.SUPABASE_URL = prevUrl;
+    if (prevKey === undefined) delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+    else process.env.SUPABASE_SERVICE_ROLE_KEY = prevKey;
+  }
+});
+
+test('CloudSync serverless cold-start restores even when local empty DB file already exists on disk, caches per container, and skips Supabase on 2nd GET', async () => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const prevUrl = process.env.SUPABASE_URL;
+  const prevKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const prevVercel = process.env.VERCEL;
+  process.env.SUPABASE_URL = 'https://test-project.supabase.co';
+  process.env.SUPABASE_SERVICE_ROLE_KEY = 'test-service-role-key';
+  process.env.VERCEL = '1';
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aod-cloudsync-test-'));
+  const localDbPath = path.join(tmpDir, 'apostles.db');
+  let activeLocalDb: Database.Database | null = null;
+
+  try {
+    // Pre-create an empty SQLite file on disk (simulating /tmp/apostles.db created on import) + stale WAL/SHM
+    activeLocalDb = new Database(localDbPath);
+    activeLocalDb.exec('CREATE TABLE albums (id TEXT PRIMARY KEY, title TEXT NOT NULL);');
+    fs.writeFileSync(`${localDbPath}-wal`, 'stale-wal');
+    fs.writeFileSync(`${localDbPath}-shm`, 'stale-shm');
+    assert.equal(fs.existsSync(localDbPath), true);
+    assert.equal((activeLocalDb.prepare('SELECT COUNT(*) as c FROM albums').get() as any).c, 0);
+
+    const cloudSnapshot = makeRealSeededSqliteBuffer();
+    let getRequestsToSupabase = 0;
+    let bucketChecks = 0;
+
+    const mockFetch: typeof fetch = async (input, init) => {
+      const url = String(input);
+      const method = (init?.method || 'GET').toUpperCase();
+      if (url.includes('/storage/v1/bucket/')) {
+        bucketChecks += 1;
+        return new Response('{}', { status: 200 });
+      }
+      if (url.includes('/storage/v1/object/') && method === 'GET') {
+        getRequestsToSupabase += 1;
+        await new Promise((r) => setTimeout(r, 15));
+        return new Response(new Uint8Array(cloudSnapshot), { status: 200 });
+      }
+      return new Response('Not found', { status: 404 });
+    };
+
+    _configureCloudSyncForTests({
+      fetchImpl: mockFetch,
+      serializeDb: () => activeLocalDb!.serialize(),
+      replaceDb: (buf) => {
+        activeLocalDb!.close();
+        for (const suffix of ['-wal', '-shm', '-journal']) {
+          if (fs.existsSync(`${localDbPath}${suffix}`)) fs.unlinkSync(`${localDbPath}${suffix}`);
+        }
+        const swapPath = `${localDbPath}.swap`;
+        fs.writeFileSync(swapPath, buf);
+        fs.renameSync(swapPath, localDbPath);
+        activeLocalDb = new Database(localDbPath);
+      },
+    });
+
+    // Simulate two concurrent cold-start GET requests arriving before restore finishes
+    await Promise.all([ensureCloudDatabaseRestored(), ensureCloudDatabaseRestored()]);
+
+    assert.equal(getRequestsToSupabase, 1, 'Concurrent cold-start GETs must share one cached restorePromise');
+    assert.equal(bucketChecks, 0, 'Cold-start pull must skip ensureBucketExists()');
+    assert.equal(fs.existsSync(`${localDbPath}-wal`), false);
+    assert.equal(fs.existsSync(`${localDbPath}-shm`), false);
+    assert.equal((activeLocalDb.prepare('SELECT COUNT(*) as c FROM albums').get() as any).c, 1);
+    assert.equal((activeLocalDb.prepare('SELECT title FROM albums WHERE id = ?').get('alb_test') as any).title, 'nightmortan');
+
+    const status = getCloudSyncStatus();
+    assert.equal(status.supabaseConfigured, true);
+    assert.equal(status.cloudRestoreStatus, 'restored');
+    assert.equal(status.cloudRestoreError, null);
+    assert.equal(status.dbObjectPath, 'db/apostles.db');
+
+    // Subsequent GET requests in same warm container must NOT hit Supabase at all
+    await ensureCloudDatabaseRestored();
+    await ensureCloudDatabaseRestored();
+    assert.equal(getRequestsToSupabase, 1, 'Subsequent GET requests must trigger 0 Supabase calls');
+  } finally {
+    try { activeLocalDb?.close(); } catch {}
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    _configureCloudSyncForTests();
+    if (prevUrl === undefined) delete process.env.SUPABASE_URL;
+    else process.env.SUPABASE_URL = prevUrl;
+    if (prevKey === undefined) delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+    else process.env.SUPABASE_SERVICE_ROLE_KEY = prevKey;
+    if (prevVercel === undefined) delete process.env.VERCEL;
+    else process.env.VERCEL = prevVercel;
+  }
+});
+
+test('CloudSync retries after cold-start failure and blocks uploadDatabaseToCloud while restore failed', async () => {
+  const prevUrl = process.env.SUPABASE_URL;
+  const prevKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  process.env.SUPABASE_URL = 'https://test-project.supabase.co';
+  process.env.SUPABASE_SERVICE_ROLE_KEY = 'test-service-role-key';
+
+  try {
+    let remoteAvailable = false;
+    let getCalls = 0;
+    let postCalls = 0;
+    const remoteBuf = makeFakeSqliteBuffer('live-production-db');
+
+    const mockFetch: typeof fetch = async (input, init) => {
+      const url = String(input);
+      const method = (init?.method || 'GET').toUpperCase();
+      if (url.includes('/storage/v1/bucket/')) {
+        return new Response('{}', { status: 200 });
+      }
+      if (url.includes('/storage/v1/object/') && method === 'GET') {
+        getCalls += 1;
+        if (!remoteAvailable) {
+          return new Response('Upstream timeout', { status: 504 });
+        }
+        return new Response(new Uint8Array(remoteBuf), { status: 200 });
+      }
+      if (url.includes('/storage/v1/object/') && method === 'POST') {
+        postCalls += 1;
+        return new Response(JSON.stringify({ Key: 'db/apostles.db' }), { status: 200 });
+      }
+      return new Response('Not found', { status: 404 });
+    };
+
+    let replaced = 0;
+    _configureCloudSyncForTests({
+      fetchImpl: mockFetch,
+      serializeDb: () => makeFakeSqliteBuffer('empty-local-db'),
+      replaceDb: () => {
+        replaced += 1;
+      },
+    });
+
+    // 1. First request fails (504) -> status = failed, restorePromise resets so next request can retry
+    await ensureCloudDatabaseRestored();
+    assert.equal(getCalls, 1);
+    assert.equal(replaced, 0);
+    assert.equal(getCloudSyncStatus().cloudRestoreStatus, 'failed');
+    assert.ok(getCloudSyncStatus().cloudRestoreError?.includes('504'));
+
+    // 2. While restore failed, uploadDatabaseToCloud MUST refuse to overwrite production DB!
+    const blockedPush = await uploadDatabaseToCloud();
+    assert.equal(blockedPush.ok, false);
+    assert.equal(postCalls, 0, 'Empty local DB must NEVER overwrite remote DB after failed restore');
+
+    // 3. Next request retries restore when Supabase recovers -> succeeds and unlocks uploads
+    remoteAvailable = true;
+    await ensureCloudDatabaseRestored();
+    assert.equal(getCalls, 2);
+    assert.equal(replaced, 1);
+    assert.equal(getCloudSyncStatus().cloudRestoreStatus, 'restored');
+    assert.equal(getCloudSyncStatus().cloudRestoreError, null);
+
+    const allowedPush = await uploadDatabaseToCloud();
+    assert.equal(allowedPush.ok, true);
+    assert.equal(postCalls, 1);
   } finally {
     _configureCloudSyncForTests();
     if (prevUrl === undefined) delete process.env.SUPABASE_URL;
