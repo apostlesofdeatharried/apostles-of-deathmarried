@@ -7,6 +7,7 @@ interface CoverArtProps {
   year?: number | string;
   className?: string;
   size?: 'sm' | 'md' | 'lg' | 'full';
+  hideBottomMeta?: boolean;
 }
 
 export const CoverArt: React.FC<CoverArtProps> = ({
@@ -15,6 +16,7 @@ export const CoverArt: React.FC<CoverArtProps> = ({
   format,
   year,
   className = '',
+  hideBottomMeta = false,
 }) => {
   const [imgError, setImgError] = useState(false);
 
@@ -43,7 +45,7 @@ export const CoverArt: React.FC<CoverArtProps> = ({
           className="w-full h-full object-cover select-none transition-transform duration-700 hover:scale-105"
         />
         <div className="absolute inset-0 ring-1 ring-inset ring-white/10 pointer-events-none" />
-        {format && (
+        {format && !hideBottomMeta && (
           <span className="absolute bottom-2 right-2 px-1.5 py-0.5 rounded bg-black/70 border border-white/15 text-[10px] tracking-wider text-[#ded8ce] uppercase pointer-events-none backdrop-blur-xs font-sans">
             {format}
           </span>
@@ -89,13 +91,15 @@ export const CoverArt: React.FC<CoverArtProps> = ({
       </div>
 
       {/* Bottom Year */}
-      <div className="relative z-10 flex items-center justify-end w-full pt-1 border-t border-white/[0.05]">
-        {year && (
-          <span className="font-sans text-[10px] tracking-widest text-ash/70">
-            {year}
-          </span>
-        )}
-      </div>
+      {!hideBottomMeta && (
+        <div className="relative z-10 flex items-center justify-end w-full pt-1 border-t border-white/[0.05]">
+          {year && (
+            <span className="font-sans text-[10px] tracking-widest text-ash/70">
+              {year}
+            </span>
+          )}
+        </div>
+      )}
 
       <div className="absolute inset-0 ring-1 ring-inset ring-white/[0.06] pointer-events-none" />
     </div>

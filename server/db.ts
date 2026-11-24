@@ -428,7 +428,7 @@ export function ensureSchemaAndMigrations(targetDb: Database.Database = db) {
     CREATE TABLE IF NOT EXISTS moderation_actions (
       id TEXT PRIMARY KEY,
       moderator_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      target_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      target_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
       action_type TEXT NOT NULL,
       details TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -790,6 +790,66 @@ export function ensureSchemaAndMigrations(targetDb: Database.Database = db) {
   try {
     targetDb.exec("UPDATE profiles SET total_xp = xp WHERE total_xp = 0 AND xp > 0;");
   } catch {}
+
+  // Rebuild legacy moderation_actions if target_user_id has NOT NULL constraint (breaks bulk reset audit logs)
+  try {
+    const modCols = targetDb
+      .prepare('PRAGMA table_info(moderation_actions)')
+      .all() as Array<{ name: string; notnull: number }>;
+    const targetUserCol = modCols.find((c) => c.name === 'target_user_id');
+    if (modCols.length > 0 && targetUserCol && targetUserCol.notnull === 1) {
+      const existingIndexes = targetDb
+        .prepare(
+          "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'moderation_actions' AND sql IS NOT NULL"
+        )
+        .all() as Array<{ sql: string }>;
+      const colNames = new Set(modCols.map((c) => c.name));
+      const selectId = colNames.has('id') ? 'id' : "lower(hex(randomblob(8)))";
+      const selectMod = colNames.has('moderator_id') ? 'moderator_id' : "''";
+      const selectTarget = 'target_user_id';
+      const selectType = colNames.has('action_type') ? 'action_type' : "'legacy'";
+      const selectDetails = colNames.has('details') ? 'details' : 'NULL';
+      const selectCreated = colNames.has('created_at')
+        ? "COALESCE(created_at, datetime('now'))"
+        : "datetime('now')";
+
+      const fkWasOn = Boolean(targetDb.pragma('foreign_keys', { simple: true }));
+      if (fkWasOn) {
+        targetDb.pragma('foreign_keys = OFF');
+      }
+      try {
+        targetDb.transaction(() => {
+          targetDb.exec(`
+            DROP TABLE IF EXISTS moderation_actions_new;
+            CREATE TABLE moderation_actions_new (
+              id TEXT PRIMARY KEY,
+              moderator_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              target_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+              action_type TEXT NOT NULL,
+              details TEXT,
+              created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            INSERT INTO moderation_actions_new (id, moderator_id, target_user_id, action_type, details, created_at)
+            SELECT ${selectId}, ${selectMod}, ${selectTarget}, ${selectType}, ${selectDetails}, ${selectCreated}
+            FROM moderation_actions;
+            DROP TABLE moderation_actions;
+            ALTER TABLE moderation_actions_new RENAME TO moderation_actions;
+          `);
+          for (const idx of existingIndexes) {
+            if (idx?.sql) {
+              targetDb.exec(idx.sql);
+            }
+          }
+        })();
+      } finally {
+        if (fkWasOn) {
+          targetDb.pragma('foreign_keys = ON');
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[DB Migration] Failed to migrate moderation_actions table:', err);
+  }
 
   // Ensure legacy accounts with empty display_name gracefully inherit nickname
   try {

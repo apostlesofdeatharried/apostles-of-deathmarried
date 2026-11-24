@@ -664,6 +664,7 @@ export const ArchiveView: React.FC = () => {
                         coverUrl={album.cover_url}
                         format="LP"
                         year={album.release_year}
+                        hideBottomMeta
                         className="w-full h-full aspect-square"
                       />
                       <div className="absolute inset-0 bg-gradient-to-t from-black/85 via-transparent to-transparent opacity-60 pointer-events-none" />
@@ -729,6 +730,7 @@ export const ArchiveView: React.FC = () => {
                         coverUrl={ep.cover_url}
                         format="EP"
                         year={ep.release_year}
+                        hideBottomMeta
                         className="w-full h-full aspect-square"
                       />
                       <div className="absolute inset-0 bg-gradient-to-t from-black/85 via-transparent to-transparent opacity-60 pointer-events-none" />

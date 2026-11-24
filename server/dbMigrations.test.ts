@@ -260,4 +260,105 @@ describe('SQLite additive migrations on legacy Stage 1–6 databases', () => {
       testDb.close();
     }
   });
+
+  it('rebuilds legacy moderation_actions with target_user_id INTEGER NOT NULL to allow NULL and preserves rows & indexes', () => {
+    const testDb = new Database(':memory:');
+    try {
+      testDb.exec(`
+        CREATE TABLE roles (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL UNIQUE,
+          description TEXT,
+          level INTEGER NOT NULL DEFAULT 1
+        );
+        INSERT INTO roles (id, name, description, level) VALUES ('admin', 'Administrator', 'Admin', 3);
+
+        CREATE TABLE users (
+          id TEXT PRIMARY KEY,
+          nickname TEXT NOT NULL UNIQUE COLLATE NOCASE,
+          password_hash TEXT NOT NULL,
+          role_id TEXT NOT NULL DEFAULT 'user',
+          is_banned INTEGER NOT NULL DEFAULT 0,
+          ban_reason TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT INTO users (id, nickname, password_hash, role_id) VALUES
+          ('u_mod', 'mod_admin', 'hash', 'admin'),
+          ('101', 'legacy_member', 'hash', 'user');
+
+        CREATE TABLE moderation_actions (
+          id TEXT PRIMARY KEY,
+          moderator_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          target_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          action_type TEXT NOT NULL,
+          details TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX idx_moderation_actions_created ON moderation_actions(created_at DESC);
+      `);
+
+      testDb
+        .prepare(`
+          INSERT INTO moderation_actions (id, moderator_id, target_user_id, action_type, details, created_at)
+          VALUES ('mod_legacy_1', 'u_mod', 101, 'legacy_ban', 'Legacy action row', '2026-01-15 12:00:00')
+        `)
+        .run();
+
+      // Enable foreign_keys = ON to mirror production runtime and verify safe migration rebuild
+      testDb.pragma('foreign_keys = ON');
+
+      // Run migration twice to confirm idempotency even with foreign_keys = ON
+      ensureSchemaAndMigrations(testDb);
+      ensureSchemaAndMigrations(testDb);
+
+      const cols = testDb.prepare('PRAGMA table_info(moderation_actions)').all() as Array<{
+        name: string;
+        type: string;
+        notnull: number;
+      }>;
+      const targetCol = cols.find((c) => c.name === 'target_user_id');
+      assert.ok(targetCol, 'target_user_id column must exist');
+      assert.equal(targetCol.notnull, 0, 'target_user_id must allow NULL after migration');
+
+      // Custom index must survive rebuild
+      const indexes = testDb
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'moderation_actions'")
+        .all() as Array<{ name: string }>;
+      assert.ok(
+        indexes.some((i) => i.name === 'idx_moderation_actions_created'),
+        'custom index on moderation_actions must be preserved'
+      );
+
+      // Existing legacy rows must remain intact
+      const legacyRow = testDb
+        .prepare('SELECT id, moderator_id, target_user_id, action_type, details, created_at FROM moderation_actions WHERE id = ?')
+        .get('mod_legacy_1') as any;
+      assert.ok(legacyRow, 'legacy moderation_actions row must be preserved');
+      assert.equal(legacyRow.moderator_id, 'u_mod');
+      assert.equal(String(legacyRow.target_user_id), '101');
+      assert.equal(legacyRow.action_type, 'legacy_ban');
+      assert.equal(legacyRow.details, 'Legacy action row');
+      assert.equal(legacyRow.created_at, '2026-01-15 12:00:00');
+
+      // Bulk reset audit log insert with target_user_id = NULL must succeed with FK ON
+      assert.doesNotThrow(() => {
+        testDb
+          .prepare(`
+            INSERT INTO moderation_actions (id, moderator_id, target_user_id, action_type, details)
+            VALUES (?, ?, ?, 'user_reset', ?)
+          `)
+          .run('mod_bulk_1', 'u_mod', null, 'mode=bulk skip_admins=true affected=5');
+      });
+
+      const bulkRow = testDb
+        .prepare('SELECT id, moderator_id, target_user_id, action_type, details FROM moderation_actions WHERE id = ?')
+        .get('mod_bulk_1') as any;
+      assert.equal(bulkRow.target_user_id, null);
+      assert.equal(bulkRow.action_type, 'user_reset');
+    } finally {
+      testDb.close();
+    }
+  });
 });
+
