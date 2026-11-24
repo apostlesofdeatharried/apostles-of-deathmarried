@@ -2,6 +2,8 @@ import crypto from 'crypto';
 import {
   serializeDatabase,
   replaceDatabaseWithBuffer,
+  ensureSchemaAndMigrations,
+  getDb,
   getDbPath,
   checkpointDatabase,
 } from './db.js';
@@ -319,6 +321,9 @@ async function pullDatabaseFromSupabaseInternal(options: {
 
       if (shouldReplace) {
         hooks.replaceDb(buffer);
+        if (hooks.replaceDb === replaceDatabaseWithBuffer) {
+          ensureSchemaAndMigrations(getDb());
+        }
         lastSyncedSha256 = remoteSha;
       }
 

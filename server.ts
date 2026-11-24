@@ -6,7 +6,15 @@ import fs from 'fs';
 import http from 'http';
 import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
-import { db, getDb, getDbPath, initDatabase, closeDatabase } from './server/db.js';
+import {
+  db,
+  getDb,
+  getDbPath,
+  getModerationActionsDiagnostics,
+  initDatabase,
+  closeDatabase,
+} from './server/db.js';
+import { executeAdminUserReset } from './server/adminUserReset.js';
 import {
   ensureCloudDatabaseRestored,
   pushDatabaseBackupNow,
@@ -7231,105 +7239,26 @@ app.post('/api/admin/users/:id/custom-shield', requireAdmin, (req: AuthRequest, 
 
 app.post('/api/admin/users/reset', requireAdmin, (req: AuthRequest, res: Response) => {
   const mode = req.body?.mode === 'bulk' ? 'bulk' : 'single';
-  const targetUserId = typeof req.body?.target_user_id === 'string' ? req.body.target_user_id.trim() : '';
-  const skipAdmins = req.body?.skip_admins !== false;
-  const confirmText = String(req.body?.confirm_text || '').trim();
-  const scopesRaw = req.body?.scopes || {};
-  const scopes = {
-    xp: Boolean(scopesRaw.xp),
-    achievements: Boolean(scopesRaw.achievements),
-    cosmetics: Boolean(scopesRaw.cosmetics),
-    games: Boolean(scopesRaw.games),
-  };
+  const result = executeAdminUserReset(getDb(), {
+    adminUserId: req.user!.id,
+    mode,
+    targetUserId: typeof req.body?.target_user_id === 'string' ? req.body.target_user_id : '',
+    skipAdmins: req.body?.skip_admins !== false,
+    confirmText: String(req.body?.confirm_text || ''),
+    scopes: {
+      xp: Boolean(req.body?.scopes?.xp),
+      achievements: Boolean(req.body?.scopes?.achievements),
+      cosmetics: Boolean(req.body?.scopes?.cosmetics),
+      games: Boolean(req.body?.scopes?.games),
+    },
+  });
 
-  if (!scopes.xp && !scopes.achievements && !scopes.cosmetics && !scopes.games) {
-    res.status(400).json({ error: 'Выберите хотя бы одну категорию данных для сброса.' });
+  if (!result.ok) {
+    res.status(result.status).json({ error: result.error });
     return;
   }
 
-  let targetIds: string[] = [];
-  if (mode === 'single') {
-    if (!targetUserId) {
-      res.status(400).json({ error: 'Выберите пользователя для сброса.' });
-      return;
-    }
-    const row = db.prepare('SELECT id FROM users WHERE id = ?').get(targetUserId) as { id: string } | undefined;
-    if (!row) {
-      res.status(404).json({ error: 'Пользователь не найден.' });
-      return;
-    }
-    targetIds = [row.id];
-  } else {
-    if (confirmText !== 'СБРОСИТЬ') {
-      res.status(400).json({ error: 'Для массового сброса введите точное слово СБРОСИТЬ.' });
-      return;
-    }
-    const rows = skipAdmins
-      ? (db.prepare("SELECT id FROM users WHERE role_id != 'admin'").all() as Array<{ id: string }>)
-      : (db.prepare('SELECT id FROM users').all() as Array<{ id: string }>);
-    targetIds = rows.map((r) => r.id);
-  }
-
-  if (targetIds.length === 0) {
-    res.json({ ok: true, affected_users: 0, scopes });
-    return;
-  }
-
-  db.transaction(() => {
-    for (const uid of targetIds) {
-      if (scopes.xp) {
-        db.prepare(`
-          UPDATE profiles SET total_xp = 0, xp = 0, level = 1, updated_at = datetime('now') WHERE user_id = ?
-        `).run(uid);
-        db.prepare('DELETE FROM xp_transactions WHERE user_id = ?').run(uid);
-      }
-
-      if (scopes.achievements) {
-        db.prepare('DELETE FROM user_achievements WHERE user_id = ?').run(uid);
-        db.prepare("UPDATE profiles SET featured_achievements_json = '[]', updated_at = datetime('now') WHERE user_id = ?").run(uid);
-        db.prepare('DELETE FROM user_track_plays WHERE user_id = ?').run(uid);
-        db.prepare('DELETE FROM post_reads WHERE user_id = ?').run(uid);
-        db.prepare('DELETE FROM user_secret_flags WHERE user_id = ?').run(uid);
-      }
-
-      if (scopes.cosmetics) {
-        db.prepare('DELETE FROM user_inventory WHERE user_id = ?').run(uid);
-        db.prepare(`
-          UPDATE profiles SET
-            equipped_frame = NULL,
-            equipped_banner = NULL,
-            equipped_name_style = NULL,
-            equipped_badge = NULL,
-            equipped_title = NULL,
-            equipped_theme = NULL,
-            equipped_effect = NULL,
-            updated_at = datetime('now')
-          WHERE user_id = ?
-        `).run(uid);
-      }
-
-      if (scopes.games) {
-        db.prepare("UPDATE profiles SET daily_streak = 0, last_active_date = NULL, updated_at = datetime('now') WHERE user_id = ?").run(uid);
-        db.prepare('DELETE FROM game_attempts WHERE user_id = ?').run(uid);
-        db.prepare('DELETE FROM daily_track_attempts WHERE user_id = ?').run(uid);
-        db.prepare('DELETE FROM quiz_attempts WHERE user_id = ?').run(uid);
-        db.prepare('DELETE FROM game_completions WHERE user_id = ?').run(uid);
-        db.prepare('DELETE FROM daily_mini_game_attempts WHERE user_id = ?').run(uid);
-      }
-    }
-
-    db.prepare(`
-      INSERT INTO moderation_actions (id, moderator_id, target_user_id, action_type, details)
-      VALUES (?, ?, ?, 'user_reset', ?)
-    `).run(
-      'mod_' + crypto.randomUUID().slice(0, 8),
-      req.user!.id,
-      mode === 'single' ? targetIds[0] : null,
-      `mode=${mode} skip_admins=${skipAdmins} affected=${targetIds.length} scopes=${JSON.stringify(scopes)}`
-    );
-  })();
-
-  res.json({ ok: true, mode, affected_users: targetIds.length, scopes });
+  res.json(result);
 });
 
 app.post('/api/admin/users/:id/reset-password', requireAdmin, (req: AuthRequest, res: Response) => {
@@ -8754,12 +8683,19 @@ app.get('/api/health', (_req: Request, res: Response) => {
     }
   } catch {}
 
+  let moderationDiag = {
+    moderationActionsTargetNullable: false,
+    moderationActionsColumns: [] as string[],
+    lastMigrationError: null as string | null,
+  };
+
   try {
     const activeDb = getDb();
     const albumRow = activeDb.prepare('SELECT COUNT(*) as cnt FROM albums').get() as { cnt?: number } | undefined;
     const userRow = activeDb.prepare('SELECT COUNT(*) as cnt FROM users').get() as { cnt?: number } | undefined;
     albumsCount = Number(albumRow?.cnt || 0);
     usersCount = Number(userRow?.cnt || 0);
+    moderationDiag = getModerationActionsDiagnostics(activeDb);
   } catch {}
 
   res.json({
@@ -8769,6 +8705,7 @@ app.get('/api/health', (_req: Request, res: Response) => {
     dbFileSizeBytes,
     albumsCount,
     usersCount,
+    ...moderationDiag,
   });
 });
 

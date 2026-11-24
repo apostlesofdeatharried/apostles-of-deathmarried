@@ -1,7 +1,8 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import Database from 'better-sqlite3';
-import { ensureSchemaAndMigrations } from './db.js';
+import { ensureSchemaAndMigrations, getModerationActionsDiagnostics } from './db.js';
+import { executeAdminUserReset } from './adminUserReset.js';
 
 describe('SQLite additive migrations on legacy Stage 1–6 databases', () => {
   it('migrates missing site_news.created_by and all Stage 1–6 columns/tables without errors', () => {
@@ -356,6 +357,241 @@ describe('SQLite additive migrations on legacy Stage 1–6 databases', () => {
         .get('mod_bulk_1') as any;
       assert.equal(bulkRow.target_user_id, null);
       assert.equal(bulkRow.action_type, 'user_reset');
+
+      const diag = getModerationActionsDiagnostics(testDb);
+      assert.equal(diag.moderationActionsTargetNullable, true);
+      assert.equal(diag.lastMigrationError, null);
+      assert.deepEqual(diag.moderationActionsColumns, [
+        'id',
+        'moderator_id',
+        'target_user_id',
+        'action_type',
+        'details',
+        'created_at',
+      ]);
+    } finally {
+      testDb.close();
+    }
+  });
+
+  it('rebuilds truncated legacy moderation_actions (fewer columns + target_user_id INTEGER NOT NULL) and runs bulk reset cleanly', () => {
+    const testDb = new Database(':memory:');
+    try {
+      testDb.exec(`
+        CREATE TABLE roles (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL UNIQUE,
+          description TEXT,
+          level INTEGER NOT NULL DEFAULT 1
+        );
+        INSERT INTO roles (id, name, description, level) VALUES
+          ('user', 'User', 'Member', 1),
+          ('admin', 'Administrator', 'Admin', 3);
+
+        CREATE TABLE users (
+          id TEXT PRIMARY KEY,
+          nickname TEXT NOT NULL UNIQUE COLLATE NOCASE,
+          password_hash TEXT NOT NULL,
+          role_id TEXT NOT NULL DEFAULT 'user',
+          is_banned INTEGER NOT NULL DEFAULT 0,
+          ban_reason TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT INTO users (id, nickname, password_hash, role_id) VALUES
+          ('u_admin', 'boss_admin', 'hash', 'admin'),
+          ('101', 'member_one', 'hash', 'user'),
+          ('102', 'member_two', 'hash', 'user');
+
+        CREATE TABLE profiles (
+          user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+          display_name TEXT NOT NULL,
+          avatar_url TEXT,
+          bio TEXT,
+          level INTEGER NOT NULL DEFAULT 1,
+          xp INTEGER NOT NULL DEFAULT 0,
+          daily_streak INTEGER NOT NULL DEFAULT 0,
+          last_active_date TEXT,
+          is_private INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT INTO profiles (user_id, display_name, xp, level, daily_streak) VALUES
+          ('u_admin', 'Boss', 900, 5, 10),
+          ('101', 'Member 1', 240, 3, 4),
+          ('102', 'Member 2', 120, 2, 2);
+
+        -- Truncated legacy moderation_actions: ONLY 3 columns (missing action_type, details, created_at)
+        -- and target_user_id is INTEGER NOT NULL
+        CREATE TABLE moderation_actions (
+          id TEXT PRIMARY KEY,
+          moderator_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          target_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE
+        );
+      `);
+
+      testDb
+        .prepare('INSERT INTO moderation_actions (id, moderator_id, target_user_id) VALUES (?, ?, ?)')
+        .run('mod_trunc_1', 'u_admin', 101);
+
+      testDb.pragma('foreign_keys = ON');
+      ensureSchemaAndMigrations(testDb);
+
+      const diag = getModerationActionsDiagnostics(testDb);
+      assert.equal(diag.lastMigrationError, null, 'truncated rebuild must produce zero migration errors');
+      assert.equal(diag.moderationActionsTargetNullable, true, 'target_user_id must become nullable');
+      assert.deepEqual(diag.moderationActionsColumns, [
+        'id',
+        'moderator_id',
+        'target_user_id',
+        'action_type',
+        'details',
+        'created_at',
+      ]);
+
+      const preserved = testDb
+        .prepare('SELECT id, moderator_id, target_user_id, action_type, details, created_at FROM moderation_actions WHERE id = ?')
+        .get('mod_trunc_1') as any;
+      assert.ok(preserved);
+      assert.equal(String(preserved.target_user_id), '101');
+      assert.equal(preserved.action_type, 'legacy');
+      assert.ok(preserved.created_at);
+
+      // Run mass reset endpoint helper against the migrated DB
+      const resetRes = executeAdminUserReset(testDb, {
+        adminUserId: 'u_admin',
+        mode: 'bulk',
+        skipAdmins: true,
+        confirmText: 'СБРОСИТЬ',
+        scopes: { xp: true, achievements: true, cosmetics: true, games: true },
+      });
+      assert.equal(resetRes.ok, true);
+      if (resetRes.ok) {
+        assert.equal(resetRes.affected_users, 2);
+        assert.equal(resetRes.audit_fallback_used, false);
+      }
+
+      const member1Profile = testDb.prepare('SELECT total_xp, xp, level, daily_streak FROM profiles WHERE user_id = ?').get('101') as any;
+      const adminProfile = testDb.prepare('SELECT total_xp, xp, level FROM profiles WHERE user_id = ?').get('u_admin') as any;
+      assert.equal(member1Profile.total_xp, 0);
+      assert.equal(member1Profile.xp, 0);
+      assert.equal(member1Profile.level, 1);
+      assert.equal(member1Profile.daily_streak, 0);
+      assert.equal(adminProfile.total_xp, 900);
+
+      const latestAudit = testDb
+        .prepare("SELECT moderator_id, target_user_id, action_type, details FROM moderation_actions WHERE action_type = 'mass_reset'")
+        .get() as any;
+      assert.ok(latestAudit);
+      assert.equal(latestAudit.moderator_id, 'u_admin');
+      assert.equal(latestAudit.target_user_id, null);
+      assert.ok(String(latestAudit.details).includes('affected=2'));
+    } finally {
+      testDb.close();
+    }
+  });
+
+  it('mass reset safely falls back to adminUserId if moderation_actions still has target_user_id NOT NULL and legacy action/reason columns', () => {
+    const testDb = new Database(':memory:');
+    try {
+      testDb.exec(`
+        CREATE TABLE roles (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL UNIQUE,
+          description TEXT,
+          level INTEGER NOT NULL DEFAULT 1
+        );
+        INSERT INTO roles (id, name, description, level) VALUES
+          ('user', 'User', 'Member', 1),
+          ('admin', 'Administrator', 'Admin', 3);
+
+        CREATE TABLE users (
+          id TEXT PRIMARY KEY,
+          nickname TEXT NOT NULL UNIQUE COLLATE NOCASE,
+          password_hash TEXT NOT NULL,
+          role_id TEXT NOT NULL DEFAULT 'user',
+          is_banned INTEGER NOT NULL DEFAULT 0,
+          ban_reason TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT INTO users (id, nickname, password_hash, role_id) VALUES
+          ('u_admin', 'boss_admin', 'hash', 'admin'),
+          ('u_1', 'member_one', 'hash', 'user');
+
+        CREATE TABLE profiles (
+          user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+          display_name TEXT NOT NULL,
+          xp INTEGER NOT NULL DEFAULT 0,
+          total_xp INTEGER NOT NULL DEFAULT 0,
+          level INTEGER NOT NULL DEFAULT 1,
+          daily_streak INTEGER NOT NULL DEFAULT 0,
+          last_active_date TEXT,
+          featured_achievements_json TEXT,
+          equipped_frame TEXT,
+          equipped_banner TEXT,
+          equipped_name_style TEXT,
+          equipped_badge TEXT,
+          equipped_title TEXT,
+          equipped_theme TEXT,
+          equipped_effect TEXT,
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT INTO profiles (user_id, display_name, xp, total_xp, level) VALUES
+          ('u_admin', 'Boss', 500, 500, 4),
+          ('u_1', 'Member', 300, 300, 3);
+
+        CREATE TABLE xp_transactions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, amount INTEGER NOT NULL, source TEXT NOT NULL);
+        CREATE TABLE user_achievements (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, achievement_id TEXT NOT NULL);
+        CREATE TABLE user_track_plays (user_id TEXT NOT NULL, track_id TEXT NOT NULL);
+        CREATE TABLE post_reads (user_id TEXT NOT NULL, post_id TEXT NOT NULL);
+        CREATE TABLE user_secret_flags (user_id TEXT NOT NULL, flag_key TEXT NOT NULL);
+        CREATE TABLE user_inventory (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, item_id TEXT NOT NULL);
+        CREATE TABLE game_attempts (id TEXT PRIMARY KEY, user_id TEXT NOT NULL);
+        CREATE TABLE daily_track_attempts (id TEXT PRIMARY KEY, user_id TEXT NOT NULL);
+        CREATE TABLE quiz_attempts (id TEXT PRIMARY KEY, user_id TEXT NOT NULL);
+        CREATE TABLE game_completions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL);
+        CREATE TABLE daily_mini_game_attempts (id TEXT PRIMARY KEY, user_id TEXT NOT NULL);
+
+        -- Hostile un-migrated moderation_actions table (target_user_id NOT NULL + action/reason columns)
+        CREATE TABLE moderation_actions (
+          id TEXT PRIMARY KEY,
+          moderator_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          target_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          action TEXT NOT NULL,
+          reason TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+      `);
+      testDb.pragma('foreign_keys = ON');
+
+      const resetRes = executeAdminUserReset(testDb, {
+        adminUserId: 'u_admin',
+        mode: 'bulk',
+        skipAdmins: true,
+        confirmText: 'СБРОСИТЬ',
+        scopes: { xp: true, achievements: true, cosmetics: true, games: true },
+      });
+
+      assert.equal(resetRes.ok, true);
+      if (resetRes.ok) {
+        assert.equal(resetRes.affected_users, 1);
+        assert.equal(resetRes.audit_fallback_used, true);
+      }
+
+      const memberProfile = testDb.prepare('SELECT total_xp, xp, level FROM profiles WHERE user_id = ?').get('u_1') as any;
+      assert.equal(memberProfile.total_xp, 0);
+      assert.equal(memberProfile.xp, 0);
+      assert.equal(memberProfile.level, 1);
+
+      const fallbackLog = testDb
+        .prepare('SELECT moderator_id, target_user_id, action, reason FROM moderation_actions')
+        .get() as any;
+      assert.ok(fallbackLog);
+      assert.equal(fallbackLog.moderator_id, 'u_admin');
+      assert.equal(fallbackLog.target_user_id, 'u_admin');
+      assert.equal(fallbackLog.action, 'mass_reset');
+      assert.ok(String(fallbackLog.reason).includes('affected=1'));
     } finally {
       testDb.close();
     }

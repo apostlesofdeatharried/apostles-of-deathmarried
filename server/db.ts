@@ -108,6 +108,34 @@ export function serializeDatabase(): Buffer {
   return currentDb.serialize();
 }
 
+let lastMigrationError: string | null = null;
+
+export function getLastMigrationError(): string | null {
+  return lastMigrationError;
+}
+
+export function getModerationActionsDiagnostics(targetDb: Database.Database = currentDb): {
+  moderationActionsTargetNullable: boolean;
+  moderationActionsColumns: string[];
+  lastMigrationError: string | null;
+} {
+  let moderationActionsColumns: string[] = [];
+  let moderationActionsTargetNullable = false;
+  try {
+    const cols = targetDb
+      .prepare('PRAGMA table_info(moderation_actions)')
+      .all() as Array<{ name: string; notnull: number }>;
+    moderationActionsColumns = cols.map((c) => c.name);
+    const targetCol = cols.find((c) => c.name === 'target_user_id');
+    moderationActionsTargetNullable = Boolean(targetCol && Number(targetCol.notnull) === 0);
+  } catch {}
+  return {
+    moderationActionsTargetNullable,
+    moderationActionsColumns,
+    lastMigrationError,
+  };
+}
+
 export function replaceDatabaseWithBuffer(buffer: Buffer): void {
   if (!buffer || buffer.length < 100) return;
   if (buffer.subarray(0, 15).toString('utf8') !== 'SQLite format 3') {
@@ -134,6 +162,13 @@ export function replaceDatabaseWithBuffer(buffer: Buffer): void {
 }
 
 export function ensureSchemaAndMigrations(targetDb: Database.Database = db) {
+  lastMigrationError = null;
+  const recordMigrationError = (step: string, err: unknown) => {
+    const msg = err instanceof Error ? err.message : String(err);
+    const entry = `[${step}] ${msg}`;
+    lastMigrationError = lastMigrationError ? `${lastMigrationError}; ${entry}` : entry;
+    console.error(`[DB Migration Error] ${entry}`);
+  };
   targetDb.exec(`
     CREATE TABLE IF NOT EXISTS app_meta (
       key TEXT PRIMARY KEY,
@@ -655,7 +690,9 @@ export function ensureSchemaAndMigrations(targetDb: Database.Database = db) {
       if (cols.length > 0 && !cols.some((c) => c.name === columnName)) {
         targetDb.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${columnDef};`);
       }
-    } catch {}
+    } catch (err) {
+      recordMigrationError(`ensureColumn:${tableName}.${columnName}`, err);
+    }
   };
 
   // Safe additive table schema migrations for existing Stage 1-6 databases
@@ -795,23 +832,15 @@ export function ensureSchemaAndMigrations(targetDb: Database.Database = db) {
   try {
     const modCols = targetDb
       .prepare('PRAGMA table_info(moderation_actions)')
-      .all() as Array<{ name: string; notnull: number }>;
+      .all() as Array<{ name: string; type: string; notnull: number; dflt_value: string | null; pk: number }>;
     const targetUserCol = modCols.find((c) => c.name === 'target_user_id');
-    if (modCols.length > 0 && targetUserCol && targetUserCol.notnull === 1) {
+    if (modCols.length > 0 && (!targetUserCol || targetUserCol.notnull === 1)) {
       const existingIndexes = targetDb
         .prepare(
           "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'moderation_actions' AND sql IS NOT NULL"
         )
         .all() as Array<{ sql: string }>;
-      const colNames = new Set(modCols.map((c) => c.name));
-      const selectId = colNames.has('id') ? 'id' : "lower(hex(randomblob(8)))";
-      const selectMod = colNames.has('moderator_id') ? 'moderator_id' : "''";
-      const selectTarget = 'target_user_id';
-      const selectType = colNames.has('action_type') ? 'action_type' : "'legacy'";
-      const selectDetails = colNames.has('details') ? 'details' : 'NULL';
-      const selectCreated = colNames.has('created_at')
-        ? "COALESCE(created_at, datetime('now'))"
-        : "datetime('now')";
+      const oldColSet = new Set(modCols.map((c) => c.name));
 
       const fkWasOn = Boolean(targetDb.pragma('foreign_keys', { simple: true }));
       if (fkWasOn) {
@@ -823,21 +852,71 @@ export function ensureSchemaAndMigrations(targetDb: Database.Database = db) {
             DROP TABLE IF EXISTS moderation_actions_new;
             CREATE TABLE moderation_actions_new (
               id TEXT PRIMARY KEY,
-              moderator_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              moderator_id TEXT NOT NULL DEFAULT '' REFERENCES users(id) ON DELETE CASCADE,
               target_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
-              action_type TEXT NOT NULL,
+              action_type TEXT NOT NULL DEFAULT 'legacy',
               details TEXT,
               created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
-            INSERT INTO moderation_actions_new (id, moderator_id, target_user_id, action_type, details, created_at)
-            SELECT ${selectId}, ${selectMod}, ${selectTarget}, ${selectType}, ${selectDetails}, ${selectCreated}
-            FROM moderation_actions;
+          `);
+
+          const newCols = targetDb
+            .prepare('PRAGMA table_info(moderation_actions_new)')
+            .all() as Array<{ name: string; notnull: number }>;
+          const newColNames = newCols.map((c) => c.name);
+
+          // Dynamically copy ONLY columns that exist in BOTH old and new moderation_actions schemas
+          const insertCols: string[] = [];
+          const selectExprs: string[] = [];
+
+          for (const colName of newColNames) {
+            if (!oldColSet.has(colName)) continue;
+            insertCols.push(colName);
+            if (colName === 'id') {
+              selectExprs.push("COALESCE(NULLIF(CAST(id AS TEXT), ''), lower(hex(randomblob(8))))");
+            } else if (colName === 'moderator_id') {
+              selectExprs.push("COALESCE(CAST(moderator_id AS TEXT), '')");
+            } else if (colName === 'target_user_id') {
+              selectExprs.push('CASE WHEN target_user_id IS NULL THEN NULL ELSE CAST(target_user_id AS TEXT) END');
+            } else if (colName === 'action_type') {
+              selectExprs.push("COALESCE(NULLIF(CAST(action_type AS TEXT), ''), 'legacy')");
+            } else if (colName === 'created_at') {
+              selectExprs.push("COALESCE(NULLIF(CAST(created_at AS TEXT), ''), datetime('now'))");
+            } else {
+              selectExprs.push(colName);
+            }
+          }
+
+          // Preserve legacy `action` / `reason` values if old table used those column names instead of `action_type` / `details`
+          if (!oldColSet.has('action_type') && oldColSet.has('action')) {
+            insertCols.push('action_type');
+            selectExprs.push("COALESCE(NULLIF(CAST(action AS TEXT), ''), 'legacy')");
+          }
+          if (!oldColSet.has('details') && oldColSet.has('reason')) {
+            insertCols.push('details');
+            selectExprs.push('reason');
+          }
+
+          if (insertCols.length > 0) {
+            targetDb.exec(`
+              INSERT INTO moderation_actions_new (${insertCols.join(', ')})
+              SELECT ${selectExprs.join(', ')}
+              FROM moderation_actions;
+            `);
+          }
+
+          targetDb.exec(`
             DROP TABLE moderation_actions;
             ALTER TABLE moderation_actions_new RENAME TO moderation_actions;
           `);
+
           for (const idx of existingIndexes) {
             if (idx?.sql) {
-              targetDb.exec(idx.sql);
+              try {
+                targetDb.exec(idx.sql);
+              } catch (idxErr) {
+                recordMigrationError('moderation_actions:recreate_index', idxErr);
+              }
             }
           }
         })();
@@ -848,8 +927,12 @@ export function ensureSchemaAndMigrations(targetDb: Database.Database = db) {
       }
     }
   } catch (err) {
-    console.error('[DB Migration] Failed to migrate moderation_actions table:', err);
+    recordMigrationError('moderation_actions:rebuild', err);
   }
+
+  ensureColumn('moderation_actions', 'action_type', "TEXT NOT NULL DEFAULT 'legacy'");
+  ensureColumn('moderation_actions', 'details', 'TEXT');
+  ensureColumn('moderation_actions', 'created_at', 'TEXT');
 
   // Ensure legacy accounts with empty display_name gracefully inherit nickname
   try {
@@ -858,7 +941,9 @@ export function ensureSchemaAndMigrations(targetDb: Database.Database = db) {
       SET display_name = (SELECT u.nickname FROM users u WHERE u.id = profiles.user_id)
       WHERE display_name IS NULL OR trim(display_name) = '';
     `);
-  } catch {}
+  } catch (err) {
+    recordMigrationError('profiles:display_name_backfill', err);
+  }
 }
 
 export function initDatabase() {
