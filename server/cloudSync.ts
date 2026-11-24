@@ -211,7 +211,7 @@ async function uploadCurrentDatabaseInternal(): Promise<SyncPushResult> {
         },
         body: new Uint8Array(buffer),
         cache: 'no-store',
-        signal: AbortSignal.timeout(15000),
+        signal: AbortSignal.timeout(30000),
       });
 
       if (res.ok) {

@@ -105,6 +105,11 @@ export function serializeDatabase(): Buffer {
     currentDb.pragma('wal_checkpoint(TRUNCATE)');
   } catch {}
   checkpointDatabase();
+  if (activeDbPath && activeDbPath !== ':memory:' && fs.existsSync(activeDbPath)) {
+    try {
+      return fs.readFileSync(activeDbPath);
+    } catch {}
+  }
   return currentDb.serialize();
 }
 

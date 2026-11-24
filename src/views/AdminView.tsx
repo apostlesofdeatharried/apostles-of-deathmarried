@@ -1019,7 +1019,10 @@ export const AdminView: React.FC = () => {
         setDeleteModal(null);
         await fetchAdminData();
         if (deleteModal.type === 'leaderboard_clear' || deleteModal.type === 'leaderboard_user_reset') {
-          await fetchAdminLeaderboard(lbTimeframe, lbGameFilter, lbSearch);
+          await Promise.all([
+            fetchAdminLeaderboard(lbTimeframe, lbGameFilter, lbSearch),
+            refresh(),
+          ]);
         }
       } else {
         const data = await safeJson<{ error?: string }>(res, {});
@@ -3331,7 +3334,13 @@ export const AdminView: React.FC = () => {
         <AdminUserResetTab
           usersList={usersList}
           lang={lang}
-          onResetComplete={() => fetchAdminUsers(userSearch, userSort)}
+          onResetComplete={async () => {
+            await Promise.all([
+              fetchAdminUsers(userSearch, userSort),
+              fetchAdminLeaderboard(lbTimeframe, lbGameFilter, lbSearch),
+              refresh(),
+            ]);
+          }}
           onNotify={(msg) => setStatusMessage(msg)}
           onError={(msg) => setErrorMessage(msg)}
         />

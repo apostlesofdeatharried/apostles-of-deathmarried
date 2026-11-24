@@ -172,6 +172,41 @@ app.use('/api', (req: Request, res: Response, next: NextFunction) => {
 const STATELESS_POST_PATHS = new Set(['/api/upload/signed-url']);
 const MUTATING_HTTP_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
+async function flushCloudBackupAndRespond(
+  res: Response,
+  body: any,
+  statusCode = 200
+): Promise<void> {
+  res.locals.cloudBackupDone = true;
+  if (isSupabaseConfigured()) {
+    try {
+      const syncResult = await pushDatabaseBackupNow();
+      if (!syncResult.ok) {
+        const errDetail =
+          syncResult.error || getCloudSyncStatus().last_backup_error || 'unknown cloud backup error';
+        console.error('[CloudSync] Failed to persist admin mutation to Supabase:', errDetail);
+        res.status(500).json({
+          error: `Ошибка сохранения базы данных в Supabase Storage: ${errDetail}`,
+          last_backup_error: errDetail,
+          cloud_sync_error: errDetail,
+        });
+        return;
+      }
+    } catch (err: any) {
+      const errDetail =
+        err?.message || getCloudSyncStatus().last_backup_error || 'unexpected cloud backup error';
+      console.error('[CloudSync] Admin mutation backup threw:', errDetail);
+      res.status(500).json({
+        error: `Ошибка сохранения базы данных в Supabase Storage: ${errDetail}`,
+        last_backup_error: errDetail,
+        cloud_sync_error: errDetail,
+      });
+      return;
+    }
+  }
+  res.status(statusCode).json(body);
+}
+
 // Cold-start-only restore + write-through backup on mutations.
 // CRITICAL: DB backup upload to Supabase Storage ONLY runs after successful mutating requests (POST/PUT/PATCH/DELETE).
 // GET requests restore strictly once per container cold start and never download/upload afterwards.
@@ -189,7 +224,7 @@ app.use(async (req: Request, res: Response, next: NextFunction) => {
         const originalJson = res.json.bind(res);
         let cloudSyncHandled = false;
         res.json = ((body: any) => {
-          if (cloudSyncHandled) {
+          if (res.locals.cloudBackupDone || cloudSyncHandled) {
             return originalJson(body);
           }
           cloudSyncHandled = true;
@@ -197,21 +232,26 @@ app.use(async (req: Request, res: Response, next: NextFunction) => {
             pushDatabaseBackupNow()
               .then((syncResult) => {
                 if (!syncResult.ok) {
-                  console.error('[CloudSync] Failed to persist mutation to Supabase:', syncResult.error);
+                  const errDetail =
+                    syncResult.error || getCloudSyncStatus().last_backup_error || 'unknown error';
+                  console.error('[CloudSync] Failed to persist mutation to Supabase:', errDetail);
                   res.status(500);
                   return originalJson({
-                    error: `Ошибка сохранения базы данных в Supabase Storage: ${syncResult.error || 'unknown error'}`,
-                    cloud_sync_error: syncResult.error || 'unknown error',
+                    error: `Ошибка сохранения базы данных в Supabase Storage: ${errDetail}`,
+                    last_backup_error: errDetail,
+                    cloud_sync_error: errDetail,
                   });
                 }
                 return originalJson(body);
               })
               .catch((err: any) => {
-                const msg = err?.message || 'unexpected cloud sync failure';
+                const msg =
+                  err?.message || getCloudSyncStatus().last_backup_error || 'unexpected cloud sync failure';
                 console.error('[CloudSync] Mutation backup threw:', msg);
                 res.status(500);
                 return originalJson({
                   error: `Ошибка сохранения базы данных в Supabase Storage: ${msg}`,
+                  last_backup_error: msg,
                   cloud_sync_error: msg,
                 });
               });
@@ -1496,7 +1536,7 @@ app.get('/api/admin/news', requireAdmin, (_req: AuthRequest, res: Response) => {
   res.json({ news, subscribers_count: Number(subRow?.cnt || 0) });
 });
 
-app.post('/api/admin/news/broadcast', requireAdmin, (req: AuthRequest, res: Response) => {
+app.post('/api/admin/news/broadcast', requireAdmin, async (req: AuthRequest, res: Response) => {
   const cleanTitle = String(req.body?.title || '').replace(/\s+/g, ' ').trim().slice(0, 120);
   const cleanMessage = String(req.body?.message || '').replace(/\s+/g, ' ').trim().slice(0, 300);
   const rawLink = typeof req.body?.link === 'string' ? req.body.link.trim() : '';
@@ -1541,7 +1581,7 @@ app.post('/api/admin/news/broadcast', requireAdmin, (req: AuthRequest, res: Resp
     `).run(newsId, cleanTitle, cleanMessage, safeLink, sentCount, req.user!.id, req.user!.nickname, req.user!.id);
   })();
 
-  res.json({ ok: true, id: newsId, sent_count: sentCount });
+  await flushCloudBackupAndRespond(res, { ok: true, id: newsId, sent_count: sentCount });
 });
 
 app.post('/api/notifications/read', requireAuth, (req: AuthRequest, res: Response) => {
@@ -1622,7 +1662,7 @@ app.get('/api/rules', (_req: Request, res: Response) => {
   res.json({ rules: DEFAULT_COMMUNITY_RULES_FALLBACK });
 });
 
-app.put('/api/admin/rules', requireAdmin, (req: AuthRequest, res: Response) => {
+app.put('/api/admin/rules', requireAdmin, async (req: AuthRequest, res: Response) => {
   const payload = req.body?.rules ?? req.body;
   if (!payload || typeof payload !== 'object' || !Array.isArray(payload.items) || payload.items.length === 0) {
     res.status(400).json({ error: 'Нужен минимум один пункт правил.' });
@@ -1661,7 +1701,7 @@ app.put('/api/admin/rules', requireAdmin, (req: AuthRequest, res: Response) => {
     ON CONFLICT(key) DO UPDATE SET value = excluded.value
   `).run(JSON.stringify(normalized));
 
-  res.json({ ok: true, rules: normalized });
+  await flushCloudBackupAndRespond(res, { ok: true, rules: normalized });
 });
 
 // ----------------------------------------------------------------------------
@@ -4403,7 +4443,7 @@ app.get('/api/games/leaderboard', (req: Request, res: Response) => {
       JOIN game_attempts ga ON ga.user_id = u.id AND ga.game_id = ? ${timeClause}
       WHERE u.is_banned = 0
       GROUP BY u.id
-      HAVING COUNT(ga.id) > 0
+      HAVING COALESCE(SUM(ga.xp_earned), 0) > 0 OR COALESCE(SUM(ga.score), 0) > 0 OR p.total_xp > 0
       ORDER BY p.level DESC, p.total_xp DESC, xp DESC, score DESC, games_played DESC
       LIMIT 50
     `).all(gameFilter) as any[];
@@ -4432,7 +4472,7 @@ app.get('/api/games/leaderboard', (req: Request, res: Response) => {
     FROM users u
     JOIN profiles p ON p.user_id = u.id
     WHERE u.is_banned = 0
-      AND (p.total_xp > 0 OR EXISTS (SELECT 1 FROM game_attempts ga WHERE ga.user_id = u.id))
+      AND (p.total_xp > 0 OR EXISTS (SELECT 1 FROM game_attempts ga WHERE ga.user_id = u.id AND (ga.xp_earned > 0 OR ga.score > 0)))
     ORDER BY p.level DESC, p.total_xp DESC, games_played DESC
     LIMIT 100
   `;
@@ -4442,7 +4482,7 @@ app.get('/api/games/leaderboard', (req: Request, res: Response) => {
       SELECT u.id, u.nickname, p.display_name, p.avatar_url, p.level, p.total_xp,
              p.equipped_frame, p.equipped_banner, p.equipped_name_style, p.equipped_badge, p.equipped_title,
              COALESCE(SUM(xt.amount), 0) as xp, p.daily_streak,
-             (SELECT COUNT(*) FROM game_attempts ga WHERE ga.user_id = u.id AND datetime(ga.created_at) >= datetime('now', '-7 days')) as games_played
+             (SELECT COUNT(*) FROM game_attempts ga WHERE ga.user_id = u.id AND (ga.xp_earned > 0 OR ga.score > 0) AND datetime(ga.created_at) >= datetime('now', '-7 days')) as games_played
       FROM users u
       JOIN profiles p ON p.user_id = u.id
       LEFT JOIN xp_transactions xt ON xt.user_id = u.id AND xt.amount > 0 AND datetime(xt.created_at) >= datetime('now', '-7 days')
@@ -4457,7 +4497,7 @@ app.get('/api/games/leaderboard', (req: Request, res: Response) => {
       SELECT u.id, u.nickname, p.display_name, p.avatar_url, p.level, p.total_xp,
              p.equipped_frame, p.equipped_banner, p.equipped_name_style, p.equipped_badge, p.equipped_title,
              COALESCE(SUM(xt.amount), 0) as xp, p.daily_streak,
-             (SELECT COUNT(*) FROM game_attempts ga WHERE ga.user_id = u.id AND datetime(ga.created_at) >= datetime('now', '-30 days')) as games_played
+             (SELECT COUNT(*) FROM game_attempts ga WHERE ga.user_id = u.id AND (ga.xp_earned > 0 OR ga.score > 0) AND datetime(ga.created_at) >= datetime('now', '-30 days')) as games_played
       FROM users u
       JOIN profiles p ON p.user_id = u.id
       LEFT JOIN xp_transactions xt ON xt.user_id = u.id AND xt.amount > 0 AND datetime(xt.created_at) >= datetime('now', '-30 days')
@@ -6797,7 +6837,7 @@ app.get('/api/admin/users/:id/details', requireAdmin, (req: Request, res: Respon
   res.json({ user: target, achievements, items, cycle_id: cycleId, cycle_completions });
 });
 
-app.put('/api/admin/users/:id/full', requireAdmin, (req: AuthRequest, res: Response) => {
+app.put('/api/admin/users/:id/full', requireAdmin, async (req: AuthRequest, res: Response) => {
   const adminId = req.user!.id;
   const targetId = req.params.id;
   const current = db.prepare(`
@@ -7045,6 +7085,9 @@ app.put('/api/admin/users/:id/full', requireAdmin, (req: AuthRequest, res: Respo
       );
     }
 
+  })();
+
+  try {
     db.prepare(`
       INSERT INTO moderation_actions (id, moderator_id, target_user_id, action_type, details)
       VALUES (?, ?, ?, 'admin_user_edit', ?)
@@ -7054,7 +7097,9 @@ app.put('/api/admin/users/:id/full', requireAdmin, (req: AuthRequest, res: Respo
       targetId,
       `Updated user @${nextNickname} (role=${nextRole}, total_xp=${nextTotalXp}, xp=${nextXp}, streak=${nextStreak})`
     );
-  })();
+  } catch (auditErr) {
+    console.error('[ModerationAudit] admin_user_edit post-commit log failed:', auditErr);
+  }
 
   let refreshedToken: string | undefined;
   if (targetId === adminId && (nicknameChanged || nextRole !== current.role_id)) {
@@ -7065,10 +7110,15 @@ app.put('/api/admin/users/:id/full', requireAdmin, (req: AuthRequest, res: Respo
     });
   }
 
-  res.json({ ok: true, nickname: nextNickname, role_id: nextRole, ...(refreshedToken ? { token: refreshedToken } : {}) });
+  await flushCloudBackupAndRespond(res, {
+    ok: true,
+    nickname: nextNickname,
+    role_id: nextRole,
+    ...(refreshedToken ? { token: refreshedToken } : {}),
+  });
 });
 
-app.post('/api/admin/users/:id/reset-cycle', requireAdmin, (req: AuthRequest, res: Response) => {
+app.post('/api/admin/users/:id/reset-cycle', requireAdmin, async (req: AuthRequest, res: Response) => {
   const targetId = req.params.id;
   const target = db.prepare('SELECT id, nickname FROM users WHERE id = ?').get(targetId) as any;
   if (!target) {
@@ -7086,7 +7136,9 @@ app.post('/api/admin/users/:id/reset-cycle', requireAdmin, (req: AuthRequest, re
     const r3 = db.prepare('DELETE FROM quiz_attempts WHERE user_id = ? AND challenge_date IN (?, ?)').run(targetId, cycleId, dateOnly);
     const r4 = db.prepare('DELETE FROM daily_mini_game_attempts WHERE user_id = ? AND cycle_id = ?').run(targetId, cycleId);
     cleared = Number(r1.changes || 0) + Number(r2.changes || 0) + Number(r3.changes || 0) + Number(r4.changes || 0);
+  })();
 
+  try {
     db.prepare(`
       INSERT INTO moderation_actions (id, moderator_id, target_user_id, action_type, details)
       VALUES (?, ?, ?, 'reset_game_cycle', ?)
@@ -7096,12 +7148,14 @@ app.post('/api/admin/users/:id/reset-cycle', requireAdmin, (req: AuthRequest, re
       targetId,
       `Reset current cycle (${cycleId}) locks for @${target.nickname} (rows=${cleared})`
     );
-  })();
+  } catch (auditErr) {
+    console.error('[ModerationAudit] reset_game_cycle post-commit log failed:', auditErr);
+  }
 
-  res.json({ ok: true, cycle_id: cycleId, cleared });
+  await flushCloudBackupAndRespond(res, { ok: true, cycle_id: cycleId, cleared });
 });
 
-app.post('/api/admin/users/:id/equip', requireAdmin, (req: AuthRequest, res: Response) => {
+app.post('/api/admin/users/:id/equip', requireAdmin, async (req: AuthRequest, res: Response) => {
   const targetId = req.params.id;
   const { item_id, category, equip } = req.body || {};
 
@@ -7146,7 +7200,7 @@ app.post('/api/admin/users/:id/equip', requireAdmin, (req: AuthRequest, res: Res
       }
     })();
 
-    res.json({ ok: true, item_id: item.id, is_equipped: shouldEquip });
+    await flushCloudBackupAndRespond(res, { ok: true, item_id: item.id, is_equipped: shouldEquip });
     return;
   }
 
@@ -7159,14 +7213,14 @@ app.post('/api/admin/users/:id/equip', requireAdmin, (req: AuthRequest, res: Res
       `).run(targetId, category);
       db.prepare(`UPDATE profiles SET ${column} = NULL, updated_at = datetime('now') WHERE user_id = ?`).run(targetId);
     })();
-    res.json({ ok: true, category, is_equipped: false });
+    await flushCloudBackupAndRespond(res, { ok: true, category, is_equipped: false });
     return;
   }
 
   res.status(400).json({ error: 'Укажите item_id или category.' });
 });
 
-app.post('/api/admin/users/:id/custom-shield', requireAdmin, (req: AuthRequest, res: Response) => {
+app.post('/api/admin/users/:id/custom-shield', requireAdmin, async (req: AuthRequest, res: Response) => {
   const targetId = req.params.id;
   const target = db.prepare('SELECT id, nickname FROM users WHERE id = ?').get(targetId) as any;
   if (!target) {
@@ -7234,10 +7288,10 @@ app.post('/api/admin/users/:id/custom-shield', requireAdmin, (req: AuthRequest, 
     `).run(previewValue, targetId);
   })();
 
-  res.json({ ok: true, item_id: itemId, preview_value: previewValue });
+  await flushCloudBackupAndRespond(res, { ok: true, item_id: itemId, preview_value: previewValue });
 });
 
-app.post('/api/admin/users/reset', requireAdmin, (req: AuthRequest, res: Response) => {
+app.post('/api/admin/users/reset', requireAdmin, async (req: AuthRequest, res: Response) => {
   const mode = req.body?.mode === 'bulk' ? 'bulk' : 'single';
   const result = executeAdminUserReset(getDb(), {
     adminUserId: req.user!.id,
@@ -7258,10 +7312,10 @@ app.post('/api/admin/users/reset', requireAdmin, (req: AuthRequest, res: Respons
     return;
   }
 
-  res.json(result);
+  await flushCloudBackupAndRespond(res, result);
 });
 
-app.post('/api/admin/users/:id/reset-password', requireAdmin, (req: AuthRequest, res: Response) => {
+app.post('/api/admin/users/:id/reset-password', requireAdmin, async (req: AuthRequest, res: Response) => {
   const adminId = req.user!.id;
   const targetId = req.params.id;
   const { new_password } = req.body || {};
@@ -7302,8 +7356,10 @@ app.post('/api/admin/users/:id/reset-password', requireAdmin, (req: AuthRequest,
 
     // Revoke all active sessions for the target user
     db.prepare('DELETE FROM sessions WHERE user_id = ?').run(targetId);
+  })();
 
-    // Audit log (never stores plaintext password!)
+  // Audit log runs strictly post-commit (never stores plaintext password)
+  try {
     db.prepare(`
       INSERT INTO moderation_actions (id, moderator_id, target_user_id, action_type, details)
       VALUES (?, ?, ?, 'password_reset', ?)
@@ -7313,15 +7369,17 @@ app.post('/api/admin/users/:id/reset-password', requireAdmin, (req: AuthRequest,
       targetId,
       `Admin password reset for @${targetUser.nickname}`
     );
-  })();
+  } catch (auditErr) {
+    console.error('[ModerationAudit] password_reset post-commit log failed:', auditErr);
+  }
 
-  res.json({
+  await flushCloudBackupAndRespond(res, {
     ok: true,
     message: `Новый пароль для @${targetUser.nickname} установлен. Предыдущие сессии завершены.`,
   });
 });
 
-app.post('/api/admin/users/:id/achievements', requireAdmin, (req: AuthRequest, res: Response) => {
+app.post('/api/admin/users/:id/achievements', requireAdmin, async (req: AuthRequest, res: Response) => {
   const targetId = req.params.id;
   const { achievement_id, action, adjust_xp } = req.body || {};
   if (!achievement_id || (action !== 'grant' && action !== 'revoke')) {
@@ -7401,10 +7459,10 @@ app.post('/api/admin/users/:id/achievements', requireAdmin, (req: AuthRequest, r
     }
   })();
 
-  res.json({ ok: true, action, achievement_id: ach.id, xp_changed: xpChanged });
+  await flushCloudBackupAndRespond(res, { ok: true, action, achievement_id: ach.id, xp_changed: xpChanged });
 });
 
-app.post('/api/admin/users/:id/items', requireAdmin, (req: AuthRequest, res: Response) => {
+app.post('/api/admin/users/:id/items', requireAdmin, async (req: AuthRequest, res: Response) => {
   const targetId = req.params.id;
   const { item_id, action } = req.body || {};
   if (!item_id || (action !== 'grant' && action !== 'revoke')) {
@@ -7439,10 +7497,10 @@ app.post('/api/admin/users/:id/items', requireAdmin, (req: AuthRequest, res: Res
     })();
   }
 
-  res.json({ ok: true, action, item_id: item.id });
+  await flushCloudBackupAndRespond(res, { ok: true, action, item_id: item.id });
 });
 
-app.post('/api/admin/users/:id/ban', requireAdmin, (req: AuthRequest, res: Response) => {
+app.post('/api/admin/users/:id/ban', requireAdmin, async (req: AuthRequest, res: Response) => {
   const { is_banned, ban_reason } = req.body || {};
   const targetUser = db.prepare('SELECT id, nickname, email, role_id FROM users WHERE id = ?').get(req.params.id) as any;
   if (!targetUser) {
@@ -7479,10 +7537,10 @@ app.post('/api/admin/users/:id/ban', requireAdmin, (req: AuthRequest, res: Respo
     db.prepare('DELETE FROM sessions WHERE user_id = ?').run(req.params.id);
   }
 
-  res.json({ ok: true });
+  await flushCloudBackupAndRespond(res, { ok: true });
 });
 
-app.post('/api/admin/users/:id/role', requireAdmin, (req: AuthRequest, res: Response) => {
+app.post('/api/admin/users/:id/role', requireAdmin, async (req: AuthRequest, res: Response) => {
   const { role_id } = req.body || {};
   if (!['user', 'moderator', 'admin'].includes(role_id)) {
     res.status(400).json({ error: 'Invalid role' });
@@ -7505,7 +7563,7 @@ app.post('/api/admin/users/:id/role', requireAdmin, (req: AuthRequest, res: Resp
     return;
   }
   db.prepare("UPDATE users SET role_id = ?, updated_at = datetime('now') WHERE id = ?").run(role_id, req.params.id);
-  res.json({ ok: true });
+  await flushCloudBackupAndRespond(res, { ok: true });
 });
 
 app.get('/api/admin/stats', requireAdmin, (_req: Request, res: Response) => {
@@ -8190,7 +8248,7 @@ app.get('/api/admin/leaderboard', requireAdmin, (req: Request, res: Response) =>
   });
 });
 
-app.post('/api/admin/leaderboard/clear', requireAdmin, (req: AuthRequest, res: Response) => {
+app.post('/api/admin/leaderboard/clear', requireAdmin, async (req: AuthRequest, res: Response) => {
   const rawScope = String(req.body?.scope || 'all').trim();
   const allowedScopes = new Set(['all', 'weekly', 'monthly', 'guess-track', 'daily-quiz', 'guess-lyrics', 'reverse-track', 'speed-track', 'daily-attempts']);
   if (!allowedScopes.has(rawScope)) {
@@ -8277,6 +8335,9 @@ app.post('/api/admin/leaderboard/clear', requireAdmin, (req: AuthRequest, res: R
       removed.game_completions = db.prepare('DELETE FROM game_completions WHERE cycle_id = ?').run(cycleId).changes;
     }
 
+  })();
+
+  try {
     db.prepare(`
       INSERT INTO moderation_actions (id, moderator_id, target_user_id, action_type, details)
       VALUES (?, ?, ?, 'leaderboard_clear', ?)
@@ -8286,12 +8347,14 @@ app.post('/api/admin/leaderboard/clear', requireAdmin, (req: AuthRequest, res: R
       req.user!.id,
       `Cleared leaderboard scope=${rawScope} (${JSON.stringify(removed)})`
     );
-  })();
+  } catch (auditErr) {
+    console.error('[ModerationAudit] leaderboard_clear post-commit log failed:', auditErr);
+  }
 
-  res.json({ ok: true, scope: rawScope, removed });
+  await flushCloudBackupAndRespond(res, { ok: true, scope: rawScope, removed });
 });
 
-app.delete('/api/admin/leaderboard/users/:userId', requireAdmin, (req: AuthRequest, res: Response) => {
+app.delete('/api/admin/leaderboard/users/:userId', requireAdmin, async (req: AuthRequest, res: Response) => {
   const userId = String(req.params.userId || '').trim();
   const rawScope = String(req.query.scope || req.body?.scope || 'all').trim();
   const allowedScopes = new Set(['all', 'guess-track', 'daily-quiz', 'guess-lyrics', 'reverse-track', 'speed-track', 'daily-attempts']);
@@ -8358,6 +8421,9 @@ app.delete('/api/admin/leaderboard/users/:userId', requireAdmin, (req: AuthReque
       removed.game_completions = db.prepare('DELETE FROM game_completions WHERE user_id = ? AND cycle_id = ?').run(userId, cycleId).changes;
     }
 
+  })();
+
+  try {
     db.prepare(`
       INSERT INTO moderation_actions (id, moderator_id, target_user_id, action_type, details)
       VALUES (?, ?, ?, 'leaderboard_user_reset', ?)
@@ -8367,9 +8433,11 @@ app.delete('/api/admin/leaderboard/users/:userId', requireAdmin, (req: AuthReque
       userId,
       `Reset leaderboard for @${targetUser.nickname} scope=${rawScope} (${JSON.stringify(removed)})`
     );
-  })();
+  } catch (auditErr) {
+    console.error('[ModerationAudit] leaderboard_user_reset post-commit log failed:', auditErr);
+  }
 
-  res.json({ ok: true, user_id: userId, nickname: targetUser.nickname, scope: rawScope, removed });
+  await flushCloudBackupAndRespond(res, { ok: true, user_id: userId, nickname: targetUser.nickname, scope: rawScope, removed });
 });
 
 // ----------------------------------------------------------------------------

@@ -468,7 +468,7 @@ describe('SQLite additive migrations on legacy Stage 1–6 databases', () => {
       assert.equal(resetRes.ok, true);
       if (resetRes.ok) {
         assert.equal(resetRes.affected_users, 2);
-        assert.equal(resetRes.audit_fallback_used, false);
+        assert.equal(resetRes.audit_logged, true);
       }
 
       const member1Profile = testDb.prepare('SELECT total_xp, xp, level, daily_streak FROM profiles WHERE user_id = ?').get('101') as any;
@@ -484,7 +484,7 @@ describe('SQLite additive migrations on legacy Stage 1–6 databases', () => {
         .get() as any;
       assert.ok(latestAudit);
       assert.equal(latestAudit.moderator_id, 'u_admin');
-      assert.equal(latestAudit.target_user_id, null);
+      assert.equal(latestAudit.target_user_id, 'u_admin');
       assert.ok(String(latestAudit.details).includes('affected=2'));
     } finally {
       testDb.close();
@@ -576,7 +576,7 @@ describe('SQLite additive migrations on legacy Stage 1–6 databases', () => {
       assert.equal(resetRes.ok, true);
       if (resetRes.ok) {
         assert.equal(resetRes.affected_users, 1);
-        assert.equal(resetRes.audit_fallback_used, true);
+        assert.equal(resetRes.audit_logged, true);
       }
 
       const memberProfile = testDb.prepare('SELECT total_xp, xp, level FROM profiles WHERE user_id = ?').get('u_1') as any;
@@ -592,6 +592,104 @@ describe('SQLite additive migrations on legacy Stage 1–6 databases', () => {
       assert.equal(fallbackLog.target_user_id, 'u_admin');
       assert.equal(fallbackLog.action, 'mass_reset');
       assert.ok(String(fallbackLog.reason).includes('affected=1'));
+    } finally {
+      testDb.close();
+    }
+  });
+
+  it('single and bulk resets zero XP, level, xp_transactions and exclude reset users from leaderboard queries', () => {
+    const testDb = new Database(':memory:');
+    try {
+      ensureSchemaAndMigrations(testDb);
+      testDb.exec(`
+        INSERT OR IGNORE INTO roles (id, name, description, level) VALUES
+          ('user', 'User', 'Member', 1),
+          ('admin', 'Administrator', 'Admin', 3);
+
+        INSERT INTO users (id, nickname, password_hash, role_id) VALUES
+          ('u_admin', 'boss_admin', 'hash', 'admin'),
+          ('u_player1', 'player_one', 'hash', 'user'),
+          ('u_player2', 'player_two', 'hash', 'user');
+
+        INSERT INTO profiles (user_id, display_name, xp, total_xp, level, daily_streak) VALUES
+          ('u_admin', 'Boss Admin', 900, 900, 5, 10),
+          ('u_player1', 'Player One', 150, 350, 3, 5),
+          ('u_player2', 'Player Two', 220, 480, 4, 7);
+
+        INSERT INTO xp_transactions (id, user_id, amount, source, details) VALUES
+          ('xpt_1', 'u_player1', 350, 'guess_track', 'Test XP 1'),
+          ('xpt_2', 'u_player2', 480, 'daily_quiz', 'Test XP 2');
+
+        INSERT INTO game_attempts (id, user_id, game_id, score, xp_earned) VALUES
+          ('ga_1', 'u_player1', 'guess-track', 100, 50),
+          ('ga_2', 'u_player2', 'daily-quiz', 120, 80);
+      `);
+
+      const queryLeaderboardIds = () =>
+        (
+          testDb
+            .prepare(`
+              SELECT u.id, p.xp, p.total_xp, p.level
+              FROM users u
+              JOIN profiles p ON p.user_id = u.id
+              WHERE u.is_banned = 0
+                AND (p.total_xp > 0 OR EXISTS (
+                  SELECT 1 FROM game_attempts ga
+                  WHERE ga.user_id = u.id AND (ga.xp_earned > 0 OR ga.score > 0)
+                ))
+              ORDER BY p.level DESC, p.total_xp DESC
+            `)
+            .all() as Array<{ id: string; xp: number; total_xp: number; level: number }>
+        ).map((r) => r.id);
+
+      assert.deepEqual(queryLeaderboardIds(), ['u_admin', 'u_player2', 'u_player1']);
+
+      // 1) Single reset (XP only, keeping game_attempts rows zeroed)
+      const singleRes = executeAdminUserReset(testDb, {
+        adminUserId: 'u_admin',
+        mode: 'single',
+        targetUserId: 'u_player1',
+        scopes: { xp: true, achievements: false, cosmetics: false, games: false },
+      });
+      assert.equal(singleRes.ok, true);
+      if (singleRes.ok) {
+        assert.equal(singleRes.affected_users, 1);
+      }
+
+      const p1AfterSingle = testDb
+        .prepare('SELECT xp, total_xp, level FROM profiles WHERE user_id = ?')
+        .get('u_player1') as { xp: number; total_xp: number; level: number };
+      assert.equal(p1AfterSingle.total_xp, 0);
+      assert.equal(p1AfterSingle.xp, 0);
+      assert.equal(p1AfterSingle.level, 1);
+      assert.deepEqual(queryLeaderboardIds(), ['u_admin', 'u_player2']);
+
+      // 2) Bulk reset (skipAdmins: true)
+      const bulkRes = executeAdminUserReset(testDb, {
+        adminUserId: 'u_admin',
+        mode: 'bulk',
+        skipAdmins: true,
+        confirmText: 'СБРОСИТЬ',
+        scopes: { xp: true, achievements: true, cosmetics: true, games: true },
+      });
+      assert.equal(bulkRes.ok, true);
+      if (bulkRes.ok) {
+        assert.equal(bulkRes.affected_users, 2);
+      }
+
+      const p2AfterBulk = testDb
+        .prepare('SELECT xp, total_xp, level, daily_streak FROM profiles WHERE user_id = ?')
+        .get('u_player2') as { xp: number; total_xp: number; level: number; daily_streak: number };
+      assert.equal(p2AfterBulk.total_xp, 0);
+      assert.equal(p2AfterBulk.xp, 0);
+      assert.equal(p2AfterBulk.level, 1);
+      assert.equal(p2AfterBulk.daily_streak, 0);
+
+      const adminAfterBulk = testDb
+        .prepare('SELECT xp, total_xp, level FROM profiles WHERE user_id = ?')
+        .get('u_admin') as { xp: number; total_xp: number; level: number };
+      assert.equal(adminAfterBulk.total_xp, 900);
+      assert.deepEqual(queryLeaderboardIds(), ['u_admin']);
     } finally {
       testDb.close();
     }
