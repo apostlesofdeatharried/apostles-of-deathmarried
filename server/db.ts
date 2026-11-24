@@ -169,6 +169,192 @@ export function replaceDatabaseWithBuffer(buffer: Buffer): void {
   ensureSchemaAndMigrations(currentDb);
 }
 
+// Complete 86-item XP Customization Shop catalog across 7 distinct categories & 6 rarities (Common -> Mythic).
+// All previously owned item IDs are preserved; deprecated title_* IDs are softly remapped without losing ownership.
+export const DEFAULT_SHOP_ITEMS = [
+  // 1. Avatar Frames (14 items)
+  { id: 'frame_graphite', name_ru: 'Графитовый контур', name_en: 'Graphite Contour', description_ru: 'Минималистичный холодный серый кант', description_en: 'Minimalist cool graphite contour', category: 'frame', cost_xp: 120, rarity: 'common', preview_value: 'border-2 border-white/30' },
+  { id: 'frame_slate_wire', name_ru: 'Свинцовая нить', name_en: 'Slate Wire', description_ru: 'Тонкая холодная грань архивного портрета', description_en: 'Fine cold edge for an archival portrait', category: 'frame', cost_xp: 160, rarity: 'common', preview_value: 'border-2 border-[#596170] ring-1 ring-white/10' },
+  { id: 'frame_ash_ring', name_ru: 'Пепельное кольцо', name_en: 'Ash Ring', description_ru: 'Матовый дымчатый ободок с тонкой обводкой', description_en: 'Matte smoky ring with subtle rim', category: 'frame', cost_xp: 230, rarity: 'uncommon', preview_value: 'border-2 border-[#7b746b] ring-2 ring-[#7b746b]/25' },
+  { id: 'frame_moss_crypt', name_ru: 'Сумрак камня', name_en: 'Crypt Stone', description_ru: 'Глубокий тёмно-изумрудный кант ночного камня', description_en: 'Deep dark emerald stone rim', category: 'frame', cost_xp: 280, rarity: 'uncommon', preview_value: 'border-2 border-[#2a6b54] ring-2 ring-[#64c9a3]/20 shadow-[0_0_12px_rgba(42,107,84,0.35)]' },
+  { id: 'frame_dashed_blueprint', name_ru: 'Пунктир стали', name_en: 'Steel Dashed', description_ru: 'Строгая прерывистая окантовка в стиле андеграунд-чертежа', description_en: 'Crisp dashed industrial steel contour', category: 'frame', cost_xp: 410, rarity: 'rare', preview_value: 'border-2 border-dashed border-[#9aa3b2] ring-2 ring-black/60' },
+  { id: 'frame_silver_thorn', name_ru: 'Серебряный шип', name_en: 'Silver Thorn', description_ru: 'Элегантная серебристая окантовка с мягким свечением', description_en: 'Elegant silver border with subtle glow', category: 'frame', cost_xp: 480, rarity: 'rare', preview_value: 'border-2 border-[#c5c8cf] shadow-[0_0_14px_rgba(197,200,207,0.35)]' },
+  { id: 'frame_dark_velvet', name_ru: 'Чёрный бархат', name_en: 'Dark Velvet', description_ru: 'Глубокая бархатная рамка с бордовым отсветом', description_en: 'Deep velvet frame with dark crimson sheen', category: 'frame', cost_xp: 600, rarity: 'rare', preview_value: 'border-2 border-[#721b2b] shadow-[0_0_16px_rgba(130,28,44,0.55)]' },
+  { id: 'frame_cobalt_vespers', name_ru: 'Холодный кобальт', name_en: 'Cold Cobalt', description_ru: 'Ледяная сапфировая окантовка ночного эфира', description_en: 'Icy sapphire halo of nocturnal airwaves', category: 'frame', cost_xp: 750, rarity: 'rare', preview_value: 'border-2 border-[#4d75ad] ring-2 ring-[#9dc2f5]/25 shadow-[0_0_16px_rgba(77,117,173,0.45)]' },
+  { id: 'frame_nocturne_amethyst', name_ru: 'Сумеречный аметист', name_en: 'Nocturne Amethyst', description_ru: 'Холодный фиолетовый ореол ночного эфира', description_en: 'Cold violet halo of midnight resonance', category: 'frame', cost_xp: 980, rarity: 'epic', preview_value: 'border-2 border-[#6e56a8] ring-2 ring-[#a38ee0]/25 shadow-[0_0_18px_rgba(110,86,168,0.55)]' },
+  { id: 'frame_gothic_crown', name_ru: 'Двойной кармин', name_en: 'Double Carmine', description_ru: 'Строгий двойной контур с глубоким винным сиянием', description_en: 'Strict double contour with deep wine glow', category: 'frame', cost_xp: 1250, rarity: 'epic', preview_value: 'border-2 border-[#821c2c] ring-2 ring-white/25 shadow-[0_0_20px_rgba(130,28,44,0.75)]' },
+  { id: 'frame_gilded_relic', name_ru: 'Античное золото', name_en: 'Antique Gold', description_ru: 'Сдержанная золотая оправа с благородным отблеском', description_en: 'Restrained antique gold frame with warm sheen', category: 'frame', cost_xp: 1750, rarity: 'legendary', preview_value: 'border-2 border-[#d4af68] ring-2 ring-[#f3dca6]/35 shadow-[0_0_24px_rgba(212,175,104,0.6)]' },
+  { id: 'frame_ivory_seraph', name_ru: 'Костяной ореол', name_en: 'Ivory Halo', description_ru: 'Алебастровая оправа с двойным золотым контуром', description_en: 'Luminous alabaster frame with gilded inner ring', category: 'frame', cost_xp: 2150, rarity: 'legendary', preview_value: 'border-2 border-[#f2e8d5] ring-2 ring-[#d4af68]/45 shadow-[0_0_26px_rgba(242,232,213,0.55)]' },
+  { id: 'frame_pulse_crimson', name_ru: 'Пульсирующий кант', name_en: 'Crimson Pulse Rim', description_ru: 'Анимированная рамка с плавным дыханием алого света', description_en: 'Animated avatar rim with smooth crimson pulse', category: 'frame', cost_xp: 2450, rarity: 'mythic', preview_value: 'border-2 border-[#b8324a] ring-2 ring-[#f0a8b8]/40 aod-frame-pulse' },
+  { id: 'frame_eclipse_sovereign', name_ru: 'Кант затмения', name_en: 'Eclipse Contour', description_ru: 'Мифическая багрово-золотая оправа полного затмения', description_en: 'Mythic crimson-gold eclipse contour', category: 'frame', cost_xp: 2700, rarity: 'mythic', preview_value: 'border-2 border-[#e27ca4] ring-2 ring-[#f3d492]/55 shadow-[0_0_30px_rgba(201,91,132,0.75)]' },
+
+  // 2. Profile Banners (12 distinct textured static banners + 4 GPU-accelerated animated banners = 16 items)
+  { id: 'banner_abyss', name_ru: 'Плёночный графит', name_en: 'Film Graphite', description_ru: 'Глубокий угольный фон с фактурой 35мм киноплёнки', description_en: 'Deep charcoal surface with 35mm film grain texture', category: 'banner', cost_xp: 150, rarity: 'common', preview_value: 'banner_tex_graphite_grain' },
+  { id: 'banner_charcoal_fog', name_ru: 'Архитектурная сетка', name_en: 'Architectural Grid', description_ru: 'Минималистичная тёмная чертёжная сетка в андеграунд-стиле', description_en: 'Minimalist dark architectural blueprint grid', category: 'banner', cost_xp: 200, rarity: 'common', preview_value: 'banner_tex_arch_grid' },
+  { id: 'banner_slate_rain', name_ru: 'Свинцовый дождь', name_en: 'Slate Rain', description_ru: 'Косые штрихи ночного дождя на холодном бетоне', description_en: 'Angled midnight rain streaks over cold slate', category: 'banner', cost_xp: 260, rarity: 'uncommon', preview_value: 'banner_tex_slate_rain' },
+  { id: 'banner_pine_nocturne', name_ru: 'Северный туман', name_en: 'Northern Mist', description_ru: 'Холодная хвойная дымка с вертикальной тенью', description_en: 'Cold pine twilight with vertical fog depth', category: 'banner', cost_xp: 310, rarity: 'uncommon', preview_value: 'banner_tex_forest_fog' },
+  { id: 'banner_night_mist', name_ru: 'Лунная вуаль', name_en: 'Moonlit Veil', description_ru: 'Холодный лунный просвет сквозь плотный ночной мрак', description_en: 'Cool lunar beam cutting through dark mist', category: 'banner', cost_xp: 460, rarity: 'rare', preview_value: 'banner_tex_moonlit_veil' },
+  { id: 'banner_silver_silk', name_ru: 'Шлифованная сталь', name_en: 'Brushed Steel', description_ru: 'Холодная металлическая текстура с диагональным бликом', description_en: 'Cold brushed steel grain with specular diagonal sheen', category: 'banner', cost_xp: 580, rarity: 'rare', preview_value: 'banner_tex_brushed_steel' },
+  { id: 'banner_cobalt_abbey', name_ru: 'Готическая решётка', name_en: 'Gothic Lattice', description_ru: 'Тонкое ромбовидное плетение в глубоком кобальте', description_en: 'Fine diamond lattice over deep midnight cobalt', category: 'banner', cost_xp: 700, rarity: 'rare', preview_value: 'banner_tex_gothic_mesh' },
+  { id: 'banner_cathedral_veil', name_ru: 'Алый бархат', name_en: 'Crimson Velvet', description_ru: 'Глубокие драпировки тёмно-винного бархата и светотени', description_en: 'Deep burgundy velvet drapery folds and chiaroscuro', category: 'banner', cost_xp: 850, rarity: 'epic', preview_value: 'banner_tex_crimson_velvet' },
+  { id: 'banner_midnight_choir', name_ru: 'Дорожки винила', name_en: 'Vinyl Grooves', description_ru: 'Концентрический рельеф тёмной пластинки в сумеречном свете', description_en: 'Concentric dark vinyl grooves with subtle specular arc', category: 'banner', cost_xp: 1050, rarity: 'epic', preview_value: 'banner_tex_vinyl_grooves' },
+  { id: 'banner_gilded_eclipse', name_ru: 'Золотой полумесяц', name_en: 'Gilded Crescent', description_ru: 'Античное золотое кольцо затмения над обсидианом', description_en: 'Antique gold eclipse arc over obsidian stone', category: 'banner', cost_xp: 1450, rarity: 'legendary', preview_value: 'banner_tex_gold_eclipse' },
+  { id: 'banner_blood_vespers', name_ru: 'Карминовый нуар', name_en: 'Carmine Noir', description_ru: 'Резкий горизонт кармина с глубокой виньеткой и зерном', description_en: 'Stark carmine noir horizon with deep vignette grain', category: 'banner', cost_xp: 1650, rarity: 'legendary', preview_value: 'banner_tex_carmine_noir' },
+  { id: 'banner_astral_requiem', name_ru: 'Призма обсидиана', name_en: 'Obsidian Prism', description_ru: 'Геометрические грани тёмного стекла с отблеском розы и золота', description_en: 'Fractured dark obsidian facets catching rose-gold light', category: 'banner', cost_xp: 2050, rarity: 'legendary', preview_value: 'banner_tex_obsidian_prism' },
+  { id: 'banner_anim_dark_mist', name_ru: 'Тёмный туман', name_en: 'Dark Mist', description_ru: 'Анимированный фон: медленно плывущие слои холодного ночного тумана', description_en: 'Animated banner: slowly drifting layers of cold nocturnal mist', category: 'banner', cost_xp: 1900, rarity: 'legendary', preview_value: 'banner_anim_dark_mist' },
+  { id: 'banner_anim_crimson_embers', name_ru: 'Алые искры и пепел', name_en: 'Crimson Embers', description_ru: 'Анимированный фон: плавно взлетающие алые искры и тлеющий пепел', description_en: 'Animated banner: gently rising crimson embers and ash motes', category: 'banner', cost_xp: 2300, rarity: 'legendary', preview_value: 'banner_anim_crimson_embers' },
+  { id: 'banner_anim_digital_glitch', name_ru: 'Цифровой глитч', name_en: 'Digital Glitch', description_ru: 'Анимированный фон: тёмные VHS-сканлайны и чёткие хроматические сдвиги', description_en: 'Animated banner: dark VHS scanlines and crisp chromatic glitch slices', category: 'banner', cost_xp: 2650, rarity: 'mythic', preview_value: 'banner_anim_digital_glitch' },
+  { id: 'banner_anim_abyss_pulse', name_ru: 'Пульс бездны', name_en: 'Abyss Pulse', description_ru: 'Анимированный фон: глубокое гипнотическое дыхание багрового затмения', description_en: 'Animated banner: hypnotic breathing rings of crimson eclipse', category: 'banner', cost_xp: 3000, rarity: 'mythic', preview_value: 'banner_anim_abyss_pulse' },
+
+  // 3. Name Styles (11 items)
+  { id: 'style_monochrome', name_ru: 'Холодный графит', name_en: 'Cold Graphite', description_ru: 'Сдержанный матовый стиль с увеличенным трекингом', description_en: 'Matte cool font with expanded tracking', category: 'name_style', cost_xp: 100, rarity: 'common', preview_value: 'text-[#b5b0a8] tracking-wider' },
+  { id: 'style_ash_serif', name_ru: 'Пепельный курсив', name_en: 'Ash Italic', description_ru: 'Тонкий винтажный наклон архивной подписи', description_en: 'Subtle vintage slanted archival signature', category: 'name_style', cost_xp: 150, rarity: 'common', preview_value: 'text-[#cbc4b8] italic tracking-wide' },
+  { id: 'style_bone_ivory', name_ru: 'Слоновая кость', name_en: 'Antique Ivory', description_ru: 'Тёплый винтажный тон старой бумаги и мягкий акцент', description_en: 'Warm vintage ivory tone with soft emphasis', category: 'name_style', cost_xp: 220, rarity: 'uncommon', preview_value: 'text-[#f2e8d5] tracking-wide font-medium' },
+  { id: 'style_emerald_mist', name_ru: 'Изумрудный туман', name_en: 'Emerald Mist', description_ru: 'Приглушённое холодное свечение лесной ночи', description_en: 'Muted cold nocturnal emerald shimmer', category: 'name_style', cost_xp: 270, rarity: 'uncommon', preview_value: 'text-[#8fd9bc] drop-shadow-[0_0_8px_rgba(100,201,163,0.35)] font-medium' },
+  { id: 'style_silver_glow', name_ru: 'Серебряный глянец', name_en: 'Silver Glow', description_ru: 'Светлое серебристое свечение символов имени', description_en: 'Luminous silver lettering', category: 'name_style', cost_xp: 440, rarity: 'rare', preview_value: 'text-[#e6e8ee] drop-shadow-[0_0_8px_rgba(255,255,255,0.45)] font-medium' },
+  { id: 'style_crimson_shade', name_ru: 'Бархатный оттенок', name_en: 'Crimson Shade', description_ru: 'Благородный винный оттенок с мягкой тенью', description_en: 'Muted wine tone with soft velvet shadow', category: 'name_style', cost_xp: 640, rarity: 'rare', preview_value: 'text-[#eb909d] drop-shadow-[0_0_9px_rgba(229,138,150,0.45)] font-medium' },
+  { id: 'style_amethyst_whisper', name_ru: 'Лунный аметист', name_en: 'Moonlit Amethyst', description_ru: 'Призрачное сиренево-серебристое сияние шрифта', description_en: 'Spectral lavender-silver glow lettering', category: 'name_style', cost_xp: 960, rarity: 'epic', preview_value: 'text-[#d3c4f7] drop-shadow-[0_0_10px_rgba(167,140,235,0.5)] font-medium tracking-wide' },
+  { id: 'style_velvet_gradient', name_ru: 'Градиент бархата', name_en: 'Velvet Gradient', description_ru: 'Плавный переход от серебра к глубокому кармину', description_en: 'Smooth metallic silver to deep carmine gradient', category: 'name_style', cost_xp: 1280, rarity: 'epic', preview_value: 'bg-gradient-to-r from-[#f5dce2] via-[#e26f86] to-[#f0b4c0] bg-clip-text text-transparent font-semibold tracking-wide' },
+  { id: 'style_gilded_sovereign', name_ru: 'Золото архива', name_en: 'Archive Gold', description_ru: 'Античный золотой градиент с благородным сиянием', description_en: 'Antique gold luminous lettering', category: 'name_style', cost_xp: 1650, rarity: 'legendary', preview_value: 'text-[#f0d599] drop-shadow-[0_0_12px_rgba(224,188,112,0.55)] font-semibold tracking-wide' },
+  { id: 'style_moonlit_chrome', name_ru: 'Лунный хром', name_en: 'Moonlit Chrome', description_ru: 'Холодный зеркальный градиент серебра и сапфира', description_en: 'Cold mirror gradient of silver and sapphire', category: 'name_style', cost_xp: 2000, rarity: 'legendary', preview_value: 'bg-gradient-to-r from-[#ffffff] via-[#9fc5f5] to-[#d6dceb] bg-clip-text text-transparent font-semibold tracking-wider drop-shadow-[0_0_10px_rgba(159,197,245,0.4)]' },
+  { id: 'style_mythic_eclipse', name_ru: 'Сияние затмения', name_en: 'Eclipse Radiance', description_ru: 'Мифический переливающийся градиент золота, розы и аметиста', description_en: 'Mythic shifting gradient of gold, rose and amethyst', category: 'name_style', cost_xp: 2500, rarity: 'mythic', preview_value: 'bg-gradient-to-r from-[#f7dca2] via-[#ef8cb3] to-[#c4a6fa] bg-clip-text text-transparent font-semibold tracking-wider drop-shadow-[0_0_14px_rgba(239,140,179,0.5)]' },
+
+  // 4. Avatar & Profile Icons / Badges (11 items)
+  { id: 'badge_wanderer', name_ru: 'Иконка «Искра»', name_en: 'Spark Icon', description_ru: 'Минималистичная серебристая искра возле имени', description_en: 'Minimalist silver spark emblem beside your name', category: 'badge', cost_xp: 130, rarity: 'common', preview_value: 'Sparkles' },
+  { id: 'badge_chronicler', name_ru: 'Иконка «Перо»', name_en: 'Quill Icon', description_ru: 'Лаконичная метка автора текстов и заметок', description_en: 'Clean quill emblem for lyric and note writers', category: 'badge', cost_xp: 170, rarity: 'common', preview_value: 'Feather' },
+  { id: 'badge_nocturne', name_ru: 'Иконка «Луна»', name_en: 'Moon Icon', description_ru: 'Тёмно-фиолетовый полумесяц ночного слушателя', description_en: 'Nocturnal crescent emblem in muted violet', category: 'badge', cost_xp: 240, rarity: 'uncommon', preview_value: 'Moon' },
+  { id: 'badge_night_signal', name_ru: 'Иконка «Эфир»', name_en: 'Headphones Icon', description_ru: 'Отметка постоянного слушателя релизов deathmarried', description_en: 'Clean headphones mark for constant listeners', category: 'badge', cost_xp: 290, rarity: 'uncommon', preview_value: 'Headphones' },
+  { id: 'badge_archivist', name_ru: 'Иконка «Щит»', name_en: 'Shield Icon', description_ru: 'Стальной знак участника архива', description_en: 'Steel shield emblem of archive regulars', category: 'badge', cost_xp: 550, rarity: 'rare', preview_value: 'Shield' },
+  { id: 'badge_audiophile', name_ru: 'Иконка «Винил»', name_en: 'Vinyl Icon', description_ru: 'Винный знак пластинки для ценителей звука', description_en: 'Dark wine vinyl mark for sound enthusiasts', category: 'badge', cost_xp: 920, rarity: 'epic', preview_value: 'Disc' },
+  { id: 'badge_ember', name_ru: 'Иконка «Огонь»', name_en: 'Flame Icon', description_ru: 'Багровая метка активности и серии дней', description_en: 'Crimson flame mark of sustained activity', category: 'badge', cost_xp: 1120, rarity: 'epic', preview_value: 'Flame' },
+  { id: 'badge_oracle', name_ru: 'Иконка «Взгляд»', name_en: 'Eye Icon', description_ru: 'Сумеречная аметистовая метка наблюдателя', description_en: 'Muted amethyst eye emblem', category: 'badge', cost_xp: 1320, rarity: 'epic', preview_value: 'Eye' },
+  { id: 'badge_night_crown', name_ru: 'Иконка «Корона»', name_en: 'Crown Icon', description_ru: 'Античная золотая корона для лидеров рейтинга', description_en: 'Antique gold crown emblem', category: 'badge', cost_xp: 1750, rarity: 'legendary', preview_value: 'Crown' },
+  { id: 'badge_relic_gem', name_ru: 'Иконка «Кристалл»', name_en: 'Crystal Icon', description_ru: 'Тёмно-карминовый огранённый кристалл', description_en: 'Dark carmine faceted crystal emblem', category: 'badge', cost_xp: 2100, rarity: 'legendary', preview_value: 'Gem' },
+  { id: 'badge_apostle_star', name_ru: 'Иконка «Звезда»', name_en: 'Star Icon', description_ru: 'Мифическая звезда высшей ступени комьюнити', description_en: 'Mythic star emblem of the community', category: 'badge', cost_xp: 2650, rarity: 'mythic', preview_value: 'Star' },
+
+  // 5. Shields beside nickname (15 items)
+  { id: 'shield_novichok', name_ru: 'Шилд «новичок»', name_en: 'Shield: novichok', description_ru: 'Лаконичный стартовый шилд возле ника в профиле и рейтинге', description_en: 'Minimalist starter shield beside your nickname', category: 'title', cost_xp: 100, rarity: 'common', preview_value: 'shield_novichok' },
+  { id: 'shield_slushatel', name_ru: 'Шилд «слушатель»', name_en: 'Shield: slushatel', description_ru: 'Сдержанный монохромный шилд постоянного слушателя', description_en: 'Understated monochrome listener shield', category: 'title', cost_xp: 150, rarity: 'common', preview_value: 'shield_slushatel' },
+  { id: 'shield_v_teme', name_ru: 'Шилд «в теме»', name_en: 'Shield: v teme', description_ru: 'Чистый андеграундный шилд для тех, кто следит за релизами', description_en: 'Clean underground shield for those in the loop', category: 'title', cost_xp: 200, rarity: 'common', preview_value: 'shield_v_teme' },
+  { id: 'shield_nochnoy', name_ru: 'Шилд «ночной»', name_en: 'Shield: nochnoy', description_ru: 'Минималистичный ночной шилд в графитовой рамке', description_en: 'Minimalist nocturnal shield in a graphite hairline', category: 'title', cost_xp: 250, rarity: 'common', preview_value: 'shield_nochnoy' },
+  { id: 'shield_tsenitel', name_ru: 'Шилд «ценитель»', name_en: 'Shield: tsenitel', description_ru: 'Холодный стальной шилд знатока звучания deathmarried', description_en: 'Cool steel shield for sound connoisseurs', category: 'title', cost_xp: 400, rarity: 'rare', preview_value: 'shield_tsenitel' },
+  { id: 'shield_arkhivarius', name_ru: 'Шилд «архивариус»', name_en: 'Shield: arkhivarius', description_ru: 'Серебристо-сланцевый шилд исследователя дискографии', description_en: 'Silver-slate shield for discography explorers', category: 'title', cost_xp: 480, rarity: 'rare', preview_value: 'shield_arkhivarius' },
+  { id: 'shield_svoy', name_ru: 'Шилд «свой»', name_en: 'Shield: svoy', description_ru: 'Спокойный сдержанный статус участника близкого круга', description_en: 'Quiet insider status for community regulars', category: 'title', cost_xp: 560, rarity: 'rare', preview_value: 'shield_svoy' },
+  { id: 'shield_podzemka', name_ru: 'Шилд «подземка»', name_en: 'Shield: podzemka', description_ru: 'Холодный андеграундный шилд с тонкой металлической гранью', description_en: 'Cold underground shield with crisp metallic edge', category: 'title', cost_xp: 650, rarity: 'rare', preview_value: 'shield_podzemka' },
+  { id: 'shield_old', name_ru: 'Шилд «олд»', name_en: 'Shield: old', description_ru: 'Эпический дымчато-винный шилд давних участников', description_en: 'Epic dark-wine shield for longtime members', category: 'title', cost_xp: 900, rarity: 'epic', preview_value: 'shield_old' },
+  { id: 'shield_khranitel', name_ru: 'Шилд «хранитель»', name_en: 'Shield: khranitel', description_ru: 'Аметистово-графитовый шилд с благородной глубиной', description_en: 'Amethyst-graphite shield with refined depth', category: 'title', cost_xp: 1020, rarity: 'epic', preview_value: 'shield_khranitel' },
+  { id: 'shield_veteran', name_ru: 'Шилд «ветеран»', name_en: 'Shield: veteran', description_ru: 'Карминовый шилд с тонким внутренним акцентом', description_en: 'Deep carmine shield with subtle inner rim', category: 'title', cost_xp: 1150, rarity: 'epic', preview_value: 'shield_veteran' },
+  { id: 'shield_apostol', name_ru: 'Шилд «апостол»', name_en: 'Shield: apostol', description_ru: 'Фирменный эпический шилд сообщества apostles of deathmarried', description_en: 'Signature epic shield of the apostles community', category: 'title', cost_xp: 1300, rarity: 'epic', preview_value: 'shield_apostol' },
+  { id: 'shield_izbrannyy', name_ru: 'Шилд «избранный»', name_en: 'Shield: izbrannyy', description_ru: 'Легендарный шилд с тёмно-золотым переливом и мягким свечением', description_en: 'Legendary shield with antique dark-gold finish', category: 'title', cost_xp: 1800, rarity: 'legendary', preview_value: 'shield_izbrannyy' },
+  { id: 'shield_legenda', name_ru: 'Шилд «легенда»', name_en: 'Shield: legenda', description_ru: 'Благородный платиново-золотой шилд лидеров архива', description_en: 'Noble platinum-gold shield for archive legends', category: 'title', cost_xp: 2150, rarity: 'legendary', preview_value: 'shield_legenda' },
+  { id: 'shield_bog_apostolov', name_ru: 'Шилд «бог апостолов»', name_en: 'Shield: bog apostolov', description_ru: 'Высший легендарный шилд с градиентом кармина, обсидиана и золота', description_en: 'Highest legendary shield in crimson, obsidian and gold', category: 'title', cost_xp: 2500, rarity: 'legendary', preview_value: 'shield_bog_apostolov' },
+
+  // 6. Profile Themes (8 items)
+  { id: 'theme_ash_velvet', name_ru: 'Тема «Пепельный бархат»', name_en: 'Ash Velvet Theme', description_ru: 'Тёплый матовый камень и приглушённый дымчатый кант', description_en: 'Warm matte stone with muted smoky borders', category: 'theme', cost_xp: 190, rarity: 'common', preview_value: 'theme_ash_velvet' },
+  { id: 'theme_obsidian_monolith', name_ru: 'Тема «Обсидиан»', name_en: 'Obsidian Monolith Theme', description_ru: 'Строгий угольно-чёрный корпус карточки с графитовым акцентом', description_en: 'Strict obsidian charcoal card surface with graphite bar', category: 'theme', cost_xp: 300, rarity: 'uncommon', preview_value: 'theme_obsidian_monolith' },
+  { id: 'theme_silver_cathedral', name_ru: 'Тема «Серебряный монолит»', name_en: 'Silver Monolith Theme', description_ru: 'Холодное серебристое окаймление и стальной прогресс-бар', description_en: 'Cold silver border sheen with metallic accent bar', category: 'theme', cost_xp: 640, rarity: 'rare', preview_value: 'theme_silver_cathedral' },
+  { id: 'theme_obsidian_cathedral', name_ru: 'Тема «Ночной сапфир»', name_en: 'Nocturnal Sapphire Theme', description_ru: 'Глубокий тёмно-синий каркас с ледяным отблеском', description_en: 'Deep midnight sapphire chassis with cold rim glow', category: 'theme', cost_xp: 780, rarity: 'rare', preview_value: 'theme_obsidian_cathedral' },
+  { id: 'theme_crimson_sanctum', name_ru: 'Тема «Тёмный кармин»', name_en: 'Dark Carmine Theme', description_ru: 'Глубокие винные акценты, бордовое свечение и тёмный бархат', description_en: 'Deep wine accents, crimson aura and dark velvet surfaces', category: 'theme', cost_xp: 1150, rarity: 'epic', preview_value: 'theme_crimson_sanctum' },
+  { id: 'theme_midnight_violet', name_ru: 'Тема «Ночной винтаж»', name_en: 'Midnight Violet Theme', description_ru: 'Благородный сумеречный фиолет для всей карточки профиля', description_en: 'Refined nocturnal twilight violet across profile cards', category: 'theme', cost_xp: 1350, rarity: 'epic', preview_value: 'theme_midnight_violet' },
+  { id: 'theme_gilded_reliquary', name_ru: 'Тема «Античное золото»', name_en: 'Antique Gold Theme', description_ru: 'Легендарное тёмно-золотое оформление с мягким свечением', description_en: 'Legendary dark-gold antique aesthetic with warm radiance', category: 'theme', cost_xp: 2050, rarity: 'legendary', preview_value: 'theme_gilded_reliquary' },
+  { id: 'theme_crimson_eclipse', name_ru: 'Тема «Алое затмение»', name_en: 'Crimson Eclipse Theme', description_ru: 'Мифическая карточка профиля с тройным градиентом затмения', description_en: 'Mythic profile chassis with tri-tone eclipse aura', category: 'theme', cost_xp: 2900, rarity: 'mythic', preview_value: 'theme_crimson_eclipse' },
+
+  // 7. Profile Atmospheric Effects & Decorations (11 items)
+  { id: 'effect_midnight_ash', name_ru: 'Эффект «Ночной пепел»', name_en: 'Midnight Ash Dust', description_ru: 'Лёгкая россыпь пепельных частиц и глубокая тень снизу', description_en: 'Subtle ash particles with deep bottom shadow', category: 'effect', cost_xp: 180, rarity: 'common', preview_value: 'effect_midnight_ash' },
+  { id: 'effect_vinyl_grain', name_ru: 'Орнамент «Виниловые дорожки»', name_en: 'Vinyl Grooves Overlay', description_ru: 'Тонкие концентрические линии пластинки на шапке профиля', description_en: 'Subtle concentric vinyl grooves across the profile header', category: 'effect', cost_xp: 290, rarity: 'uncommon', preview_value: 'effect_vinyl_grain' },
+  { id: 'effect_rim_glow', name_ru: 'Эффект «Свечение граней»', name_en: 'Edge Rim Glow', description_ru: 'Холодное контурное свечение вдоль верхнего и нижнего краёв карточки', description_en: 'Cold illuminated rim light along card edges', category: 'effect', cost_xp: 440, rarity: 'rare', preview_value: 'effect_rim_glow' },
+  { id: 'effect_silver_filigree', name_ru: 'Украшение «Серебряные уголки»', name_en: 'Silver Corner Frame', description_ru: 'Изящные архитектурные уголки и двойная рамка на шапке профиля', description_en: 'Refined architectural corner ticks framing your banner', category: 'effect', cost_xp: 650, rarity: 'rare', preview_value: 'effect_silver_filigree' },
+  { id: 'effect_crimson_mist', name_ru: 'Эффект «Багровая дымка»', name_en: 'Crimson Mist Aura', description_ru: 'Мягкое винное сияние и тонкая светящаяся линия на баннере', description_en: 'Atmospheric crimson mist glow with illuminated hairline', category: 'effect', cost_xp: 1080, rarity: 'epic', preview_value: 'effect_crimson_mist' },
+  { id: 'effect_cathedral_light', name_ru: 'Эффект «Лучи света»', name_en: 'Noir Light Shafts', description_ru: 'Диагональные лучи приглушённого света сквозь тёмный фон', description_en: 'Diagonal muted light shafts across the dark banner', category: 'effect', cost_xp: 1320, rarity: 'epic', preview_value: 'effect_cathedral_light' },
+  { id: 'effect_drifting_ash', name_ru: 'Эффект «Плывущий пепел»', name_en: 'Drifting Ash', description_ru: 'Плавные анимированные частицы пепла поверх шапки профиля', description_en: 'Smooth GPU-accelerated drifting ash motes over the banner', category: 'effect', cost_xp: 1550, rarity: 'epic', preview_value: 'effect_drifting_ash' },
+  { id: 'effect_cathedral_stardust', name_ru: 'Эффект «Звёздная пыль»', name_en: 'Lunar Dust', description_ru: 'Сумеречное фиолетовое сияние с россыпью золотых и лунных искр', description_en: 'Twilight violet mist speckled with lunar and gold motes', category: 'effect', cost_xp: 1850, rarity: 'legendary', preview_value: 'effect_cathedral_stardust' },
+  { id: 'effect_eclipse_halo', name_ru: 'Эффект «Ореол затмения»', name_en: 'Eclipse Halo', description_ru: 'Легендарный золотой нимб затмения и глубокая виньетка', description_en: 'Legendary golden eclipse ring and deep atmospheric vignette', category: 'effect', cost_xp: 2200, rarity: 'legendary', preview_value: 'effect_eclipse_halo' },
+  { id: 'effect_glitch_accent', name_ru: 'Эффект «Глитч-кромка»', name_en: 'Glitch Edge', description_ru: 'Анимированные хроматические микро-сдвиги и сканлайны на баннере', description_en: 'Animated chromatic micro-shifts and scanlines on the banner', category: 'effect', cost_xp: 2550, rarity: 'mythic', preview_value: 'effect_glitch_accent' },
+  { id: 'effect_apostle_aura', name_ru: 'Эффект «Аура Апостола»', name_en: 'Apostle Aura', description_ru: 'Мифический ореол затмения, двойная кайма и золотой зенит', description_en: 'Mythic zenith halo with rose-gold filigree lines', category: 'effect', cost_xp: 3000, rarity: 'mythic', preview_value: 'effect_apostle_aura' },
+] as const;
+
+const LEGACY_SHIELD_REMAP: Record<string, string> = {
+  title_nocturne_listener: 'shield_slushatel',
+  title_vinyl_collector: 'shield_nochnoy',
+  title_cathedral_scribe: 'shield_arkhivarius',
+  title_nightmortan_witness: 'shield_khranitel',
+  title_velvet_phantom: 'shield_veteran',
+  title_obsidian_curator: 'shield_izbrannyy',
+  title_gilded_apostle: 'shield_legenda',
+  title_sovereign_of_silence: 'shield_bog_apostolov',
+};
+
+/**
+ * Idempotently ensures the full 86-item shop catalog exists on targetDb (never drops existing items or user_inventory).
+ * Safe on empty tables AND legacy DBs containing only 14 old items (uses ON CONFLICT DO UPDATE, never DELETE/REPLACE).
+ */
+export function ensureShopCatalogSeeded(targetDb: Database.Database = db): void {
+  const insertOrSyncShopItem = targetDb.prepare(`
+    INSERT INTO shop_items (id, name_ru, name_en, description_ru, description_en, category, cost_xp, rarity, preview_value, is_active)
+    VALUES (@id, @name_ru, @name_en, @description_ru, @description_en, @category, @cost_xp, @rarity, @preview_value, 1)
+    ON CONFLICT(id) DO UPDATE SET
+      name_ru = excluded.name_ru,
+      name_en = excluded.name_en,
+      description_ru = excluded.description_ru,
+      description_en = excluded.description_en,
+      category = excluded.category,
+      cost_xp = excluded.cost_xp,
+      rarity = excluded.rarity,
+      preview_value = excluded.preview_value,
+      is_active = 1
+  `);
+
+  targetDb.transaction(() => {
+    for (const item of DEFAULT_SHOP_ITEMS) {
+      insertOrSyncShopItem.run(item);
+    }
+
+    // Soft non-destructive migration for deprecated title_* shields: preserve ownership & equipped status
+    for (const [oldId, newId] of Object.entries(LEGACY_SHIELD_REMAP)) {
+      try {
+        const legacyOwners = targetDb
+          .prepare('SELECT id, user_id, is_equipped FROM user_inventory WHERE item_id = ?')
+          .all(oldId) as Array<{ id: string; user_id: string; is_equipped: number }>;
+        for (const row of legacyOwners) {
+          const hasNew = targetDb
+            .prepare('SELECT id, is_equipped FROM user_inventory WHERE user_id = ? AND item_id = ?')
+            .get(row.user_id, newId) as { id: string; is_equipped: number } | undefined;
+          if (hasNew) {
+            if (row.is_equipped && !hasNew.is_equipped) {
+              targetDb.prepare('UPDATE user_inventory SET is_equipped = 1 WHERE id = ?').run(hasNew.id);
+            }
+            targetDb.prepare('DELETE FROM user_inventory WHERE id = ?').run(row.id);
+          } else {
+            targetDb.prepare('UPDATE user_inventory SET item_id = ? WHERE id = ?').run(newId, row.id);
+          }
+        }
+        targetDb.prepare('UPDATE profiles SET equipped_title = ? WHERE equipped_title = ?').run(newId, oldId);
+        targetDb.prepare('UPDATE shop_items SET is_active = 0 WHERE id = ?').run(oldId);
+      } catch {}
+    }
+
+    // Safely refresh equipped_banner values for users who already equipped an existing banner whose texture upgraded
+    try {
+      targetDb.exec(`
+        UPDATE profiles
+        SET equipped_banner = (
+          SELECT si.preview_value
+          FROM user_inventory ui
+          JOIN shop_items si ON si.id = ui.item_id
+          WHERE ui.user_id = profiles.user_id AND ui.is_equipped = 1 AND si.category = 'banner'
+          LIMIT 1
+        )
+        WHERE EXISTS (
+          SELECT 1
+          FROM user_inventory ui
+          JOIN shop_items si ON si.id = ui.item_id
+          WHERE ui.user_id = profiles.user_id AND ui.is_equipped = 1 AND si.category = 'banner'
+        );
+      `);
+    } catch {}
+  })();
+}
+
 export function ensureSchemaAndMigrations(targetDb: Database.Database = db) {
   lastMigrationError = null;
   const recordMigrationError = (step: string, err: unknown) => {
@@ -968,6 +1154,14 @@ export function ensureSchemaAndMigrations(targetDb: Database.Database = db) {
   ensureColumn('shop_items', 'is_active', 'INTEGER NOT NULL DEFAULT 1');
   ensureColumn('shop_items', 'requires_achievement_id', 'TEXT');
 
+  // Always idempotently upsert the full 86-item customization shop catalog inside ensureSchemaAndMigrations
+  // (critical after CloudSync restores an older prod snapshot with only 14 items; never deletes existing rows or user_inventory).
+  try {
+    ensureShopCatalogSeeded(targetDb);
+  } catch (err) {
+    recordMigrationError('shop_items:seed_catalog', err);
+  }
+
   ensureColumn('promo_codes', 'max_uses', 'INTEGER');
   ensureColumn('promo_codes', 'expires_at', 'TEXT');
 
@@ -1265,189 +1459,10 @@ function seedInitialData() {
     insertAch.run(ach);
   }
 
-  // Seed expanded XP Customization Shop across 7 distinct categories & 6 rarities (Common -> Mythic)
-  // Rebalanced economy: Common 100–250, Uncommon 220–300, Rare 400–800, Epic 900–1450, Legendary 1500–2500, Mythic 2400–3000 XP.
-  // All previously owned item IDs are preserved; deprecated clichéd title_* IDs are softly remapped below without losing ownership.
-  const shopItems = [
-    // 1. Avatar Frames (14 items)
-    { id: 'frame_graphite', name_ru: 'Графитовый контур', name_en: 'Graphite Contour', description_ru: 'Минималистичный холодный серый кант', description_en: 'Minimalist cool graphite contour', category: 'frame', cost_xp: 120, rarity: 'common', preview_value: 'border-2 border-white/30' },
-    { id: 'frame_slate_wire', name_ru: 'Свинцовая нить', name_en: 'Slate Wire', description_ru: 'Тонкая холодная грань архивного портрета', description_en: 'Fine cold edge for an archival portrait', category: 'frame', cost_xp: 160, rarity: 'common', preview_value: 'border-2 border-[#596170] ring-1 ring-white/10' },
-    { id: 'frame_ash_ring', name_ru: 'Пепельное кольцо', name_en: 'Ash Ring', description_ru: 'Матовый дымчатый ободок с тонкой обводкой', description_en: 'Matte smoky ring with subtle rim', category: 'frame', cost_xp: 230, rarity: 'uncommon', preview_value: 'border-2 border-[#7b746b] ring-2 ring-[#7b746b]/25' },
-    { id: 'frame_moss_crypt', name_ru: 'Сумрак камня', name_en: 'Crypt Stone', description_ru: 'Глубокий тёмно-изумрудный кант ночного камня', description_en: 'Deep dark emerald stone rim', category: 'frame', cost_xp: 280, rarity: 'uncommon', preview_value: 'border-2 border-[#2a6b54] ring-2 ring-[#64c9a3]/20 shadow-[0_0_12px_rgba(42,107,84,0.35)]' },
-    { id: 'frame_dashed_blueprint', name_ru: 'Пунктир стали', name_en: 'Steel Dashed', description_ru: 'Строгая прерывистая окантовка в стиле андеграунд-чертежа', description_en: 'Crisp dashed industrial steel contour', category: 'frame', cost_xp: 410, rarity: 'rare', preview_value: 'border-2 border-dashed border-[#9aa3b2] ring-2 ring-black/60' },
-    { id: 'frame_silver_thorn', name_ru: 'Серебряный шип', name_en: 'Silver Thorn', description_ru: 'Элегантная серебристая окантовка с мягким свечением', description_en: 'Elegant silver border with subtle glow', category: 'frame', cost_xp: 480, rarity: 'rare', preview_value: 'border-2 border-[#c5c8cf] shadow-[0_0_14px_rgba(197,200,207,0.35)]' },
-    { id: 'frame_dark_velvet', name_ru: 'Чёрный бархат', name_en: 'Dark Velvet', description_ru: 'Глубокая бархатная рамка с бордовым отсветом', description_en: 'Deep velvet frame with dark crimson sheen', category: 'frame', cost_xp: 600, rarity: 'rare', preview_value: 'border-2 border-[#721b2b] shadow-[0_0_16px_rgba(130,28,44,0.55)]' },
-    { id: 'frame_cobalt_vespers', name_ru: 'Холодный кобальт', name_en: 'Cold Cobalt', description_ru: 'Ледяная сапфировая окантовка ночного эфира', description_en: 'Icy sapphire halo of nocturnal airwaves', category: 'frame', cost_xp: 750, rarity: 'rare', preview_value: 'border-2 border-[#4d75ad] ring-2 ring-[#9dc2f5]/25 shadow-[0_0_16px_rgba(77,117,173,0.45)]' },
-    { id: 'frame_nocturne_amethyst', name_ru: 'Сумеречный аметист', name_en: 'Nocturne Amethyst', description_ru: 'Холодный фиолетовый ореол ночного эфира', description_en: 'Cold violet halo of midnight resonance', category: 'frame', cost_xp: 980, rarity: 'epic', preview_value: 'border-2 border-[#6e56a8] ring-2 ring-[#a38ee0]/25 shadow-[0_0_18px_rgba(110,86,168,0.55)]' },
-    { id: 'frame_gothic_crown', name_ru: 'Двойной кармин', name_en: 'Double Carmine', description_ru: 'Строгий двойной контур с глубоким винным сиянием', description_en: 'Strict double contour with deep wine glow', category: 'frame', cost_xp: 1250, rarity: 'epic', preview_value: 'border-2 border-[#821c2c] ring-2 ring-white/25 shadow-[0_0_20px_rgba(130,28,44,0.75)]' },
-    { id: 'frame_gilded_relic', name_ru: 'Античное золото', name_en: 'Antique Gold', description_ru: 'Сдержанная золотая оправа с благородным отблеском', description_en: 'Restrained antique gold frame with warm sheen', category: 'frame', cost_xp: 1750, rarity: 'legendary', preview_value: 'border-2 border-[#d4af68] ring-2 ring-[#f3dca6]/35 shadow-[0_0_24px_rgba(212,175,104,0.6)]' },
-    { id: 'frame_ivory_seraph', name_ru: 'Костяной ореол', name_en: 'Ivory Halo', description_ru: 'Алебастровая оправа с двойным золотым контуром', description_en: 'Luminous alabaster frame with gilded inner ring', category: 'frame', cost_xp: 2150, rarity: 'legendary', preview_value: 'border-2 border-[#f2e8d5] ring-2 ring-[#d4af68]/45 shadow-[0_0_26px_rgba(242,232,213,0.55)]' },
-    { id: 'frame_pulse_crimson', name_ru: 'Пульсирующий кант', name_en: 'Crimson Pulse Rim', description_ru: 'Анимированная рамка с плавным дыханием алого света', description_en: 'Animated avatar rim with smooth crimson pulse', category: 'frame', cost_xp: 2450, rarity: 'mythic', preview_value: 'border-2 border-[#b8324a] ring-2 ring-[#f0a8b8]/40 aod-frame-pulse' },
-    { id: 'frame_eclipse_sovereign', name_ru: 'Кант затмения', name_en: 'Eclipse Contour', description_ru: 'Мифическая багрово-золотая оправа полного затмения', description_en: 'Mythic crimson-gold eclipse contour', category: 'frame', cost_xp: 2700, rarity: 'mythic', preview_value: 'border-2 border-[#e27ca4] ring-2 ring-[#f3d492]/55 shadow-[0_0_30px_rgba(201,91,132,0.75)]' },
-
-    // 2. Profile Banners (12 distinct textured static banners + 4 GPU-accelerated animated banners = 16 items)
-    { id: 'banner_abyss', name_ru: 'Плёночный графит', name_en: 'Film Graphite', description_ru: 'Глубокий угольный фон с фактурой 35мм киноплёнки', description_en: 'Deep charcoal surface with 35mm film grain texture', category: 'banner', cost_xp: 150, rarity: 'common', preview_value: 'banner_tex_graphite_grain' },
-    { id: 'banner_charcoal_fog', name_ru: 'Архитектурная сетка', name_en: 'Architectural Grid', description_ru: 'Минималистичная тёмная чертёжная сетка в андеграунд-стиле', description_en: 'Minimalist dark architectural blueprint grid', category: 'banner', cost_xp: 200, rarity: 'common', preview_value: 'banner_tex_arch_grid' },
-    { id: 'banner_slate_rain', name_ru: 'Свинцовый дождь', name_en: 'Slate Rain', description_ru: 'Косые штрихи ночного дождя на холодном бетоне', description_en: 'Angled midnight rain streaks over cold slate', category: 'banner', cost_xp: 260, rarity: 'uncommon', preview_value: 'banner_tex_slate_rain' },
-    { id: 'banner_pine_nocturne', name_ru: 'Северный туман', name_en: 'Northern Mist', description_ru: 'Холодная хвойная дымка с вертикальной тенью', description_en: 'Cold pine twilight with vertical fog depth', category: 'banner', cost_xp: 310, rarity: 'uncommon', preview_value: 'banner_tex_forest_fog' },
-    { id: 'banner_night_mist', name_ru: 'Лунная вуаль', name_en: 'Moonlit Veil', description_ru: 'Холодный лунный просвет сквозь плотный ночной мрак', description_en: 'Cool lunar beam cutting through dark mist', category: 'banner', cost_xp: 460, rarity: 'rare', preview_value: 'banner_tex_moonlit_veil' },
-    { id: 'banner_silver_silk', name_ru: 'Шлифованная сталь', name_en: 'Brushed Steel', description_ru: 'Холодная металлическая текстура с диагональным бликом', description_en: 'Cold brushed steel grain with specular diagonal sheen', category: 'banner', cost_xp: 580, rarity: 'rare', preview_value: 'banner_tex_brushed_steel' },
-    { id: 'banner_cobalt_abbey', name_ru: 'Готическая решётка', name_en: 'Gothic Lattice', description_ru: 'Тонкое ромбовидное плетение в глубоком кобальте', description_en: 'Fine diamond lattice over deep midnight cobalt', category: 'banner', cost_xp: 700, rarity: 'rare', preview_value: 'banner_tex_gothic_mesh' },
-    { id: 'banner_cathedral_veil', name_ru: 'Алый бархат', name_en: 'Crimson Velvet', description_ru: 'Глубокие драпировки тёмно-винного бархата и светотени', description_en: 'Deep burgundy velvet drapery folds and chiaroscuro', category: 'banner', cost_xp: 850, rarity: 'epic', preview_value: 'banner_tex_crimson_velvet' },
-    { id: 'banner_midnight_choir', name_ru: 'Дорожки винила', name_en: 'Vinyl Grooves', description_ru: 'Концентрический рельеф тёмной пластинки в сумеречном свете', description_en: 'Concentric dark vinyl grooves with subtle specular arc', category: 'banner', cost_xp: 1050, rarity: 'epic', preview_value: 'banner_tex_vinyl_grooves' },
-    { id: 'banner_gilded_eclipse', name_ru: 'Золотой полумесяц', name_en: 'Gilded Crescent', description_ru: 'Античное золотое кольцо затмения над обсидианом', description_en: 'Antique gold eclipse arc over obsidian stone', category: 'banner', cost_xp: 1450, rarity: 'legendary', preview_value: 'banner_tex_gold_eclipse' },
-    { id: 'banner_blood_vespers', name_ru: 'Карминовый нуар', name_en: 'Carmine Noir', description_ru: 'Резкий горизонт кармина с глубокой виньеткой и зерном', description_en: 'Stark carmine noir horizon with deep vignette grain', category: 'banner', cost_xp: 1650, rarity: 'legendary', preview_value: 'banner_tex_carmine_noir' },
-    { id: 'banner_astral_requiem', name_ru: 'Призма обсидиана', name_en: 'Obsidian Prism', description_ru: 'Геометрические грани тёмного стекла с отблеском розы и золота', description_en: 'Fractured dark obsidian facets catching rose-gold light', category: 'banner', cost_xp: 2050, rarity: 'legendary', preview_value: 'banner_tex_obsidian_prism' },
-    // Animated Profile Banners (GPU-accelerated CSS transform/opacity)
-    { id: 'banner_anim_dark_mist', name_ru: 'Тёмный туман', name_en: 'Dark Mist', description_ru: 'Анимированный фон: медленно плывущие слои холодного ночного тумана', description_en: 'Animated banner: slowly drifting layers of cold nocturnal mist', category: 'banner', cost_xp: 1900, rarity: 'legendary', preview_value: 'banner_anim_dark_mist' },
-    { id: 'banner_anim_crimson_embers', name_ru: 'Алые искры и пепел', name_en: 'Crimson Embers', description_ru: 'Анимированный фон: плавно взлетающие алые искры и тлеющий пепел', description_en: 'Animated banner: gently rising crimson embers and ash motes', category: 'banner', cost_xp: 2300, rarity: 'legendary', preview_value: 'banner_anim_crimson_embers' },
-    { id: 'banner_anim_digital_glitch', name_ru: 'Цифровой глитч', name_en: 'Digital Glitch', description_ru: 'Анимированный фон: тёмные VHS-сканлайны и чёткие хроматические сдвиги', description_en: 'Animated banner: dark VHS scanlines and crisp chromatic glitch slices', category: 'banner', cost_xp: 2650, rarity: 'mythic', preview_value: 'banner_anim_digital_glitch' },
-    { id: 'banner_anim_abyss_pulse', name_ru: 'Пульс бездны', name_en: 'Abyss Pulse', description_ru: 'Анимированный фон: глубокое гипнотическое дыхание багрового затмения', description_en: 'Animated banner: hypnotic breathing rings of crimson eclipse', category: 'banner', cost_xp: 3000, rarity: 'mythic', preview_value: 'banner_anim_abyss_pulse' },
-
-    // 3. Name Styles (11 items, including rich CSS text gradients)
-    { id: 'style_monochrome', name_ru: 'Холодный графит', name_en: 'Cold Graphite', description_ru: 'Сдержанный матовый стиль с увеличенным трекингом', description_en: 'Matte cool font with expanded tracking', category: 'name_style', cost_xp: 100, rarity: 'common', preview_value: 'text-[#b5b0a8] tracking-wider' },
-    { id: 'style_ash_serif', name_ru: 'Пепельный курсив', name_en: 'Ash Italic', description_ru: 'Тонкий винтажный наклон архивной подписи', description_en: 'Subtle vintage slanted archival signature', category: 'name_style', cost_xp: 150, rarity: 'common', preview_value: 'text-[#cbc4b8] italic tracking-wide' },
-    { id: 'style_bone_ivory', name_ru: 'Слоновая кость', name_en: 'Antique Ivory', description_ru: 'Тёплый винтажный тон старой бумаги и мягкий акцент', description_en: 'Warm vintage ivory tone with soft emphasis', category: 'name_style', cost_xp: 220, rarity: 'uncommon', preview_value: 'text-[#f2e8d5] tracking-wide font-medium' },
-    { id: 'style_emerald_mist', name_ru: 'Изумрудный туман', name_en: 'Emerald Mist', description_ru: 'Приглушённое холодное свечение лесной ночи', description_en: 'Muted cold nocturnal emerald shimmer', category: 'name_style', cost_xp: 270, rarity: 'uncommon', preview_value: 'text-[#8fd9bc] drop-shadow-[0_0_8px_rgba(100,201,163,0.35)] font-medium' },
-    { id: 'style_silver_glow', name_ru: 'Серебряный глянец', name_en: 'Silver Glow', description_ru: 'Светлое серебристое свечение символов имени', description_en: 'Luminous silver lettering', category: 'name_style', cost_xp: 440, rarity: 'rare', preview_value: 'text-[#e6e8ee] drop-shadow-[0_0_8px_rgba(255,255,255,0.45)] font-medium' },
-    { id: 'style_crimson_shade', name_ru: 'Бархатный оттенок', name_en: 'Crimson Shade', description_ru: 'Благородный винный оттенок с мягкой тенью', description_en: 'Muted wine tone with soft velvet shadow', category: 'name_style', cost_xp: 640, rarity: 'rare', preview_value: 'text-[#eb909d] drop-shadow-[0_0_9px_rgba(229,138,150,0.45)] font-medium' },
-    { id: 'style_amethyst_whisper', name_ru: 'Лунный аметист', name_en: 'Moonlit Amethyst', description_ru: 'Призрачное сиренево-серебристое сияние шрифта', description_en: 'Spectral lavender-silver glow lettering', category: 'name_style', cost_xp: 960, rarity: 'epic', preview_value: 'text-[#d3c4f7] drop-shadow-[0_0_10px_rgba(167,140,235,0.5)] font-medium tracking-wide' },
-    { id: 'style_velvet_gradient', name_ru: 'Градиент бархата', name_en: 'Velvet Gradient', description_ru: 'Плавный переход от серебра к глубокому кармину', description_en: 'Smooth metallic silver to deep carmine gradient', category: 'name_style', cost_xp: 1280, rarity: 'epic', preview_value: 'bg-gradient-to-r from-[#f5dce2] via-[#e26f86] to-[#f0b4c0] bg-clip-text text-transparent font-semibold tracking-wide' },
-    { id: 'style_gilded_sovereign', name_ru: 'Золото архива', name_en: 'Archive Gold', description_ru: 'Античный золотой градиент с благородным сиянием', description_en: 'Antique gold luminous lettering', category: 'name_style', cost_xp: 1650, rarity: 'legendary', preview_value: 'text-[#f0d599] drop-shadow-[0_0_12px_rgba(224,188,112,0.55)] font-semibold tracking-wide' },
-    { id: 'style_moonlit_chrome', name_ru: 'Лунный хром', name_en: 'Moonlit Chrome', description_ru: 'Холодный зеркальный градиент серебра и сапфира', description_en: 'Cold mirror gradient of silver and sapphire', category: 'name_style', cost_xp: 2000, rarity: 'legendary', preview_value: 'bg-gradient-to-r from-[#ffffff] via-[#9fc5f5] to-[#d6dceb] bg-clip-text text-transparent font-semibold tracking-wider drop-shadow-[0_0_10px_rgba(159,197,245,0.4)]' },
-    { id: 'style_mythic_eclipse', name_ru: 'Сияние затмения', name_en: 'Eclipse Radiance', description_ru: 'Мифический переливающийся градиент золота, розы и аметиста', description_en: 'Mythic shifting gradient of gold, rose and amethyst', category: 'name_style', cost_xp: 2500, rarity: 'mythic', preview_value: 'bg-gradient-to-r from-[#f7dca2] via-[#ef8cb3] to-[#c4a6fa] bg-clip-text text-transparent font-semibold tracking-wider drop-shadow-[0_0_14px_rgba(239,140,179,0.5)]' },
-
-    // 4. Avatar & Profile Icons / Badges (11 items — clean minimalist names, existing IDs preserved)
-    { id: 'badge_wanderer', name_ru: 'Иконка «Искра»', name_en: 'Spark Icon', description_ru: 'Минималистичная серебристая искра возле имени', description_en: 'Minimalist silver spark emblem beside your name', category: 'badge', cost_xp: 130, rarity: 'common', preview_value: 'Sparkles' },
-    { id: 'badge_chronicler', name_ru: 'Иконка «Перо»', name_en: 'Quill Icon', description_ru: 'Лаконичная метка автора текстов и заметок', description_en: 'Clean quill emblem for lyric and note writers', category: 'badge', cost_xp: 170, rarity: 'common', preview_value: 'Feather' },
-    { id: 'badge_nocturne', name_ru: 'Иконка «Луна»', name_en: 'Moon Icon', description_ru: 'Тёмно-фиолетовый полумесяц ночного слушателя', description_en: 'Nocturnal crescent emblem in muted violet', category: 'badge', cost_xp: 240, rarity: 'uncommon', preview_value: 'Moon' },
-    { id: 'badge_night_signal', name_ru: 'Иконка «Эфир»', name_en: 'Headphones Icon', description_ru: 'Отметка постоянного слушателя релизов deathmarried', description_en: 'Clean headphones mark for constant listeners', category: 'badge', cost_xp: 290, rarity: 'uncommon', preview_value: 'Headphones' },
-    { id: 'badge_archivist', name_ru: 'Иконка «Щит»', name_en: 'Shield Icon', description_ru: 'Стальной знак участника архива', description_en: 'Steel shield emblem of archive regulars', category: 'badge', cost_xp: 550, rarity: 'rare', preview_value: 'Shield' },
-    { id: 'badge_audiophile', name_ru: 'Иконка «Винил»', name_en: 'Vinyl Icon', description_ru: 'Винный знак пластинки для ценителей звука', description_en: 'Dark wine vinyl mark for sound enthusiasts', category: 'badge', cost_xp: 920, rarity: 'epic', preview_value: 'Disc' },
-    { id: 'badge_ember', name_ru: 'Иконка «Огонь»', name_en: 'Flame Icon', description_ru: 'Багровая метка активности и серии дней', description_en: 'Crimson flame mark of sustained activity', category: 'badge', cost_xp: 1120, rarity: 'epic', preview_value: 'Flame' },
-    { id: 'badge_oracle', name_ru: 'Иконка «Взгляд»', name_en: 'Eye Icon', description_ru: 'Сумеречная аметистовая метка наблюдателя', description_en: 'Muted amethyst eye emblem', category: 'badge', cost_xp: 1320, rarity: 'epic', preview_value: 'Eye' },
-    { id: 'badge_night_crown', name_ru: 'Иконка «Корона»', name_en: 'Crown Icon', description_ru: 'Античная золотая корона для лидеров рейтинга', description_en: 'Antique gold crown emblem', category: 'badge', cost_xp: 1750, rarity: 'legendary', preview_value: 'Crown' },
-    { id: 'badge_relic_gem', name_ru: 'Иконка «Кристалл»', name_en: 'Crystal Icon', description_ru: 'Тёмно-карминовый огранённый кристалл', description_en: 'Dark carmine faceted crystal emblem', category: 'badge', cost_xp: 2100, rarity: 'legendary', preview_value: 'Gem' },
-    { id: 'badge_apostle_star', name_ru: 'Иконка «Звезда»', name_en: 'Star Icon', description_ru: 'Мифическая звезда высшей ступени комьюнити', description_en: 'Mythic star emblem of the community', category: 'badge', cost_xp: 2650, rarity: 'mythic', preview_value: 'Star' },
-
-    // 5. Shields / Shilds beside nickname (15 minimalist underground-community shields, Common -> Legendary)
-    // Common (100–250 XP)
-    { id: 'shield_novichok', name_ru: 'Шилд «новичок»', name_en: 'Shield: novichok', description_ru: 'Лаконичный стартовый шилд возле ника в профиле и рейтинге', description_en: 'Minimalist starter shield beside your nickname', category: 'title', cost_xp: 100, rarity: 'common', preview_value: 'shield_novichok' },
-    { id: 'shield_slushatel', name_ru: 'Шилд «слушатель»', name_en: 'Shield: slushatel', description_ru: 'Сдержанный монохромный шилд постоянного слушателя', description_en: 'Understated monochrome listener shield', category: 'title', cost_xp: 150, rarity: 'common', preview_value: 'shield_slushatel' },
-    { id: 'shield_v_teme', name_ru: 'Шилд «в теме»', name_en: 'Shield: v teme', description_ru: 'Чистый андеграундный шилд для тех, кто следит за релизами', description_en: 'Clean underground shield for those in the loop', category: 'title', cost_xp: 200, rarity: 'common', preview_value: 'shield_v_teme' },
-    { id: 'shield_nochnoy', name_ru: 'Шилд «ночной»', name_en: 'Shield: nochnoy', description_ru: 'Минималистичный ночной шилд в графитовой рамке', description_en: 'Minimalist nocturnal shield in a graphite hairline', category: 'title', cost_xp: 250, rarity: 'common', preview_value: 'shield_nochnoy' },
-    // Rare (400–650 XP)
-    { id: 'shield_tsenitel', name_ru: 'Шилд «ценитель»', name_en: 'Shield: tsenitel', description_ru: 'Холодный стальной шилд знатока звучания deathmarried', description_en: 'Cool steel shield for sound connoisseurs', category: 'title', cost_xp: 400, rarity: 'rare', preview_value: 'shield_tsenitel' },
-    { id: 'shield_arkhivarius', name_ru: 'Шилд «архивариус»', name_en: 'Shield: arkhivarius', description_ru: 'Серебристо-сланцевый шилд исследователя дискографии', description_en: 'Silver-slate shield for discography explorers', category: 'title', cost_xp: 480, rarity: 'rare', preview_value: 'shield_arkhivarius' },
-    { id: 'shield_svoy', name_ru: 'Шилд «свой»', name_en: 'Shield: svoy', description_ru: 'Спокойный сдержанный статус участника близкого круга', description_en: 'Quiet insider status for community regulars', category: 'title', cost_xp: 560, rarity: 'rare', preview_value: 'shield_svoy' },
-    { id: 'shield_podzemka', name_ru: 'Шилд «подземка»', name_en: 'Shield: podzemka', description_ru: 'Холодный андеграундный шилд с тонкой металлической гранью', description_en: 'Cold underground shield with crisp metallic edge', category: 'title', cost_xp: 650, rarity: 'rare', preview_value: 'shield_podzemka' },
-    // Epic (900–1300 XP)
-    { id: 'shield_old', name_ru: 'Шилд «олд»', name_en: 'Shield: old', description_ru: 'Эпический дымчато-винный шилд давних участников', description_en: 'Epic dark-wine shield for longtime members', category: 'title', cost_xp: 900, rarity: 'epic', preview_value: 'shield_old' },
-    { id: 'shield_khranitel', name_ru: 'Шилд «хранитель»', name_en: 'Shield: khranitel', description_ru: 'Аметистово-графитовый шилд с благородной глубиной', description_en: 'Amethyst-graphite shield with refined depth', category: 'title', cost_xp: 1020, rarity: 'epic', preview_value: 'shield_khranitel' },
-    { id: 'shield_veteran', name_ru: 'Шилд «ветеран»', name_en: 'Shield: veteran', description_ru: 'Карминовый шилд с тонким внутренним акцентом', description_en: 'Deep carmine shield with subtle inner rim', category: 'title', cost_xp: 1150, rarity: 'epic', preview_value: 'shield_veteran' },
-    { id: 'shield_apostol', name_ru: 'Шилд «апостол»', name_en: 'Shield: apostol', description_ru: 'Фирменный эпический шилд сообщества apostles of deathmarried', description_en: 'Signature epic shield of the apostles community', category: 'title', cost_xp: 1300, rarity: 'epic', preview_value: 'shield_apostol' },
-    // Legendary (1800–2500 XP)
-    { id: 'shield_izbrannyy', name_ru: 'Шилд «избранный»', name_en: 'Shield: izbrannyy', description_ru: 'Легендарный шилд с тёмно-золотым переливом и мягким свечением', description_en: 'Legendary shield with antique dark-gold finish', category: 'title', cost_xp: 1800, rarity: 'legendary', preview_value: 'shield_izbrannyy' },
-    { id: 'shield_legenda', name_ru: 'Шилд «легенда»', name_en: 'Shield: legenda', description_ru: 'Благородный платиново-золотой шилд лидеров архива', description_en: 'Noble platinum-gold shield for archive legends', category: 'title', cost_xp: 2150, rarity: 'legendary', preview_value: 'shield_legenda' },
-    { id: 'shield_bog_apostolov', name_ru: 'Шилд «бог апостолов»', name_en: 'Shield: bog apostolov', description_ru: 'Высший легендарный шилд с градиентом кармина, обсидиана и золота', description_en: 'Highest legendary shield in crimson, obsidian and gold', category: 'title', cost_xp: 2500, rarity: 'legendary', preview_value: 'shield_bog_apostolov' },
-
-    // 6. Profile Themes (8 items)
-    { id: 'theme_ash_velvet', name_ru: 'Тема «Пепельный бархат»', name_en: 'Ash Velvet Theme', description_ru: 'Тёплый матовый камень и приглушённый дымчатый кант', description_en: 'Warm matte stone with muted smoky borders', category: 'theme', cost_xp: 190, rarity: 'common', preview_value: 'theme_ash_velvet' },
-    { id: 'theme_obsidian_monolith', name_ru: 'Тема «Обсидиан»', name_en: 'Obsidian Monolith Theme', description_ru: 'Строгий угольно-чёрный корпус карточки с графитовым акцентом', description_en: 'Strict obsidian charcoal card surface with graphite bar', category: 'theme', cost_xp: 300, rarity: 'uncommon', preview_value: 'theme_obsidian_monolith' },
-    { id: 'theme_silver_cathedral', name_ru: 'Тема «Серебряный монолит»', name_en: 'Silver Monolith Theme', description_ru: 'Холодное серебристое окаймление и стальной прогресс-бар', description_en: 'Cold silver border sheen with metallic accent bar', category: 'theme', cost_xp: 640, rarity: 'rare', preview_value: 'theme_silver_cathedral' },
-    { id: 'theme_obsidian_cathedral', name_ru: 'Тема «Ночной сапфир»', name_en: 'Nocturnal Sapphire Theme', description_ru: 'Глубокий тёмно-синий каркас с ледяным отблеском', description_en: 'Deep midnight sapphire chassis with cold rim glow', category: 'theme', cost_xp: 780, rarity: 'rare', preview_value: 'theme_obsidian_cathedral' },
-    { id: 'theme_crimson_sanctum', name_ru: 'Тема «Тёмный кармин»', name_en: 'Dark Carmine Theme', description_ru: 'Глубокие винные акценты, бордовое свечение и тёмный бархат', description_en: 'Deep wine accents, crimson aura and dark velvet surfaces', category: 'theme', cost_xp: 1150, rarity: 'epic', preview_value: 'theme_crimson_sanctum' },
-    { id: 'theme_midnight_violet', name_ru: 'Тема «Ночной винтаж»', name_en: 'Midnight Violet Theme', description_ru: 'Благородный сумеречный фиолет для всей карточки профиля', description_en: 'Refined nocturnal twilight violet across profile cards', category: 'theme', cost_xp: 1350, rarity: 'epic', preview_value: 'theme_midnight_violet' },
-    { id: 'theme_gilded_reliquary', name_ru: 'Тема «Античное золото»', name_en: 'Antique Gold Theme', description_ru: 'Легендарное тёмно-золотое оформление с мягким свечением', description_en: 'Legendary dark-gold antique aesthetic with warm radiance', category: 'theme', cost_xp: 2050, rarity: 'legendary', preview_value: 'theme_gilded_reliquary' },
-    { id: 'theme_crimson_eclipse', name_ru: 'Тема «Алое затмение»', name_en: 'Crimson Eclipse Theme', description_ru: 'Мифическая карточка профиля с тройным градиентом затмения', description_en: 'Mythic profile chassis with tri-tone eclipse aura', category: 'theme', cost_xp: 2900, rarity: 'mythic', preview_value: 'theme_crimson_eclipse' },
-
-    // 7. Profile Atmospheric Effects & Decorations (11 items)
-    { id: 'effect_midnight_ash', name_ru: 'Эффект «Ночной пепел»', name_en: 'Midnight Ash Dust', description_ru: 'Лёгкая россыпь пепельных частиц и глубокая тень снизу', description_en: 'Subtle ash particles with deep bottom shadow', category: 'effect', cost_xp: 180, rarity: 'common', preview_value: 'effect_midnight_ash' },
-    { id: 'effect_vinyl_grain', name_ru: 'Орнамент «Виниловые дорожки»', name_en: 'Vinyl Grooves Overlay', description_ru: 'Тонкие концентрические линии пластинки на шапке профиля', description_en: 'Subtle concentric vinyl grooves across the profile header', category: 'effect', cost_xp: 290, rarity: 'uncommon', preview_value: 'effect_vinyl_grain' },
-    { id: 'effect_rim_glow', name_ru: 'Эффект «Свечение граней»', name_en: 'Edge Rim Glow', description_ru: 'Холодное контурное свечение вдоль верхнего и нижнего краёв карточки', description_en: 'Cold illuminated rim light along card edges', category: 'effect', cost_xp: 440, rarity: 'rare', preview_value: 'effect_rim_glow' },
-    { id: 'effect_silver_filigree', name_ru: 'Украшение «Серебряные уголки»', name_en: 'Silver Corner Frame', description_ru: 'Изящные архитектурные уголки и двойная рамка на шапке профиля', description_en: 'Refined architectural corner ticks framing your banner', category: 'effect', cost_xp: 650, rarity: 'rare', preview_value: 'effect_silver_filigree' },
-    { id: 'effect_crimson_mist', name_ru: 'Эффект «Багровая дымка»', name_en: 'Crimson Mist Aura', description_ru: 'Мягкое винное сияние и тонкая светящаяся линия на баннере', description_en: 'Atmospheric crimson mist glow with illuminated hairline', category: 'effect', cost_xp: 1080, rarity: 'epic', preview_value: 'effect_crimson_mist' },
-    { id: 'effect_cathedral_light', name_ru: 'Эффект «Лучи света»', name_en: 'Noir Light Shafts', description_ru: 'Диагональные лучи приглушённого света сквозь тёмный фон', description_en: 'Diagonal muted light shafts across the dark banner', category: 'effect', cost_xp: 1320, rarity: 'epic', preview_value: 'effect_cathedral_light' },
-    { id: 'effect_drifting_ash', name_ru: 'Эффект «Плывущий пепел»', name_en: 'Drifting Ash', description_ru: 'Плавные анимированные частицы пепла поверх шапки профиля', description_en: 'Smooth GPU-accelerated drifting ash motes over the banner', category: 'effect', cost_xp: 1550, rarity: 'epic', preview_value: 'effect_drifting_ash' },
-    { id: 'effect_cathedral_stardust', name_ru: 'Эффект «Звёздная пыль»', name_en: 'Lunar Dust', description_ru: 'Сумеречное фиолетовое сияние с россыпью золотых и лунных искр', description_en: 'Twilight violet mist speckled with lunar and gold motes', category: 'effect', cost_xp: 1850, rarity: 'legendary', preview_value: 'effect_cathedral_stardust' },
-    { id: 'effect_eclipse_halo', name_ru: 'Эффект «Ореол затмения»', name_en: 'Eclipse Halo', description_ru: 'Легендарный золотой нимб затмения и глубокая виньетка', description_en: 'Legendary golden eclipse ring and deep atmospheric vignette', category: 'effect', cost_xp: 2200, rarity: 'legendary', preview_value: 'effect_eclipse_halo' },
-    { id: 'effect_glitch_accent', name_ru: 'Эффект «Глитч-кромка»', name_en: 'Glitch Edge', description_ru: 'Анимированные хроматические микро-сдвиги и сканлайны на баннере', description_en: 'Animated chromatic micro-shifts and scanlines on the banner', category: 'effect', cost_xp: 2550, rarity: 'mythic', preview_value: 'effect_glitch_accent' },
-    { id: 'effect_apostle_aura', name_ru: 'Эффект «Аура Апостола»', name_en: 'Apostle Aura', description_ru: 'Мифический ореол затмения, двойная кайма и золотой зенит', description_en: 'Mythic zenith halo with rose-gold filigree lines', category: 'effect', cost_xp: 3000, rarity: 'mythic', preview_value: 'effect_apostle_aura' },
-  ];
-
-  const insertShopItem = db.prepare(`
-    INSERT INTO shop_items (id, name_ru, name_en, description_ru, description_en, category, cost_xp, rarity, preview_value, is_active)
-    VALUES (@id, @name_ru, @name_en, @description_ru, @description_en, @category, @cost_xp, @rarity, @preview_value, 1)
-    ON CONFLICT(id) DO UPDATE SET
-      name_ru = excluded.name_ru,
-      name_en = excluded.name_en,
-      description_ru = excluded.description_ru,
-      description_en = excluded.description_en,
-      category = excluded.category,
-      cost_xp = excluded.cost_xp,
-      rarity = excluded.rarity,
-      preview_value = excluded.preview_value,
-      is_active = 1
-  `);
-  for (const item of shopItems) {
-    insertShopItem.run(item);
-  }
-
-  // Safe, non-destructive soft migration for deprecated clichéd title_* shields:
-  // Preserves all existing user purchases and equipped states by remapping to equivalent-tier new shields,
-  // and marks old title_* rows inactive (never deleting shop_items rows or user ownership).
-  const legacyShieldMap: Record<string, string> = {
-    title_nocturne_listener: 'shield_slushatel',
-    title_vinyl_collector: 'shield_nochnoy',
-    title_cathedral_scribe: 'shield_arkhivarius',
-    title_nightmortan_witness: 'shield_khranitel',
-    title_velvet_phantom: 'shield_veteran',
-    title_obsidian_curator: 'shield_izbrannyy',
-    title_gilded_apostle: 'shield_legenda',
-    title_sovereign_of_silence: 'shield_bog_apostolov',
-  };
-  for (const [oldId, newId] of Object.entries(legacyShieldMap)) {
-    try {
-      const legacyOwners = db
-        .prepare('SELECT id, user_id, is_equipped FROM user_inventory WHERE item_id = ?')
-        .all(oldId) as Array<{ id: string; user_id: string; is_equipped: number }>;
-      for (const row of legacyOwners) {
-        const hasNew = db
-          .prepare('SELECT id, is_equipped FROM user_inventory WHERE user_id = ? AND item_id = ?')
-          .get(row.user_id, newId) as { id: string; is_equipped: number } | undefined;
-        if (hasNew) {
-          if (row.is_equipped && !hasNew.is_equipped) {
-            db.prepare('UPDATE user_inventory SET is_equipped = 1 WHERE id = ?').run(hasNew.id);
-          }
-          db.prepare('DELETE FROM user_inventory WHERE id = ?').run(row.id);
-        } else {
-          db.prepare('UPDATE user_inventory SET item_id = ? WHERE id = ?').run(newId, row.id);
-        }
-      }
-      db.prepare('UPDATE profiles SET equipped_title = ? WHERE equipped_title = ?').run(newId, oldId);
-      db.prepare('UPDATE shop_items SET is_active = 0 WHERE id = ?').run(oldId);
-    } catch {}
-  }
-
-  // Safely refresh equipped_banner values for users who already equipped an existing banner whose texture upgraded
-  try {
-    db.exec(`
-      UPDATE profiles
-      SET equipped_banner = (
-        SELECT si.preview_value
-        FROM user_inventory ui
-        JOIN shop_items si ON si.id = ui.item_id
-        WHERE ui.user_id = profiles.user_id AND ui.is_equipped = 1 AND si.category = 'banner'
-        LIMIT 1
-      )
-      WHERE EXISTS (
-        SELECT 1
-        FROM user_inventory ui
-        JOIN shop_items si ON si.id = ui.item_id
-        WHERE ui.user_id = profiles.user_id AND ui.is_equipped = 1 AND si.category = 'banner'
-      );
-    `);
-  } catch {}
+  // Customization Shop (all 86 items + legacy title_* remap + equipped_banner refresh)
+  // is also guaranteed unconditionally inside ensureSchemaAndMigrations() so CloudSync cold-start
+  // restores of older prod snapshots automatically receive the full 86-item catalog.
+  ensureShopCatalogSeeded(db);
 
   // Seed initial starter promo codes safely (INSERT OR IGNORE — never resets existing redemptions)
   const initialPromoCodes = [

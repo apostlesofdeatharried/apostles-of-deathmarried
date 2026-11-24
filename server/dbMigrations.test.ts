@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import Database from 'better-sqlite3';
-import { ensureSchemaAndMigrations, getModerationActionsDiagnostics } from './db.js';
+import { ensureSchemaAndMigrations, getModerationActionsDiagnostics, DEFAULT_SHOP_ITEMS } from './db.js';
 import { executeAdminUserReset } from './adminUserReset.js';
 
 describe('SQLite additive migrations on legacy Stage 1–6 databases', () => {
@@ -694,5 +694,176 @@ describe('SQLite additive migrations on legacy Stage 1–6 databases', () => {
       testDb.close();
     }
   });
+
+  it('expands a legacy 14-item shop_items database to all 86 active items while preserving existing user_inventory and equipped cosmetics', () => {
+    const testDb = new Database(':memory:');
+    try {
+      testDb.exec(`
+        CREATE TABLE roles (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL UNIQUE,
+          description TEXT,
+          level INTEGER NOT NULL DEFAULT 1
+        );
+        INSERT INTO roles (id, name, description, level) VALUES
+          ('user', 'User', 'Member', 1),
+          ('admin', 'Administrator', 'Admin', 3);
+
+        CREATE TABLE users (
+          id TEXT PRIMARY KEY,
+          nickname TEXT NOT NULL UNIQUE COLLATE NOCASE,
+          password_hash TEXT NOT NULL,
+          role_id TEXT NOT NULL DEFAULT 'user',
+          is_banned INTEGER NOT NULL DEFAULT 0,
+          ban_reason TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE profiles (
+          user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+          display_name TEXT NOT NULL,
+          xp INTEGER NOT NULL DEFAULT 0,
+          total_xp INTEGER NOT NULL DEFAULT 0,
+          level INTEGER NOT NULL DEFAULT 1,
+          equipped_frame TEXT,
+          equipped_banner TEXT,
+          equipped_name_style TEXT,
+          equipped_badge TEXT,
+          equipped_title TEXT,
+          equipped_theme TEXT,
+          equipped_effect TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        -- Legacy shop_items missing rarity, is_active, requires_achievement_id columns
+        CREATE TABLE shop_items (
+          id TEXT PRIMARY KEY,
+          name_ru TEXT NOT NULL,
+          name_en TEXT NOT NULL,
+          description_ru TEXT,
+          description_en TEXT,
+          category TEXT NOT NULL,
+          cost_xp INTEGER NOT NULL,
+          preview_value TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE user_inventory (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          item_id TEXT NOT NULL REFERENCES shop_items(id) ON DELETE CASCADE,
+          is_equipped INTEGER NOT NULL DEFAULT 0,
+          purchased_at TEXT NOT NULL DEFAULT (datetime('now')),
+          UNIQUE(user_id, item_id)
+        );
+      `);
+
+      testDb.pragma('foreign_keys = ON');
+
+      // Seed exactly 14 old shop items (13 older canonical entries + 1 legacy title_* shield)
+      const legacyFourteen = [
+        ['frame_graphite', 'Графитовый контур', 'Graphite Contour', 'Старая рамка', 'Old frame', 'frame', 100, 'border-2 border-white/30'],
+        ['frame_silver_thorn', 'Серебряный шип', 'Silver Thorn', 'Старая рамка 2', 'Old frame 2', 'frame', 400, 'border-2 border-[#c5c8cf]'],
+        ['frame_dark_velvet', 'Чёрный бархат', 'Dark Velvet', 'Старая рамка 3', 'Old frame 3', 'frame', 500, 'border-2 border-[#721b2b]'],
+        ['banner_abyss', 'Бездна', 'Abyss', 'Старый градиент', 'Old gradient', 'banner', 150, 'bg-gradient-to-r from-zinc-900 to-black'],
+        ['banner_cathedral_veil', 'Соборная вуаль', 'Cathedral Veil', 'Старый баннер', 'Old banner', 'banner', 700, 'bg-gradient-to-r from-red-950 to-black'],
+        ['style_monochrome', 'Холодный графит', 'Cold Graphite', 'Старый стиль', 'Old style', 'name_style', 100, 'text-[#b5b0a8]'],
+        ['style_silver_glow', 'Серебряный глянец', 'Silver Glow', 'Старый стиль 2', 'Old style 2', 'name_style', 350, 'text-white'],
+        ['badge_wanderer', 'Иконка «Искра»', 'Spark Icon', 'Старый значок', 'Old badge', 'badge', 120, 'Sparkles'],
+        ['badge_nocturne', 'Иконка «Луна»', 'Moon Icon', 'Старый значок 2', 'Old badge 2', 'badge', 220, 'Moon'],
+        ['theme_ash_velvet', 'Тема «Пепельный бархат»', 'Ash Velvet', 'Старая тема', 'Old theme', 'theme', 190, 'theme_ash_velvet'],
+        ['theme_crimson_sanctum', 'Тема «Тёмный кармин»', 'Dark Carmine', 'Старая тема 2', 'Old theme 2', 'theme', 900, 'theme_crimson_sanctum'],
+        ['effect_midnight_ash', 'Эффект «Ночной пепел»', 'Midnight Ash', 'Старый эффект', 'Old effect', 'effect', 180, 'effect_midnight_ash'],
+        ['shield_novichok', 'Шилд «новичок»', 'Shield: novichok', 'Старый шилд', 'Old shield', 'title', 100, 'shield_novichok'],
+        ['title_nocturne_listener', 'Титул слушателя', 'Listener Title', 'Устаревший титул', 'Legacy title', 'title', 150, 'title_nocturne_listener'],
+      ] as const;
+
+      const insertLegacy = testDb.prepare(`
+        INSERT INTO shop_items (id, name_ru, name_en, description_ru, description_en, category, cost_xp, preview_value)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const row of legacyFourteen) {
+        insertLegacy.run(...row);
+      }
+
+      const preCount = (testDb.prepare('SELECT COUNT(*) as c FROM shop_items').get() as { c: number }).c;
+      assert.equal(preCount, 14, 'Legacy DB must start with exactly 14 shop items');
+
+      // Seed existing user with purchases + equipped items from the old 14-item shop
+      testDb
+        .prepare("INSERT INTO users (id, nickname, password_hash, role_id) VALUES ('u_collector', 'old_collector', 'hash', 'user')")
+        .run();
+      testDb
+        .prepare(`
+          INSERT INTO profiles (user_id, display_name, xp, total_xp, level, equipped_frame, equipped_banner, equipped_title)
+          VALUES ('u_collector', 'Old Collector', 320, 1200, 6, 'border-2 border-white/30', 'bg-gradient-to-r from-zinc-900 to-black', 'title_nocturne_listener')
+        `)
+        .run();
+      testDb.exec(`
+        INSERT INTO user_inventory (id, user_id, item_id, is_equipped) VALUES
+          ('inv_1', 'u_collector', 'frame_graphite', 1),
+          ('inv_2', 'u_collector', 'banner_abyss', 1),
+          ('inv_3', 'u_collector', 'style_monochrome', 0),
+          ('inv_4', 'u_collector', 'title_nocturne_listener', 1);
+      `);
+
+      // Run ensureSchemaAndMigrations twice (simulates CloudSync cold-start restore + repeated boot)
+      ensureSchemaAndMigrations(testDb);
+      ensureSchemaAndMigrations(testDb);
+
+      const diag = getModerationActionsDiagnostics(testDb);
+      assert.equal(diag.lastMigrationError, null);
+
+      // Verify all 86 canonical active items are available in the shop
+      assert.equal(DEFAULT_SHOP_ITEMS.length, 86);
+      const activeCount = (
+        testDb.prepare('SELECT COUNT(*) as c FROM shop_items WHERE is_active = 1').get() as { c: number }
+      ).c;
+      assert.equal(activeCount, 86, 'After migration all 86 catalog items must be active in shop_items');
+
+      // Verify every category matches exact catalog totals
+      const byCategory = Object.fromEntries(
+        (
+          testDb
+            .prepare('SELECT category, COUNT(*) as c FROM shop_items WHERE is_active = 1 GROUP BY category')
+            .all() as Array<{ category: string; c: number }>
+        ).map((r) => [r.category, r.c])
+      );
+      assert.deepEqual(byCategory, {
+        frame: 14,
+        banner: 16,
+        name_style: 11,
+        badge: 11,
+        title: 15,
+        theme: 8,
+        effect: 11,
+      });
+
+      // Verify all 4 previous user_inventory purchases survived cleanly (no ON DELETE CASCADE wipe!)
+      const invRows = testDb
+        .prepare('SELECT item_id, is_equipped FROM user_inventory WHERE user_id = ? ORDER BY item_id ASC')
+        .all('u_collector') as Array<{ item_id: string; is_equipped: number }>;
+      assert.equal(invRows.length, 4, 'All existing user purchases must remain intact');
+      assert.deepEqual(invRows, [
+        { item_id: 'banner_abyss', is_equipped: 1 },
+        { item_id: 'frame_graphite', is_equipped: 1 },
+        { item_id: 'shield_slushatel', is_equipped: 1 },
+        { item_id: 'style_monochrome', is_equipped: 0 },
+      ]);
+
+      // Verify equipped banner texture & legacy title shield remapped cleanly on profile
+      const prof = testDb
+        .prepare('SELECT equipped_frame, equipped_banner, equipped_title FROM profiles WHERE user_id = ?')
+        .get('u_collector') as { equipped_frame: string; equipped_banner: string; equipped_title: string };
+      assert.equal(prof.equipped_frame, 'border-2 border-white/30');
+      assert.equal(prof.equipped_banner, 'banner_tex_graphite_grain');
+      assert.equal(prof.equipped_title, 'shield_slushatel');
+    } finally {
+      testDb.close();
+    }
+  });
 });
+
 
