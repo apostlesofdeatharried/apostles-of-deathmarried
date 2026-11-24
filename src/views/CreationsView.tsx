@@ -1,12 +1,12 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useI18n } from '../context/I18nContext.js';
 import { useAuth, authFetch } from '../context/AuthContext.js';
 import { Creation } from '../types/index.js';
 import { safeJson } from '../utils/logic.js';
 import { formatHandle } from '../utils/cosmetics.js';
+import { RulesModal, hasAcceptedRules } from '../components/RulesModal.js';
 import {
   Sparkles,
-  Heart,
   Search,
   Plus,
   Play,
@@ -21,6 +21,7 @@ import {
   MessageSquare,
   Send,
   Shield,
+  ShieldAlert,
   CheckCircle2,
   Edit2,
   Bookmark,
@@ -42,7 +43,7 @@ export const CreationsView: React.FC = () => {
   const [creationComments, setCreationComments] = useState<any[]>([]);
   const [newComment, setNewComment] = useState('');
   const [replyToCommentId, setReplyToCommentId] = useState<string | null>(null);
-  const [isLiked, setIsLiked] = useState(false);
+  const [userReaction, setUserReaction] = useState<'rose' | 'skull' | null>(null);
   const [isFavorited, setIsFavorited] = useState(false);
 
   // Publish modal state
@@ -71,8 +72,23 @@ export const CreationsView: React.FC = () => {
   const [deletingTarget, setDeletingTarget] = useState(false);
 
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [rulesModalMode, setRulesModalMode] = useState<'accept' | 'view' | null>(null);
+  const pendingRulesActionRef = useRef<(() => void) | null>(null);
 
   const isStaff = Boolean(user && (user.role_id === 'admin' || user.role_id === 'moderator'));
+
+  const requireRulesThen = (action: () => void) => {
+    if (!user) {
+      openAuth('login');
+      return;
+    }
+    if (!hasAcceptedRules(user)) {
+      pendingRulesActionRef.current = action;
+      setRulesModalMode('accept');
+      return;
+    }
+    action();
+  };
 
   const goToProfile = (nickname?: string) => {
     if (!nickname) return;
@@ -119,16 +135,25 @@ export const CreationsView: React.FC = () => {
     fetchCreations();
   }, [selectedCategory, search, user?.id]);
 
-  const openCreationDetail = async (creation: Creation) => {
-    setActiveCreation(creation);
+  const openCreationById = async (creationId: string, initialCreation?: Creation) => {
+    if (initialCreation) {
+      setActiveCreation(initialCreation);
+      setUserReaction(initialCreation.user_reaction ?? null);
+    }
     setReplyToCommentId(null);
     try {
-      const res = await authFetch(`/api/creations/${creation.id}`);
-      const data = await safeJson<{ creation?: Creation; comments?: any[]; liked?: boolean; favorited?: boolean; error?: string }>(res, {});
+      const res = await authFetch(`/api/creations/${creationId}`);
+      const data = await safeJson<{
+        creation?: Creation;
+        comments?: any[];
+        userReaction?: 'rose' | 'skull' | null;
+        favorited?: boolean;
+        error?: string;
+      }>(res, {});
       if (res.ok) {
         if (data.creation) setActiveCreation(data.creation);
         setCreationComments(data.comments || []);
-        setIsLiked(Boolean(data.liked));
+        setUserReaction(data.userReaction ?? data.creation?.user_reaction ?? null);
         setIsFavorited(Boolean(data.favorited));
       } else {
         setToastMessage(data.error || (lang === 'ru' ? 'Не удалось загрузить работу' : 'Failed to load creation'));
@@ -138,6 +163,25 @@ export const CreationsView: React.FC = () => {
       console.error(e);
     }
   };
+
+  const openCreationDetail = async (creation: Creation) => {
+    await openCreationById(creation.id, creation);
+  };
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const initialId = params.get('creation');
+    if (initialId) {
+      openCreationById(initialId);
+    }
+    const handleOpenCreationEvent = (e: CustomEvent<string>) => {
+      if (e.detail) openCreationById(e.detail);
+    };
+    window.addEventListener('open-creation', handleOpenCreationEvent as EventListener);
+    return () => {
+      window.removeEventListener('open-creation', handleOpenCreationEvent as EventListener);
+    };
+  }, []);
 
   const handleFileUpload = async (file: File) => {
     setUploading(true);
@@ -238,25 +282,94 @@ export const CreationsView: React.FC = () => {
     }
   };
 
-  const handleLike = async (creationId: string) => {
+  const handleReactCreation = async (creationId: string, reactionType: 'rose' | 'skull') => {
     if (!user) {
       openAuth('login');
       return;
     }
+
+    const prevCreations = creations;
+    const prevActive = activeCreation;
+    const prevReactionState = userReaction;
+
+    const target =
+      (activeCreation && activeCreation.id === creationId ? activeCreation : null) ||
+      creations.find((c) => c.id === creationId);
+    if (!target) return;
+
+    const currentReaction: 'rose' | 'skull' | null =
+      activeCreation?.id === creationId ? userReaction : (target.user_reaction ?? null);
+    const nextReaction: 'rose' | 'skull' | null = currentReaction === reactionType ? null : reactionType;
+
+    let nextRose = Number(target.rose_count ?? 0);
+    let nextSkull = Number(target.skull_count ?? 0);
+    if (currentReaction === 'rose') nextRose = Math.max(0, nextRose - 1);
+    if (currentReaction === 'skull') nextSkull = Math.max(0, nextSkull - 1);
+    if (nextReaction === 'rose') nextRose += 1;
+    if (nextReaction === 'skull') nextSkull += 1;
+    const nextTotal = nextRose + nextSkull;
+
+    // Instant Optimistic UI
+    if (activeCreation?.id === creationId) {
+      setUserReaction(nextReaction);
+      setActiveCreation((prev) =>
+        prev
+          ? { ...prev, rose_count: nextRose, skull_count: nextSkull, likes_count: nextTotal, user_reaction: nextReaction }
+          : null
+      );
+    }
+    setCreations((curr) =>
+      curr.map((c) =>
+        c.id === creationId
+          ? { ...c, rose_count: nextRose, skull_count: nextSkull, likes_count: nextTotal, user_reaction: nextReaction }
+          : c
+      )
+    );
+
     try {
-      const res = await authFetch(`/api/creations/${creationId}/react`, { method: 'POST' });
-      const data = await safeJson<{ liked: boolean }>(res, { liked: false });
+      const res = await authFetch(`/api/creations/${creationId}/react`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reaction_type: reactionType }),
+      });
+      const data = await safeJson<{
+        reacted?: boolean;
+        reaction_type?: 'rose' | 'skull' | null;
+        rose_count?: number;
+        skull_count?: number;
+        likes_count?: number;
+      }>(res, {});
       if (res.ok) {
-        setIsLiked(data.liked);
-        fetchCreations();
-        if (activeCreation && activeCreation.id === creationId) {
+        const syncedReaction = data.reacted ? (data.reaction_type ?? null) : null;
+        const syncedRose = typeof data.rose_count === 'number' ? data.rose_count : nextRose;
+        const syncedSkull = typeof data.skull_count === 'number' ? data.skull_count : nextSkull;
+        const syncedTotal = typeof data.likes_count === 'number' ? data.likes_count : syncedRose + syncedSkull;
+
+        if (activeCreation?.id === creationId) {
+          setUserReaction(syncedReaction);
           setActiveCreation((prev) =>
-            prev ? { ...prev, likes_count: Math.max(0, (prev.likes_count || 0) + (data.liked ? 1 : -1)) } : null
+            prev
+              ? { ...prev, rose_count: syncedRose, skull_count: syncedSkull, likes_count: syncedTotal, user_reaction: syncedReaction }
+              : null
           );
         }
+        setCreations((curr) =>
+          curr.map((c) =>
+            c.id === creationId
+              ? { ...c, rose_count: syncedRose, skull_count: syncedSkull, likes_count: syncedTotal, user_reaction: syncedReaction }
+              : c
+          )
+        );
+      } else {
+        setCreations(prevCreations);
+        setActiveCreation(prevActive);
+        setUserReaction(prevReactionState);
       }
     } catch (e) {
       console.error(e);
+      setCreations(prevCreations);
+      setActiveCreation(prevActive);
+      setUserReaction(prevReactionState);
     }
   };
 
@@ -333,8 +446,7 @@ export const CreationsView: React.FC = () => {
     }
   };
 
-  const handleAddCreationComment = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const submitCreationCommentNow = async () => {
     if (!user || !activeCreation || !newComment.trim()) return;
 
     try {
@@ -359,6 +471,14 @@ export const CreationsView: React.FC = () => {
     } catch (e) {
       console.error(e);
     }
+  };
+
+  const handleAddCreationComment = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!activeCreation || !newComment.trim()) return;
+    requireRulesThen(() => {
+      submitCreationCommentNow();
+    });
   };
 
   const handleConfirmDelete = async () => {
@@ -417,10 +537,7 @@ export const CreationsView: React.FC = () => {
         </div>
 
         <button
-          onClick={() => {
-            if (!user) openAuth('login');
-            else setPublishModalOpen(true);
-          }}
+          onClick={() => requireRulesThen(() => setPublishModalOpen(true))}
           className="flex items-center gap-2 font-mono text-xs tracking-wider uppercase px-5 py-2.5 bg-white/[0.08] hover:bg-white/[0.16] border border-white/[0.15] text-white rounded-lg transition-colors cursor-pointer"
         >
           <Plus className="w-4 h-4" />
@@ -562,9 +679,39 @@ export const CreationsView: React.FC = () => {
                     </span>
                   </button>
 
-                  <div className="flex items-center gap-1 text-[#e8909c] shrink-0">
-                    <Heart className="w-3.5 h-3.5 fill-current" />
-                    <span>{creation.likes_count || 0}</span>
+                  <div className="flex items-center gap-1.5 shrink-0 tabular-nums">
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleReactCreation(creation.id, 'rose');
+                      }}
+                      title="Роза"
+                      className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded border transition-colors cursor-pointer ${
+                        creation.user_reaction === 'rose'
+                          ? 'bg-[#821c2c]/30 border-[#a4283c] text-white'
+                          : 'bg-white/[0.03] border-white/[0.07] text-[#c49298] hover:border-white/20 hover:text-white'
+                      }`}
+                    >
+                      <span>🌹</span>
+                      <span>{creation.rose_count ?? 0}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleReactCreation(creation.id, 'skull');
+                      }}
+                      title="Череп"
+                      className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded border transition-colors cursor-pointer ${
+                        creation.user_reaction === 'skull'
+                          ? 'bg-white/[0.16] border-white/40 text-white'
+                          : 'bg-white/[0.03] border-white/[0.07] text-[#8e877e] hover:border-white/20 hover:text-white'
+                      }`}
+                    >
+                      <span>💀</span>
+                      <span>{creation.skull_count ?? 0}</span>
+                    </button>
                   </div>
                 </div>
               </div>
@@ -704,15 +851,29 @@ export const CreationsView: React.FC = () => {
                     </button>
                     <button
                       type="button"
-                      onClick={() => handleLike(activeCreation.id)}
-                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border font-mono text-xs transition-colors cursor-pointer ${
-                        isLiked
-                          ? 'bg-[#821c2c]/30 border-[#821c2c] text-white'
+                      onClick={() => handleReactCreation(activeCreation.id, 'rose')}
+                      title="Роза"
+                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border font-mono text-xs transition-colors cursor-pointer tabular-nums ${
+                        userReaction === 'rose'
+                          ? 'bg-[#821c2c]/30 border-[#a4283c] text-white'
                           : 'bg-white/[0.04] border-white/[0.08] text-[#8e877e] hover:text-white'
                       }`}
                     >
-                      <Heart className={`w-3.5 h-3.5 ${isLiked ? 'fill-current text-[#e8909c]' : ''}`} />
-                      <span>{activeCreation.likes_count || 0}</span>
+                      <span>🌹</span>
+                      <span>{activeCreation.rose_count ?? 0}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleReactCreation(activeCreation.id, 'skull')}
+                      title="Череп"
+                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border font-mono text-xs transition-colors cursor-pointer tabular-nums ${
+                        userReaction === 'skull'
+                          ? 'bg-white/[0.16] border-white/40 text-white'
+                          : 'bg-white/[0.04] border-white/[0.08] text-[#8e877e] hover:text-white'
+                      }`}
+                    >
+                      <span>💀</span>
+                      <span>{activeCreation.skull_count ?? 0}</span>
                     </button>
                   </div>
                 </div>
@@ -1157,6 +1318,37 @@ export const CreationsView: React.FC = () => {
           </div>
         </div>
       )}
+
+      {/* Subtle Creations Rules Footer Link */}
+      <div className="pt-4 border-t border-white/[0.05] flex items-center justify-between text-[11px] font-mono text-[#736c64]">
+        <span>Галерея творчества Apostles of deathmarried</span>
+        <button
+          type="button"
+          onClick={() => setRulesModalMode('view')}
+          className="inline-flex items-center gap-1.5 text-[#8e877e] hover:text-[#f2eee9] transition-colors cursor-pointer"
+        >
+          <ShieldAlert className="w-3.5 h-3.5 text-[#821c2c]" />
+          <span>Правила</span>
+        </button>
+      </div>
+
+      {/* Rules Modal */}
+      <RulesModal
+        isOpen={rulesModalMode !== null}
+        mode={rulesModalMode || 'view'}
+        userId={user?.id}
+        onClose={() => {
+          setRulesModalMode(null);
+          pendingRulesActionRef.current = null;
+        }}
+        onAccepted={() => {
+          setRulesModalMode(null);
+          refresh();
+          const nextAction = pendingRulesActionRef.current;
+          pendingRulesActionRef.current = null;
+          nextAction?.();
+        }}
+      />
     </div>
   );
 };

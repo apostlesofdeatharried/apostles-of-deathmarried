@@ -22,11 +22,14 @@ import {
   signSessionToken,
   verifySessionToken,
   isSignedSessionToken,
+  resolveSessionSecret,
   SESSION_TTL_MS,
 } from './server/sessionToken.js';
 import {
   calculateLevelFromXp,
   calculateQuizScore,
+  calculateQuizScoreByDifficulty,
+  calculateMiniGameXp,
   validateNickname,
   validatePassword,
   checkAchievementEligibility,
@@ -36,6 +39,11 @@ import {
   sanitizeStreamingLinks,
   classifyMediaUpload,
   buildSafeAsciiFilename,
+  getMoscowDateString,
+  isMoscowMidnightWindow,
+  getStreakBonusPercent,
+  applyStreakBonusXp,
+  parsePrivacySettings,
 } from './src/utils/logic.js';
 import {
   DAILY_SNIPPET_DURATION_SECONDS,
@@ -43,15 +51,32 @@ import {
   getUtcDateString,
   isValidUtcDateString,
   getNextUtcMidnightIso,
+  getUtc12HourSlot,
+  isValidUtc12HourSlot,
+  getNextUtc12HourResetIso,
+  getMoscow12hCycle,
+  isValidMoscow12hCycle,
+  getPreviousMoscow12hCycle,
   pickDailyTrackChallenge,
+  pickDailyReverseTrackChallenge,
+  pickDailySpeedTrackChallenge,
+  pickDailyLyricsChallenge,
   parseAndValidateQuizQuestion,
   pickDailyQuizSet,
+  shuffleQuizQuestionOptions,
   readLocalWavDurationSeconds,
   type PlayableTrackCandidate,
+  type LyricTrackCandidate,
   type TitleOption,
   type RawQuizQuestion,
   type ValidatedQuizQuestion,
 } from './server/dailyGames.js';
+import {
+  generateDiscographyQuizQuestions,
+  type DiscographyAlbum,
+  type DiscographyTrack,
+  type DiscographySingle,
+} from './server/quizGenerator.js';
 import {
   normalizeUsername,
   validateUsername,
@@ -63,8 +88,22 @@ import {
   canChangeUsername,
   isSameOriginRequest,
   evaluateAchievementSlugs,
+  getAchievementProgress,
+  type AchievementMetrics,
   MAX_FEATURED_ACHIEVEMENTS,
+  MAX_REGISTRATIONS_PER_IP_24H,
+  MAX_REGISTRATIONS_PER_DEVICE_24H,
+  hashGuardIdentifier,
+  createSignedCaptcha,
+  verifySignedCaptcha,
+  parseBulkQuizInput,
+  generateVerificationCode,
+  createSignedEmailVerificationToken,
+  verifySignedEmailVerificationToken,
+  normalizePromoCode,
+  type EmailVerificationPurpose,
 } from './server/accountSecurity.js';
+import { sendVerificationCodeEmail } from './server/emailService.js';
 
 const DUMMY_PASSWORD_HASH = bcrypt.hashSync('apostles_dummy_timing_guard_2026', 12);
 
@@ -219,6 +258,8 @@ function createRateLimiter(keyPrefix: string, maxRequests: number, windowMs: num
   };
 }
 const authRateLimit = createRateLimiter('auth', 40, 60 * 1000);
+const emailCodeRateLimit = createRateLimiter('email_code', 5, 10 * 60 * 1000);
+const promoRateLimit = createRateLimiter('promo', 15, 60 * 1000);
 const uploadRateLimit = createRateLimiter('upload', 30, 60 * 1000);
 
 // Static uploads folder (uses /tmp/uploads on Vercel read-only filesystem)
@@ -315,6 +356,8 @@ interface AuthRequest extends Request {
   user?: {
     id: string;
     nickname: string;
+    email?: string | null;
+    email_verified?: number;
     role_id: string;
     is_banned: number;
     level: number;
@@ -392,12 +435,18 @@ function parseFeaturedAchievements(raw: unknown): string[] {
 function hydrateSessionUserRow(row: any) {
   if (!row) return null;
   const { password_changed_at, featured_achievements_json, ...safeRow } = row;
+  const totalXp = Number(safeRow.total_xp ?? safeRow.xp ?? 0);
+  const { level: computedLevel } = calculateLevelFromXp(totalXp);
   return {
     ...safeRow,
+    email_verified: Number(safeRow.email_verified || 0),
+    accepted_rules: Number(safeRow.accepted_rules || 0),
+    favorite_track: safeRow.favorite_track || null,
     display_name: safeRow.display_name && String(safeRow.display_name).trim()
       ? safeRow.display_name
       : safeRow.nickname,
-    total_xp: safeRow.total_xp ?? safeRow.xp ?? 0,
+    total_xp: totalXp,
+    level: computedLevel,
     featured_achievements: parseFeaturedAchievements(featured_achievements_json),
   };
 }
@@ -416,11 +465,11 @@ function resolveUserFromToken(token: string) {
     } catch {}
 
     const userRow = db.prepare(`
-      SELECT u.id as user_id, u.id, u.nickname, u.email, u.email_verified, u.role_id, u.is_banned,
+      SELECT u.id as user_id, u.id, u.nickname, u.email, u.email_verified, u.accepted_rules, u.role_id, u.is_banned,
              u.password_changed_at, u.created_at as registered_at,
-             p.display_name, p.avatar_url, p.bio, p.custom_status, p.level, p.xp, p.total_xp,
+             p.display_name, p.avatar_url, p.bio, p.custom_status, p.favorite_track, p.level, p.xp, p.total_xp,
              p.daily_streak, p.is_private, p.equipped_frame, p.equipped_banner,
-             p.equipped_name_style, p.equipped_badge, p.equipped_theme, p.equipped_effect,
+             p.equipped_name_style, p.equipped_badge, p.equipped_title, p.equipped_theme, p.equipped_effect,
              p.featured_achievements_json, p.username_changed_at
       FROM users u
       JOIN profiles p ON p.user_id = u.id
@@ -450,11 +499,11 @@ function resolveUserFromToken(token: string) {
 
   // Path B: Legacy opaque session token stored in SQLite sessions table
   const session = db.prepare(`
-    SELECT s.user_id, s.expires_at, u.id, u.nickname, u.email, u.email_verified, u.role_id, u.is_banned,
+    SELECT s.user_id, s.expires_at, u.id, u.nickname, u.email, u.email_verified, u.accepted_rules, u.role_id, u.is_banned,
            u.password_changed_at, u.created_at as registered_at,
-           p.display_name, p.avatar_url, p.bio, p.custom_status, p.level, p.xp, p.total_xp,
+           p.display_name, p.avatar_url, p.bio, p.custom_status, p.favorite_track, p.level, p.xp, p.total_xp,
            p.daily_streak, p.is_private, p.equipped_frame, p.equipped_banner,
-           p.equipped_name_style, p.equipped_badge, p.equipped_theme, p.equipped_effect,
+           p.equipped_name_style, p.equipped_badge, p.equipped_title, p.equipped_theme, p.equipped_effect,
            p.featured_achievements_json, p.username_changed_at
     FROM sessions s
     JOIN users u ON u.id = s.user_id
@@ -511,7 +560,167 @@ function requireAdmin(req: AuthRequest, res: Response, next: NextFunction) {
 // API: AUTHENTICATION
 // ----------------------------------------------------------------------------
 
+// Stateless HMAC-signed arithmetic captcha for registration anti-bot protection
+app.get('/api/auth/captcha', authRateLimit, (_req: Request, res: Response) => {
+  const challenge = createSignedCaptcha(resolveSessionSecret());
+  res.json(challenge);
+});
+
+// Send 6-digit email verification code via Resend (stateless HMAC-signed token; safe across Vercel serverless cold starts)
+app.post('/api/auth/email/send-code', emailCodeRateLimit, async (req: Request, res: Response) => {
+  const honeypot = String(req.body?.website ?? req.body?.company_url ?? '').trim();
+  if (honeypot.length > 0) {
+    res.status(400).json({ error: 'Не удалось пройти проверку защиты от ботов.' });
+    return;
+  }
+
+  const rawPurpose = String(req.body?.purpose || 'register').trim();
+  const purpose: EmailVerificationPurpose = rawPurpose === 'verify_existing' ? 'verify_existing' : 'register';
+  const sessionUser = getSessionUser(req);
+
+  let targetEmail = '';
+  let targetUserId: string | null = null;
+
+  if (purpose === 'verify_existing') {
+    if (!sessionUser) {
+      res.status(401).json({ error: 'Войдите в аккаунт для подтверждения почты.' });
+      return;
+    }
+    targetUserId = sessionUser.id;
+    const rawRequestedEmail = String(req.body?.email || sessionUser.email || '').trim();
+    const emailCheck = validateEmail(rawRequestedEmail);
+    if (!emailCheck.valid) {
+      res.status(400).json({ error: emailCheck.error || 'Укажите корректный адрес электронной почты.' });
+      return;
+    }
+    targetEmail = emailCheck.normalized;
+
+    // Ensure no other account already owns this email
+    const conflicting = db
+      .prepare('SELECT id FROM users WHERE LOWER(TRIM(email)) = ? AND id != ?')
+      .get(targetEmail, sessionUser.id);
+    if (conflicting) {
+      res.status(409).json({ error: 'Эта почта уже зарегистрирована' });
+      return;
+    }
+  } else {
+    const emailCheck = validateEmail(String(req.body?.email || ''));
+    if (!emailCheck.valid) {
+      res.status(400).json({ error: emailCheck.error || 'Введите корректный адрес электронной почты.' });
+      return;
+    }
+    targetEmail = emailCheck.normalized;
+
+    const existingEmail = db
+      .prepare('SELECT id FROM users WHERE LOWER(TRIM(email)) = ?')
+      .get(targetEmail);
+    if (existingEmail) {
+      res.status(409).json({ error: 'Эта почта уже зарегистрирована' });
+      return;
+    }
+  }
+
+  const code = generateVerificationCode();
+  const guardSecret = resolveSessionSecret();
+  const signed = createSignedEmailVerificationToken(
+    targetEmail,
+    code,
+    purpose,
+    guardSecret,
+    targetUserId
+  );
+
+  const delivery = await sendVerificationCodeEmail({
+    to: targetEmail,
+    code,
+    purpose,
+  });
+
+  if (!delivery.ok) {
+    res.status(delivery.configured ? 502 : 503).json({
+      error: delivery.error || 'Не удалось отправить код подтверждения на почту.',
+      email_service_configured: delivery.configured,
+    });
+    return;
+  }
+
+  res.json({
+    ok: true,
+    email: targetEmail,
+    verification_token: signed.verification_token,
+    expires_at: signed.expires_at,
+  });
+});
+
+// Verify existing account's email using stateless HMAC-signed token + 6-digit code
+app.post('/api/auth/email/verify', requireAuth, authRateLimit, (req: AuthRequest, res: Response) => {
+  if (!req.user) {
+    res.status(401).json({ error: 'Authentication required' });
+    return;
+  }
+
+  const rawEmail = String(req.body?.email || req.user.email || '').trim();
+  const emailCheck = validateEmail(rawEmail);
+  if (!emailCheck.valid) {
+    res.status(400).json({ error: emailCheck.error || 'Укажите корректный адрес электронной почты.' });
+    return;
+  }
+
+  const conflicting = db
+    .prepare('SELECT id FROM users WHERE LOWER(TRIM(email)) = ? AND id != ?')
+    .get(emailCheck.normalized, req.user.id);
+  if (conflicting) {
+    res.status(409).json({ error: 'Эта почта уже зарегистрирована' });
+    return;
+  }
+
+  const guardSecret = resolveSessionSecret();
+  const check = verifySignedEmailVerificationToken(
+    req.body?.verification_token ?? req.body?.email_verification_token,
+    emailCheck.normalized,
+    req.body?.code ?? req.body?.email_code,
+    'verify_existing',
+    guardSecret,
+    req.user.id
+  );
+  if (!check.valid) {
+    res.status(400).json({ error: check.error || 'Неверный или истёкший код подтверждения.' });
+    return;
+  }
+
+  db.prepare(`
+    UPDATE users
+    SET email = ?, email_verified = 1, updated_at = datetime('now')
+    WHERE id = ?
+  `).run(emailCheck.normalized, req.user.id);
+
+  res.json({
+    ok: true,
+    email: emailCheck.normalized,
+    email_verified: 1,
+  });
+});
+
 app.post('/api/auth/register', authRateLimit, (req: Request, res: Response) => {
+  // 1. Honeypot trap: bots filling hidden fields are rejected immediately
+  const honeypot = String(req.body?.website ?? req.body?.company_url ?? '').trim();
+  if (honeypot.length > 0) {
+    res.status(400).json({ error: 'Не удалось пройти проверку защиты от ботов.' });
+    return;
+  }
+
+  // 2. Stateless HMAC-signed math captcha check
+  const guardSecret = resolveSessionSecret();
+  const captchaCheck = verifySignedCaptcha(
+    req.body?.captcha_token,
+    req.body?.captcha_answer,
+    guardSecret
+  );
+  if (!captchaCheck.valid) {
+    res.status(400).json({ error: captchaCheck.error || 'Неверный ответ на проверочный вопрос.' });
+    return;
+  }
+
   const rawUsername = req.body?.username ?? req.body?.nickname ?? '';
   const rawDisplayName = req.body?.display_name ?? '';
   const rawEmail = req.body?.email ?? '';
@@ -546,36 +755,90 @@ app.post('/api/auth/register', authRateLimit, (req: Request, res: Response) => {
   }
 
   const normalizedUsername = usernameCheck.normalized;
-  if (normalizedUsername === 'sushkanov097' || normalizedUsername === 'deathmarried_admin') {
-    res.status(403).json({ error: 'Этот @username зарезервирован администрацией.' });
+
+  // 3. Case-insensitive trimmed username & email uniqueness check FIRST (exact HTTP 409 messages)
+  const existingNick = db
+    .prepare('SELECT id FROM users WHERE LOWER(TRIM(nickname)) = ?')
+    .get(normalizedUsername);
+  if (existingNick) {
+    res.status(409).json({ error: 'Этот юзернейм уже занят' });
     return;
   }
 
-  const existingNick = db
-    .prepare('SELECT id FROM users WHERE nickname = ? COLLATE NOCASE')
-    .get(normalizedUsername);
-  if (existingNick) {
-    res.status(409).json({ error: 'Этот @username уже занят. Выберите другой.' });
+  if (normalizedUsername === 'sushkanov097' || normalizedUsername === 'deathmarried_admin') {
+    res.status(409).json({ error: 'Этот юзернейм уже занят' });
     return;
   }
 
   const existingEmail = db
-    .prepare('SELECT id FROM users WHERE email = ? COLLATE NOCASE')
+    .prepare('SELECT id FROM users WHERE LOWER(TRIM(email)) = ?')
     .get(emailCheck.normalized);
   if (existingEmail) {
-    res.status(409).json({ error: 'Аккаунт с этим адресом электронной почты уже существует.' });
+    res.status(409).json({ error: 'Эта почта уже зарегистрирована' });
     return;
+  }
+
+  // 4. Mandatory stateless 6-digit email verification code check for all new registrations
+  const emailCodeCheck = verifySignedEmailVerificationToken(
+    req.body?.email_verification_token ?? req.body?.verification_token,
+    emailCheck.normalized,
+    req.body?.email_code ?? req.body?.code,
+    'register',
+    guardSecret
+  );
+  if (!emailCodeCheck.valid) {
+    res.status(400).json({ error: emailCodeCheck.error || 'Подтвердите электронную почту 6-значным кодом из письма.' });
+    return;
+  }
+
+  // 5. Anti-spam multi-account guard: max 2 registrations per IP / device per 24 hours
+  const forwardedFor = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  const clientIp = forwardedFor || req.ip || req.socket.remoteAddress || 'unknown';
+  const ipHash = hashGuardIdentifier(`ip:${clientIp}`, guardSecret);
+
+  const rawClientFp =
+    (typeof req.body?.client_fp === 'string' && req.body.client_fp.trim()) ||
+    (typeof req.cookies?.aod_reg_mark === 'string' && req.cookies.aod_reg_mark.trim()) ||
+    '';
+  const clientFpHash = rawClientFp ? hashGuardIdentifier(`fp:${rawClientFp}`, guardSecret) : null;
+
+  const recentIpRow = db
+    .prepare(
+      "SELECT COUNT(*) as c FROM registration_guards WHERE ip_hash = ? AND datetime(created_at) >= datetime('now', '-24 hours')"
+    )
+    .get(ipHash) as { c: number };
+  if ((recentIpRow?.c || 0) >= MAX_REGISTRATIONS_PER_IP_24H) {
+    res.status(429).json({
+      error: `С одного IP-адреса можно создать не более ${MAX_REGISTRATIONS_PER_IP_24H} аккаунтов за 24 часа. Попробуйте позже.`,
+    });
+    return;
+  }
+
+  if (clientFpHash) {
+    const recentFpRow = db
+      .prepare(
+        "SELECT COUNT(*) as c FROM registration_guards WHERE client_fp_hash = ? AND datetime(created_at) >= datetime('now', '-24 hours')"
+      )
+      .get(clientFpHash) as { c: number };
+    if ((recentFpRow?.c || 0) >= MAX_REGISTRATIONS_PER_DEVICE_24H) {
+      res.status(429).json({
+        error: `С этого устройства уже создано максимальное число аккаунтов (${MAX_REGISTRATIONS_PER_DEVICE_24H}) за последние 24 часа.`,
+      });
+      return;
+    }
   }
 
   const userId = 'usr_' + crypto.randomUUID().slice(0, 8);
   const hash = bcrypt.hashSync(String(password), 12);
   const assignedRole = 'user';
   const defaultAvatar = '/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg';
+  const deviceMarkValue = rawClientFp || `dev_${crypto.randomUUID().replace(/-/g, '')}`;
+  const persistedFpHash = hashGuardIdentifier(`fp:${deviceMarkValue}`, guardSecret);
 
   db.transaction(() => {
     db.prepare(`
       INSERT INTO users (id, nickname, email, email_verified, password_hash, role_id, failed_login_attempts)
-      VALUES (?, ?, ?, 0, ?, ?, 0)
+      VALUES (?, ?, ?, 1, ?, ?, 0)
     `).run(userId, normalizedUsername, emailCheck.normalized, hash, assignedRole);
 
     // CRITICAL: New accounts always start with strictly 0 XP, 0 total_xp, Level 1, 0 streak
@@ -588,6 +851,11 @@ app.post('/api/auth/register', authRateLimit, (req: Request, res: Response) => {
       defaultAvatar,
       ''
     );
+
+    db.prepare(`
+      INSERT INTO registration_guards (id, ip_hash, client_fp_hash)
+      VALUES (?, ?, ?)
+    `).run('rg_' + crypto.randomUUID().slice(0, 10), ipHash, persistedFpHash);
   })();
 
   // Award 0-XP registration milestone badge without touching XP
@@ -599,12 +867,20 @@ app.post('/api/auth/register', authRateLimit, (req: Request, res: Response) => {
     role_id: assignedRole,
   });
 
+  res.cookie('aod_reg_mark', deviceMarkValue, {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: process.env.NODE_ENV === 'production' || isVercel,
+    path: '/',
+    maxAge: 30 * 24 * 60 * 60 * 1000,
+  });
+
   res.status(201).json({
     user: {
       id: userId,
       nickname: normalizedUsername,
       email: emailCheck.normalized,
-      email_verified: 0,
+      email_verified: 1,
       role_id: assignedRole,
       display_name: displayNameCheck.normalized,
       avatar_url: defaultAvatar,
@@ -618,6 +894,7 @@ app.post('/api/auth/register', authRateLimit, (req: Request, res: Response) => {
       equipped_banner: null,
       equipped_name_style: null,
       equipped_badge: null,
+      equipped_title: null,
       equipped_theme: null,
       equipped_effect: null,
       featured_achievements: [],
@@ -644,7 +921,7 @@ app.post('/api/auth/login', authRateLimit, (req: Request, res: Response) => {
            u.failed_login_attempts, u.locked_until, u.created_at as registered_at,
            p.display_name, p.avatar_url, p.bio, p.custom_status, p.level, p.xp, p.total_xp,
            p.daily_streak, p.equipped_frame, p.equipped_banner, p.equipped_name_style,
-           p.equipped_badge, p.equipped_theme, p.equipped_effect, p.featured_achievements_json,
+           p.equipped_badge, p.equipped_title, p.equipped_theme, p.equipped_effect, p.featured_achievements_json,
            p.username_changed_at
     FROM users u
     JOIN profiles p ON p.user_id = u.id
@@ -734,13 +1011,18 @@ app.post('/api/auth/login', authRateLimit, (req: Request, res: Response) => {
     ...cleanUser
   } = user;
 
+  const totalXp = Number(cleanUser.total_xp ?? cleanUser.xp ?? 0);
+  const { level: computedLevel } = calculateLevelFromXp(totalXp);
+
   res.json({
     user: {
       ...cleanUser,
+      email_verified: Number(cleanUser.email_verified || 0),
       display_name: cleanUser.display_name && String(cleanUser.display_name).trim()
         ? cleanUser.display_name
         : cleanUser.nickname,
-      total_xp: cleanUser.total_xp ?? cleanUser.xp ?? 0,
+      total_xp: totalXp,
+      level: computedLevel,
       featured_achievements: parseFeaturedAchievements(featured_achievements_json),
     },
     token,
@@ -871,8 +1153,200 @@ app.get('/api/auth/me', (req: Request, res: Response) => {
 });
 
 // ----------------------------------------------------------------------------
-// API: ARCHIVE (ALBUMS, SINGLES, TRACKS)
+// API: NOTIFICATIONS & COMMUNITY RULES ACCEPTANCE
 // ----------------------------------------------------------------------------
+
+function createReplyNotification(params: {
+  recipientUserId: string;
+  actor: { id: string; nickname: string; display_name?: string };
+  targetType: 'post' | 'creation' | 'album' | 'single';
+  targetId: string;
+  targetTitle: string;
+  targetLink: string;
+  excerpt: string;
+}) {
+  if (!params.recipientUserId || params.recipientUserId === params.actor.id) return;
+  try {
+    const cleanExcerpt = String(params.excerpt || '').replace(/\s+/g, ' ').trim().slice(0, 140);
+    const cleanTitle = String(params.targetTitle || '').trim().slice(0, 120);
+    const actorName = (params.actor.display_name || params.actor.nickname || 'Участник').trim().slice(0, 60);
+    db.prepare(`
+      INSERT INTO notifications (
+        id, user_id, actor_id, actor_nickname, actor_name, type,
+        target_type, target_id, target_title, target_link, excerpt, is_read
+      )
+      VALUES (?, ?, ?, ?, ?, 'reply', ?, ?, ?, ?, ?, 0)
+    `).run(
+      'ntf_' + crypto.randomUUID().slice(0, 10),
+      params.recipientUserId,
+      params.actor.id,
+      params.actor.nickname,
+      actorName,
+      params.targetType,
+      params.targetId,
+      cleanTitle,
+      params.targetLink,
+      cleanExcerpt
+    );
+  } catch (err) {
+    console.error('[Notifications] Failed to create notification:', err);
+  }
+}
+
+// Strictly read-only GET endpoint for gentle polling (never triggers CloudSync upload)
+app.get('/api/notifications', requireAuth, (req: AuthRequest, res: Response) => {
+  const userId = req.user!.id;
+  const notifications = db.prepare(`
+    SELECT id, user_id, actor_id, actor_nickname, actor_name, type,
+           target_type, target_id, target_title, target_link, excerpt, is_read, created_at
+    FROM notifications
+    WHERE user_id = ?
+    ORDER BY created_at DESC
+    LIMIT 30
+  `).all(userId);
+
+  const unreadRow = db.prepare(`
+    SELECT COUNT(*) as cnt FROM notifications WHERE user_id = ? AND is_read = 0
+  `).get(userId) as { cnt?: number } | undefined;
+
+  res.json({
+    notifications,
+    unreadCount: Number(unreadRow?.cnt || 0),
+  });
+});
+
+app.post('/api/notifications/read', requireAuth, (req: AuthRequest, res: Response) => {
+  const userId = req.user!.id;
+  const { id, all } = req.body || {};
+
+  if (all) {
+    db.prepare('UPDATE notifications SET is_read = 1 WHERE user_id = ? AND is_read = 0').run(userId);
+  } else if (typeof id === 'string' && id.trim()) {
+    db.prepare('UPDATE notifications SET is_read = 1 WHERE id = ? AND user_id = ?').run(id.trim(), userId);
+  } else {
+    res.status(400).json({ error: 'Specify notification id or all: true.' });
+    return;
+  }
+
+  const unreadRow = db.prepare(`
+    SELECT COUNT(*) as cnt FROM notifications WHERE user_id = ? AND is_read = 0
+  `).get(userId) as { cnt?: number } | undefined;
+
+  res.json({ ok: true, unreadCount: Number(unreadRow?.cnt || 0) });
+});
+
+app.post('/api/rules/accept', requireAuth, (req: AuthRequest, res: Response) => {
+  db.prepare("UPDATE users SET accepted_rules = 1, updated_at = datetime('now') WHERE id = ?").run(req.user!.id);
+  res.json({ ok: true, accepted_rules: 1 });
+});
+
+// ----------------------------------------------------------------------------
+// API: ARCHIVE (ALBUMS, SINGLES, TRACKS & RELEASE COMMENTS)
+// ----------------------------------------------------------------------------
+
+app.get('/api/archive/:releaseType/:releaseId/comments', (req: Request, res: Response) => {
+  const releaseType = String(req.params.releaseType || '').toLowerCase();
+  const releaseId = String(req.params.releaseId || '').trim();
+  if ((releaseType !== 'album' && releaseType !== 'single') || !releaseId) {
+    res.status(400).json({ error: 'Invalid release target.' });
+    return;
+  }
+
+  const user = getSessionUser(req);
+  const isStaff = Boolean(user && (user.role_id === 'admin' || user.role_id === 'moderator'));
+  const col = releaseType === 'album' ? 'cm.album_id' : 'cm.single_id';
+
+  const comments = db.prepare(`
+    SELECT cm.*, u.nickname as author_nickname, pr.display_name as author_name,
+           pr.avatar_url as author_avatar, pr.level as author_level,
+           pr.equipped_frame as author_frame, pr.equipped_name_style as author_name_style,
+           pr.equipped_badge as author_badge, pr.equipped_title as author_title
+    FROM comments cm
+    JOIN users u ON u.id = cm.user_id
+    JOIN profiles pr ON pr.user_id = u.id
+    WHERE ${col} = ? ${isStaff ? '' : 'AND COALESCE(cm.is_hidden, 0) = 0'}
+    ORDER BY cm.created_at ASC
+    LIMIT 200
+  `).all(releaseId);
+
+  res.json({ comments });
+});
+
+app.post('/api/archive/:releaseType/:releaseId/comments', requireAuth, (req: AuthRequest, res: Response) => {
+  const releaseType = String(req.params.releaseType || '').toLowerCase() as 'album' | 'single';
+  const releaseId = String(req.params.releaseId || '').trim();
+  if ((releaseType !== 'album' && releaseType !== 'single') || !releaseId) {
+    res.status(400).json({ error: 'Invalid release target.' });
+    return;
+  }
+
+  const { content, parent_id } = req.body || {};
+  const cleanContent = content ? String(content).trim().slice(0, 1500) : '';
+  if (!cleanContent) {
+    res.status(400).json({ error: 'Текст комментария не может быть пустым.' });
+    return;
+  }
+
+  const targetRelease = releaseType === 'album'
+    ? (db.prepare('SELECT id, title FROM albums WHERE id = ?').get(releaseId) as any)
+    : (db.prepare('SELECT id, title FROM singles WHERE id = ?').get(releaseId) as any);
+
+  if (!targetRelease) {
+    res.status(404).json({ error: 'Релиз не найден.' });
+    return;
+  }
+
+  let parentComment: any = null;
+  if (parent_id && typeof parent_id === 'string') {
+    parentComment = db.prepare('SELECT id, user_id FROM comments WHERE id = ?').get(parent_id) as any;
+  }
+
+  const id = 'cm_' + crypto.randomUUID().slice(0, 8);
+  let newlyUnlocked: UnlockedAchievementInfo[] = [];
+
+  db.transaction(() => {
+    db.prepare(`
+      INSERT INTO comments (id, user_id, album_id, single_id, content, parent_id, is_hidden)
+      VALUES (?, ?, ?, ?, ?, ?, 0)
+    `).run(
+      id,
+      req.user!.id,
+      releaseType === 'album' ? releaseId : null,
+      releaseType === 'single' ? releaseId : null,
+      cleanContent,
+      parentComment ? parentComment.id : null
+    );
+
+    db.prepare(`
+      UPDATE profiles SET xp = xp + 5, total_xp = total_xp + 5, updated_at = datetime('now')
+      WHERE user_id = ?
+    `).run(req.user!.id);
+    const updated = db.prepare('SELECT total_xp FROM profiles WHERE user_id = ?').get(req.user!.id) as any;
+    const { level } = calculateLevelFromXp(updated.total_xp);
+    db.prepare('UPDATE profiles SET level = ? WHERE user_id = ?').run(level, req.user!.id);
+
+    db.prepare(`
+      INSERT INTO xp_transactions (id, user_id, amount, source, details)
+      VALUES (?, ?, 5, 'comment', ?)
+    `).run('xpt_' + crypto.randomUUID().slice(0, 8), req.user!.id, `Комментарий к релизу «${String(targetRelease.title).slice(0, 36)}»`);
+
+    if (parentComment && parentComment.user_id && parentComment.user_id !== req.user!.id) {
+      createReplyNotification({
+        recipientUserId: parentComment.user_id,
+        actor: req.user!,
+        targetType: releaseType,
+        targetId: releaseId,
+        targetTitle: targetRelease.title,
+        targetLink: `/archive?${releaseType}=${encodeURIComponent(releaseId)}`,
+        excerpt: cleanContent,
+      });
+    }
+
+    newlyUnlocked = evaluateUserAchievements(req.user!.id);
+  })();
+
+  res.json({ ok: true, id, newly_unlocked_achievements: newlyUnlocked });
+});
 
 app.get('/api/archive/albums', (_req: Request, res: Response) => {
   const albums = db.prepare(`
@@ -1489,6 +1963,22 @@ function resolveEffectiveTrackDuration(audioUrl: string, dbDurationSeconds: numb
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
 }
 
+function normalizeSameOriginAudioUrl(rawUrl: string): string {
+  const trimmed = (rawUrl || '').trim();
+  if (!trimmed) return '';
+  if (trimmed.startsWith('/uploads/') || trimmed.startsWith('/audio/')) {
+    return trimmed;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    const match = parsed.pathname.match(/\/([^/]+\.(?:mp3|wav|ogg|m4a|flac|aac))$/i);
+    if (match && /supabase\.(co|in)|storage/i.test(parsed.hostname)) {
+      return `/uploads/${encodeURIComponent(match[1])}`;
+    }
+  } catch {}
+  return trimmed;
+}
+
 function getPlayableGameTrackPool(): {
   playablePool: PlayableTrackCandidate[];
   allTitles: TitleOption[];
@@ -1516,7 +2006,7 @@ function getPlayableGameTrackPool(): {
     ...rawTracks.map((row) => ({
       id: String(row.id),
       title: String(row.title || '').trim(),
-      audio_url: String(row.audio_url || '').trim(),
+      audio_url: normalizeSameOriginAudioUrl(String(row.audio_url || '')),
       duration_seconds: resolveEffectiveTrackDuration(String(row.audio_url || ''), Number(row.duration_seconds) || 0),
       source: 'track' as const,
       album_title: row.album_title,
@@ -1525,7 +2015,7 @@ function getPlayableGameTrackPool(): {
     ...rawSingles.map((row) => ({
       id: String(row.id),
       title: String(row.title || '').trim(),
-      audio_url: String(row.audio_url || '').trim(),
+      audio_url: normalizeSameOriginAudioUrl(String(row.audio_url || '')),
       duration_seconds: resolveEffectiveTrackDuration(String(row.audio_url || ''), Number(row.duration_seconds) || 0),
       source: 'single' as const,
       album_title: row.album_title,
@@ -1540,6 +2030,71 @@ function getPlayableGameTrackPool(): {
   `).all() as TitleOption[];
 
   return { playablePool, allTitles };
+}
+
+function getLyricGameTrackPool(): LyricTrackCandidate[] {
+  const rawTracks = db.prepare(`
+    SELECT t.id, t.title, t.lyrics,
+           COALESCE(a.title, s.title, 'Archive Release') as album_title,
+           COALESCE(a.cover_url, s.cover_url, '/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg') as cover_url
+    FROM tracks t
+    LEFT JOIN albums a ON a.id = t.album_id
+    LEFT JOIN singles s ON s.id = t.single_id
+    WHERE t.lyrics IS NOT NULL AND length(trim(t.lyrics)) > 15
+  `).all() as any[];
+
+  const rawSingles = db.prepare(`
+    SELECT s.id, s.title, s.lyrics,
+           'Single' as album_title,
+           COALESCE(s.cover_url, '/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg') as cover_url
+    FROM singles s
+    WHERE s.lyrics IS NOT NULL AND length(trim(s.lyrics)) > 15
+      AND s.id NOT IN (SELECT single_id FROM tracks WHERE single_id IS NOT NULL)
+  `).all() as any[];
+
+  return [
+    ...rawTracks.map((row) => ({
+      id: String(row.id),
+      title: String(row.title || '').trim(),
+      lyrics: String(row.lyrics || ''),
+      source: 'track' as const,
+      album_title: row.album_title,
+      cover_url: row.cover_url,
+    })),
+    ...rawSingles.map((row) => ({
+      id: String(row.id),
+      title: String(row.title || '').trim(),
+      lyrics: String(row.lyrics || ''),
+      source: 'single' as const,
+      album_title: row.album_title,
+      cover_url: row.cover_url,
+    })),
+  ].filter((t) => t.title.length > 0 && t.lyrics.trim().length > 15);
+}
+
+function getQuizSettingsFromDb(): { quiz_enabled: boolean; active_quiz_ids: string[] } {
+  let quizEnabled = true;
+  let activeQuizIds: string[] = [];
+  try {
+    const enabledRow = db.prepare("SELECT value FROM app_meta WHERE key = 'quiz_enabled'").get() as
+      | { value: string }
+      | undefined;
+    if (enabledRow && (enabledRow.value === '0' || enabledRow.value === 'false')) {
+      quizEnabled = false;
+    }
+    const idsRow = db.prepare("SELECT value FROM app_meta WHERE key = 'active_quiz_ids'").get() as
+      | { value: string }
+      | undefined;
+    if (idsRow?.value) {
+      const parsed = JSON.parse(idsRow.value);
+      if (Array.isArray(parsed)) {
+        activeQuizIds = parsed
+          .filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+          .map((id) => id.trim());
+      }
+    }
+  } catch {}
+  return { quiz_enabled: quizEnabled, active_quiz_ids: activeQuizIds };
 }
 
 function getTrackRevealInfo(trackId: string) {
@@ -1692,25 +2247,89 @@ function getOrCreateDailyTrackChallenge(utcDate: string): ResolvedDailyTrackChal
   };
 }
 
-function getOrCreateDailyQuizChallenge(utcDate: string): ValidatedQuizQuestion[] {
-  const rawQuestions = db.prepare(`
+function getCombinedQuizPool(): {
+  allRaw: RawQuizQuestion[];
+  validById: Map<string, ValidatedQuizQuestion>;
+  customCount: number;
+  generatedCount: number;
+} {
+  const customRaw = db.prepare(`
     SELECT id, question_ru, question_en, options_json, correct_index, explanation_ru, explanation_en, difficulty, is_active
     FROM quiz_questions
     WHERE is_active = 1
   `).all() as RawQuizQuestion[];
 
+  const albums = db.prepare(`
+    SELECT id, title, release_year, release_date, format_type, track_count
+    FROM albums
+  `).all() as DiscographyAlbum[];
+
+  const tracks = db.prepare(`
+    SELECT id, album_id, single_id, title, track_number, duration_seconds, lyrics
+    FROM tracks
+  `).all() as DiscographyTrack[];
+
+  const singles = db.prepare(`
+    SELECT id, title, release_year, release_date, duration_seconds, lyrics
+    FROM singles
+  `).all() as DiscographySingle[];
+
+  const generatedRaw = generateDiscographyQuizQuestions({
+    albums,
+    tracks,
+    singles,
+    secret: getDailyChallengeSecret(),
+  });
+
   const validById = new Map<string, ValidatedQuizQuestion>();
-  for (const raw of rawQuestions) {
+  const allRaw: RawQuizQuestion[] = [];
+  let customCount = 0;
+  let generatedCount = 0;
+
+  for (const raw of customRaw) {
     const valid = parseAndValidateQuizQuestion(raw);
     if (valid && !validById.has(valid.id)) {
       validById.set(valid.id, valid);
+      allRaw.push(raw);
+      customCount++;
     }
   }
+  for (const raw of generatedRaw) {
+    const valid = parseAndValidateQuizQuestion(raw);
+    if (valid && !validById.has(valid.id)) {
+      validById.set(valid.id, valid);
+      allRaw.push(raw);
+      generatedCount++;
+    }
+  }
+
+  return { allRaw, validById, customCount, generatedCount };
+}
+
+function getOrCreateDailyQuizChallenge(cycleId: string): ValidatedQuizQuestion[] {
+  const { allRaw, validById } = getCombinedQuizPool();
   if (validById.size === 0) return [];
 
+  // Manual selection mode: if admin pinned explicit active_quiz_ids, serve those exact valid questions
+  const { active_quiz_ids } = getQuizSettingsFromDb();
+  if (active_quiz_ids.length > 0) {
+    const manualSet: ValidatedQuizQuestion[] = [];
+    const seenManual = new Set<string>();
+    for (const qid of active_quiz_ids) {
+      if (!seenManual.has(qid) && validById.has(qid)) {
+        seenManual.add(qid);
+        manualSet.push(validById.get(qid)!);
+      }
+    }
+    if (manualSet.length > 0) {
+      return manualSet;
+    }
+  }
+
+  const targetCount = Math.min(DEFAULT_DAILY_QUIZ_COUNT, validById.size);
   const existing = db.prepare(`
     SELECT id, questions_json FROM daily_challenges WHERE challenge_date = ?
-  `).get(utcDate) as { id: string; questions_json: string } | undefined;
+  `).get(cycleId) as { id: string; questions_json: string } | undefined;
 
   if (existing) {
     try {
@@ -1724,20 +2343,20 @@ function getOrCreateDailyQuizChallenge(utcDate: string): ValidatedQuizQuestion[]
             resolved.push(validById.get(qid)!);
           }
         }
-        if (resolved.length > 0) {
+        if (resolved.length === targetCount && resolved.length === storedIds.length) {
           return resolved;
         }
       }
     } catch {}
   }
 
-  // Avoid repeating questions used in the last 3 UTC days when enough questions exist
+  // Avoid repeating questions used in recent 12h MSK cycles when enough questions exist
   const recentRows = db.prepare(`
     SELECT questions_json FROM daily_challenges
     WHERE challenge_date < ?
     ORDER BY challenge_date DESC
-    LIMIT 3
-  `).all(utcDate) as Array<{ questions_json: string }>;
+    LIMIT 7
+  `).all(cycleId) as Array<{ questions_json: string }>;
 
   const recentQuestionIds: string[] = [];
   for (const row of recentRows) {
@@ -1752,8 +2371,8 @@ function getOrCreateDailyQuizChallenge(utcDate: string): ValidatedQuizQuestion[]
   }
 
   const selected = pickDailyQuizSet({
-    utcDate,
-    rawQuestions,
+    utcDate: cycleId,
+    rawQuestions: allRaw,
     recentQuestionIds,
     limit: DEFAULT_DAILY_QUIZ_COUNT,
     secret: getDailyChallengeSecret(),
@@ -1761,20 +2380,20 @@ function getOrCreateDailyQuizChallenge(utcDate: string): ValidatedQuizQuestion[]
   if (selected.length === 0) return [];
 
   const selectedIds = selected.map((q) => q.id);
-  const rowId = existing?.id || `dq_${utcDate.replace(/-/g, '')}`;
+  const rowId = existing?.id || `dq_${cycleId.replace(/[^a-zA-Z0-9]/g, '')}`;
   if (existing) {
     db.prepare(`UPDATE daily_challenges SET questions_json = ? WHERE challenge_date = ?`).run(
       JSON.stringify(selectedIds),
-      utcDate
+      cycleId
     );
   } else {
     db.prepare(`
       INSERT OR IGNORE INTO daily_challenges (id, challenge_date, questions_json)
       VALUES (?, ?, ?)
-    `).run(rowId, utcDate, JSON.stringify(selectedIds));
+    `).run(rowId, cycleId, JSON.stringify(selectedIds));
   }
 
-  const persisted = db.prepare(`SELECT questions_json FROM daily_challenges WHERE challenge_date = ?`).get(utcDate) as
+  const persisted = db.prepare(`SELECT questions_json FROM daily_challenges WHERE challenge_date = ?`).get(cycleId) as
     | { questions_json: string }
     | undefined;
   if (persisted) {
@@ -1792,15 +2411,14 @@ function getOrCreateDailyQuizChallenge(utcDate: string): ValidatedQuizQuestion[]
   return selected;
 }
 
-// 1. Daily Guess The Track (shared 24h UTC challenge with exact 5-second snippet)
+// 1. Guess The Track (shared 12-hour MSK challenge: 00:00 & 12:00 МСК, exact 5-second snippet)
 app.get('/api/games/guess-track/round', (req: Request, res: Response) => {
   const user = getSessionUser(req);
-  const today = getUtcDateString();
-  const nextResetAt = getNextUtcMidnightIso(today);
+  const { cycleId: slotKey, nextResetAt } = getMoscow12hCycle();
 
-  const daily = getOrCreateDailyTrackChallenge(today);
+  const daily = getOrCreateDailyTrackChallenge(slotKey);
   if (!daily) {
-    res.status(404).json({ error: 'В архиве пока нет доступных аудиофайлов для ежедневного испытания.' });
+    res.status(404).json({ error: 'В архиве пока нет доступных аудиофайлов для испытания.' });
     return;
   }
 
@@ -1817,7 +2435,7 @@ app.get('/api/games/guess-track/round', (req: Request, res: Response) => {
   if (user) {
     const attempt = db.prepare(`
       SELECT * FROM daily_track_attempts WHERE user_id = ? AND challenge_date = ?
-    `).get(user.id, today) as any;
+    `).get(user.id, slotKey) as any;
     if (attempt) {
       alreadyCompleted = true;
       previousAttempt = {
@@ -1831,11 +2449,12 @@ app.get('/api/games/guess-track/round', (req: Request, res: Response) => {
     }
   }
 
-  // Notice: correct track id is NEVER returned until user completes today's challenge!
   res.json({
-    challenge_date: today,
+    challenge_date: slotKey,
     next_reset_at: nextResetAt,
-    round_token: `daily:${today}`,
+    refresh_interval_hours: 12,
+    timezone: 'MSK',
+    round_token: `daily:${slotKey}`,
     audio_url: daily.track.audio_url,
     snippet_start: daily.snippet_start_seconds,
     snippet_start_ratio: daily.snippet_start_ratio,
@@ -1854,48 +2473,46 @@ app.post('/api/games/guess-track/verify', (req: AuthRequest, res: Response) => {
   }
 
   const user = getSessionUser(req);
-  const today = getUtcDateString();
-  const nextResetAt = getNextUtcMidnightIso(today);
+  const { cycleId: slotKey, nextResetAt } = getMoscow12hCycle();
 
-  // Extract client challenge date (if provided) to gracefully handle midnight UTC rollover
-  let clientDate: string | null = null;
-  if (isValidUtcDateString(challenge_date)) {
-    clientDate = challenge_date;
+  let clientSlot: string | null = null;
+  if (isValidMoscow12hCycle(challenge_date)) {
+    clientSlot = challenge_date;
   } else if (typeof round_token === 'string' && round_token.startsWith('daily:')) {
     const extracted = round_token.slice('daily:'.length);
-    if (isValidUtcDateString(extracted)) {
-      clientDate = extracted;
+    if (isValidMoscow12hCycle(extracted)) {
+      clientSlot = extracted;
     }
   }
 
-  if (clientDate && clientDate !== today) {
+  if (clientSlot && clientSlot !== slotKey) {
     res.status(409).json({
-      error: 'Наступил новый день (UTC) — доступно новое ежедневное испытание!',
+      error: 'Начался новый 12-часовой раунд (МСК) — доступен свежий трек!',
       code: 'DAILY_ROLLOVER',
-      challenge_date: today,
+      challenge_date: slotKey,
       next_reset_at: nextResetAt,
     });
     return;
   }
 
-  const daily = getOrCreateDailyTrackChallenge(today);
+  const daily = getOrCreateDailyTrackChallenge(slotKey);
   if (!daily) {
-    res.status(404).json({ error: 'Ежедневное испытание временно недоступно.' });
+    res.status(404).json({ error: 'Испытание «Угадай трек» временно недоступно.' });
     return;
   }
 
   if (!daily.options.some((o) => o.id === selected_track_id)) {
-    res.status(400).json({ error: 'Selected option is not valid for today\'s challenge.' });
+    res.status(400).json({ error: 'Selected option is not valid for the current round.' });
     return;
   }
 
   if (user) {
     const existingAttempt = db.prepare(`
       SELECT id FROM daily_track_attempts WHERE user_id = ? AND challenge_date = ?
-    `).get(user.id, today);
+    `).get(user.id, slotKey);
     if (existingAttempt) {
       res.status(400).json({
-        error: 'Вы уже прошли сегодняшнее испытание «Угадай трек». Новое появится в 00:00 UTC!',
+        error: 'Вы уже прошли текущий раунд «Угадай трек». Обновление в 00:00 и 12:00 МСК!',
         already_completed: true,
       });
       return;
@@ -1906,11 +2523,24 @@ app.post('/api/games/guess-track/verify', (req: AuthRequest, res: Response) => {
   const isCorrect = correctTrackId === selected_track_id;
   const safeTimeSpent = Math.max(1, Math.min(180, Math.round(Number(time_spent) || 10)));
   const score = isCorrect ? 100 : 0;
-  let xpEarned = 5;
-  if (isCorrect) {
-    // 15 XP base + speed bonus if under 15 seconds (up to 10 extra)
-    const speed = Math.max(0, 15 - Math.floor(safeTimeSpent));
-    xpEarned = 15 + Math.min(10, speed);
+  const todayMoscowDate = getMoscowDateString();
+  const baseXp = isCorrect ? 15 : 5;
+
+  let xpEarned = baseXp;
+  let streakBonusXp = 0;
+  let streakBonusPercent = 0;
+  let nextStreak = 0;
+  let newlyUnlockedAchievements: UnlockedAchievementInfo[] = [];
+
+  if (user) {
+    const prev = db
+      .prepare('SELECT total_xp, daily_streak, last_active_date FROM profiles WHERE user_id = ?')
+      .get(user.id) as any;
+    nextStreak = computeDailyStreak(prev?.last_active_date, todayMoscowDate, prev?.daily_streak || 0);
+    const boosted = applyStreakBonusXp(baseXp, nextStreak);
+    xpEarned = boosted.totalXp;
+    streakBonusXp = boosted.bonusXp;
+    streakBonusPercent = boosted.bonusPercent;
   }
 
   const trackInfo = getTrackRevealInfo(correctTrackId) || {
@@ -1923,14 +2553,14 @@ app.post('/api/games/guess-track/verify', (req: AuthRequest, res: Response) => {
   if (user) {
     try {
       db.transaction(() => {
-        // Ensure today's daily track challenge row is persisted in the DB snapshot synced to Supabase
+        // Ensure current 12-hour track challenge row is persisted in the DB snapshot synced to Supabase
         db.prepare(`
           INSERT OR IGNORE INTO daily_track_challenges
             (id, challenge_date, track_id, track_source, snippet_start_seconds, snippet_start_ratio, snippet_duration_seconds, options_json)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           daily.id,
-          today,
+          slotKey,
           daily.track.id,
           daily.track.source,
           daily.snippet_start_seconds,
@@ -1939,7 +2569,7 @@ app.post('/api/games/guess-track/verify', (req: AuthRequest, res: Response) => {
           JSON.stringify(daily.options)
         );
 
-        // Enforce strictly 1 rewarded attempt per user per UTC day
+        // Enforce strictly 1 rewarded attempt per user per 12-hour UTC window
         db.prepare(`
           INSERT INTO daily_track_attempts
             (id, user_id, challenge_date, track_id, selected_track_id, is_correct, score, xp_earned, time_spent)
@@ -1947,7 +2577,7 @@ app.post('/api/games/guess-track/verify', (req: AuthRequest, res: Response) => {
         `).run(
           'dta_' + crypto.randomUUID().slice(0, 8),
           user.id,
-          today,
+          slotKey,
           correctTrackId,
           selected_track_id,
           isCorrect ? 1 : 0,
@@ -1965,10 +2595,14 @@ app.post('/api/games/guess-track/verify', (req: AuthRequest, res: Response) => {
           user.id,
           score,
           xpEarned,
-          JSON.stringify({ isCorrect, correctTrackId, challengeDate: today })
+          JSON.stringify({ isCorrect, correctTrackId, challengeDate: slotKey, streakBonusPercent })
         );
 
-        // Record XP transaction
+        // Record XP transaction in Russian
+        const txDetails = isCorrect
+          ? (streakBonusPercent > 0 ? `Верный ответ (серия +${streakBonusPercent}%)` : 'Верный ответ')
+          : (streakBonusPercent > 0 ? `Участие в раунде (серия +${streakBonusPercent}%)` : 'Участие в раунде');
+
         db.prepare(`
           INSERT INTO xp_transactions (id, user_id, amount, source, details)
           VALUES (?, ?, ?, 'guess_track', ?)
@@ -1976,11 +2610,10 @@ app.post('/api/games/guess-track/verify', (req: AuthRequest, res: Response) => {
           'xpt_' + crypto.randomUUID().slice(0, 8),
           user.id,
           xpEarned,
-          isCorrect ? `Daily Guess Track (${today}): Correct` : `Daily Guess Track (${today}): Participation`
+          txDetails
         );
 
-        const prev = db.prepare('SELECT total_xp, daily_streak, last_active_date FROM profiles WHERE user_id = ?').get(user.id) as any;
-        const nextStreak = computeDailyStreak(prev?.last_active_date, today, prev?.daily_streak || 0);
+        const prev = db.prepare('SELECT total_xp FROM profiles WHERE user_id = ?').get(user.id) as any;
         const nextTotalXp = (prev?.total_xp || 0) + xpEarned;
         const { level } = calculateLevelFromXp(nextTotalXp);
 
@@ -1993,15 +2626,15 @@ app.post('/api/games/guess-track/verify', (req: AuthRequest, res: Response) => {
             last_active_date = ?,
             updated_at = datetime('now')
           WHERE user_id = ?
-        `).run(xpEarned, nextTotalXp, level, nextStreak, today, user.id);
+        `).run(xpEarned, nextTotalXp, level, nextStreak, todayMoscowDate, user.id);
 
         // Evaluate all eligible achievements server-side
-        evaluateUserAchievements(user.id);
+        newlyUnlockedAchievements = evaluateUserAchievements(user.id);
       })();
     } catch (err: any) {
       if (String(err?.message || '').includes('UNIQUE')) {
         res.status(400).json({
-          error: 'Вы уже прошли сегодняшнее испытание «Угадай трек». Новое появится в 00:00 UTC!',
+          error: 'Вы уже прошли текущий раунд «Угадай трек». Новый трек обновляется каждые 12 часов (в 00:00 и 12:00 UTC)!',
           already_completed: true,
         });
         return;
@@ -2015,18 +2648,41 @@ app.post('/api/games/guess-track/verify', (req: AuthRequest, res: Response) => {
     correct_track_id: correctTrackId,
     selected_track_id,
     score,
+    base_xp: baseXp,
+    streak_bonus_xp: streakBonusXp,
+    streak_bonus_percent: streakBonusPercent,
+    daily_streak: nextStreak,
     xp_earned: xpEarned,
     track: trackInfo,
-    challenge_date: today,
+    challenge_date: slotKey,
     next_reset_at: nextResetAt,
+    refresh_interval_hours: 12,
+    newly_unlocked_achievements: newlyUnlockedAchievements,
   });
 });
 
-// 2. Daily Quiz with 24h UTC persisted set & duplicate protection
+// 2. Daily Quiz (12-hour MSK schedule: 00:00 & 12:00 МСК, quiz_enabled toggle, active_quiz_ids manual mode, difficulty XP + Fisher-Yates options)
 app.get('/api/games/quiz/daily', (req: Request, res: Response) => {
   const user = getSessionUser(req);
-  const today = getUtcDateString();
-  const nextResetAt = getNextUtcMidnightIso(today);
+  const { cycleId, nextResetAt } = getMoscow12hCycle();
+  const quizSecret = getDailyChallengeSecret();
+  const { quiz_enabled } = getQuizSettingsFromDb();
+
+  if (!quiz_enabled) {
+    res.json({
+      disabled: true,
+      message: 'Зайдите позже, добавляются новые вопросы',
+      questions: [],
+      already_completed: false,
+      previous_score: 0,
+      previous_xp: 0,
+      challenge_date: cycleId,
+      next_reset_at: nextResetAt,
+      refresh_interval_hours: 12,
+      timezone: 'MSK',
+    });
+    return;
+  }
 
   let alreadyCompleted = false;
   let previousScore = 0;
@@ -2035,7 +2691,7 @@ app.get('/api/games/quiz/daily', (req: Request, res: Response) => {
   if (user) {
     const attempt = db.prepare(`
       SELECT * FROM quiz_attempts WHERE user_id = ? AND challenge_date = ?
-    `).get(user.id, today) as any;
+    `).get(user.id, cycleId) as any;
     if (attempt) {
       alreadyCompleted = true;
       previousScore = attempt.score;
@@ -2043,7 +2699,9 @@ app.get('/api/games/quiz/daily', (req: Request, res: Response) => {
     }
   }
 
-  const questions = getOrCreateDailyQuizChallenge(today);
+  const questions = getOrCreateDailyQuizChallenge(cycleId).map((q) =>
+    shuffleQuizQuestionOptions(q, cycleId, quizSecret)
+  );
   const sanitized = questions.map((q) => ({
     id: q.id,
     question_ru: q.question_ru,
@@ -2053,31 +2711,43 @@ app.get('/api/games/quiz/daily', (req: Request, res: Response) => {
   }));
 
   res.json({
+    disabled: false,
     questions: sanitized,
     already_completed: alreadyCompleted,
     previous_score: previousScore,
     previous_xp: previousXp,
-    challenge_date: today,
+    challenge_date: cycleId,
     next_reset_at: nextResetAt,
+    refresh_interval_hours: 12,
+    timezone: 'MSK',
   });
 });
 
 app.post('/api/games/quiz/submit', (req: AuthRequest, res: Response) => {
-  const { answers, time_spent_seconds, challenge_date } = req.body || {};
+  const { answers, challenge_date } = req.body || {};
   if (!answers || typeof answers !== 'object' || Array.isArray(answers)) {
     res.status(400).json({ error: 'Answers must be provided.' });
     return;
   }
 
-  const user = getSessionUser(req);
-  const today = getUtcDateString();
-  const nextResetAt = getNextUtcMidnightIso(today);
+  const { quiz_enabled } = getQuizSettingsFromDb();
+  if (!quiz_enabled) {
+    res.status(403).json({
+      disabled: true,
+      error: 'Зайдите позже, добавляются новые вопросы',
+    });
+    return;
+  }
 
-  if (isValidUtcDateString(challenge_date) && challenge_date !== today) {
+  const user = getSessionUser(req);
+  const { cycleId, nextResetAt } = getMoscow12hCycle();
+  const quizSecret = getDailyChallengeSecret();
+
+  if (isValidMoscow12hCycle(challenge_date) && challenge_date !== cycleId) {
     res.status(409).json({
-      error: 'Наступил новый день (UTC) — доступна новая ежедневная викторина!',
+      error: 'Начался новый 12-часовой цикл (МСК) — доступна новая викторина!',
       code: 'DAILY_ROLLOVER',
-      challenge_date: today,
+      challenge_date: cycleId,
       next_reset_at: nextResetAt,
     });
     return;
@@ -2086,24 +2756,26 @@ app.post('/api/games/quiz/submit', (req: AuthRequest, res: Response) => {
   if (user) {
     const existingAttempt = db.prepare(`
       SELECT id FROM quiz_attempts WHERE user_id = ? AND challenge_date = ?
-    `).get(user.id, today);
+    `).get(user.id, cycleId);
 
     if (existingAttempt) {
-      res.status(400).json({ error: 'Вы уже прошли ежедневную викторину сегодня. Возвращайтесь завтра!' });
+      res.status(400).json({ error: 'Вы уже прошли викторину в этом раунде. Обновление в 00:00 и 12:00 МСК!' });
       return;
     }
   }
 
-  const dailyQuestions = getOrCreateDailyQuizChallenge(today);
+  const dailyQuestions = getOrCreateDailyQuizChallenge(cycleId).map((q) =>
+    shuffleQuizQuestionOptions(q, cycleId, quizSecret)
+  );
   if (dailyQuestions.length === 0) {
-    res.status(404).json({ error: 'Вопросы для ежедневной викторины не найдены.' });
+    res.status(404).json({ error: 'Вопросы для викторины не найдены.' });
     return;
   }
 
   let correctCount = 0;
   const matchedQuestions = dailyQuestions.filter((q) => answers[q.id] !== undefined);
   if (matchedQuestions.length === 0) {
-    res.status(400).json({ error: 'Не переданы ответы на сегодняшние вопросы викторины.' });
+    res.status(400).json({ error: 'Не переданы ответы на текущие вопросы викторины.' });
     return;
   }
 
@@ -2119,28 +2791,51 @@ app.post('/api/games/quiz/submit', (req: AuthRequest, res: Response) => {
       correct_index: q.correct_index,
       explanation_ru: q.explanation_ru,
       explanation_en: q.explanation_en,
+      difficulty: q.difficulty,
     };
   });
 
-  const safeTime = Math.max(1, Math.min(3600, Number(time_spent_seconds) || 30));
-  const { baseScore, speedBonus, totalXp } = calculateQuizScore(total, correctCount, safeTime);
+  // Difficulty-based Quiz XP: easy (1) = 10 XP, medium (2) = 15 XP, hard (3) = 25 XP
+  const { baseScore, speedBonus, totalXp: rawBaseXp } = calculateQuizScoreByDifficulty(
+    dailyQuestions.map((q, idx) => ({
+      isCorrect: results[idx].is_correct,
+      difficulty: q.difficulty,
+    }))
+  );
+
+  const todayMoscowDate = getMoscowDateString();
+  let totalXp = rawBaseXp;
+  let streakBonusXp = 0;
+  let streakBonusPercent = 0;
+  let nextStreak = 0;
+  let newlyUnlockedAchievements: UnlockedAchievementInfo[] = [];
 
   if (user) {
+    const prev = db
+      .prepare('SELECT total_xp, daily_streak, last_active_date FROM profiles WHERE user_id = ?')
+      .get(user.id) as any;
+    nextStreak = computeDailyStreak(prev?.last_active_date, todayMoscowDate, prev?.daily_streak || 0);
+    const boosted = applyStreakBonusXp(rawBaseXp, nextStreak);
+    totalXp = boosted.totalXp;
+    streakBonusXp = boosted.bonusXp;
+    streakBonusPercent = boosted.bonusPercent;
+
     try {
       db.transaction(() => {
-        // Ensure today's daily_challenges row is persisted in the DB snapshot synced to Supabase
         db.prepare(`
           INSERT OR IGNORE INTO daily_challenges (id, challenge_date, questions_json)
           VALUES (?, ?, ?)
-        `).run(`dq_${today.replace(/-/g, '')}`, today, JSON.stringify(dailyQuestions.map((q) => q.id)));
+        `).run(
+          `dq_${cycleId.replace(/[^a-zA-Z0-9]/g, '')}`,
+          cycleId,
+          JSON.stringify(dailyQuestions.map((q) => q.id))
+        );
 
-        // Record in quiz_attempts (UNIQUE(user_id, challenge_date) enforces single reward)
         db.prepare(`
           INSERT INTO quiz_attempts (id, user_id, challenge_date, score, xp_earned)
           VALUES (?, ?, ?, ?, ?)
-        `).run('qa_' + crypto.randomUUID().slice(0, 8), user.id, today, baseScore, totalXp);
+        `).run('qa_' + crypto.randomUUID().slice(0, 8), user.id, cycleId, baseScore, totalXp);
 
-        // Record in game_attempts
         db.prepare(`
           INSERT INTO game_attempts (id, user_id, game_id, score, xp_earned, details_json)
           VALUES (?, ?, 'daily-quiz', ?, ?, ?)
@@ -2149,21 +2844,22 @@ app.post('/api/games/quiz/submit', (req: AuthRequest, res: Response) => {
           user.id,
           baseScore,
           totalXp,
-          JSON.stringify({ correctCount, total, challengeDate: today })
+          JSON.stringify({ correctCount, total, challengeDate: cycleId, streakBonusPercent })
         );
 
-        // Record XP transaction
+        const txDetails =
+          streakBonusPercent > 0
+            ? `Результат ${correctCount}/${total} (серия +${streakBonusPercent}%)`
+            : `Результат ${correctCount}/${total}`;
+
         db.prepare(`
           INSERT INTO xp_transactions (id, user_id, amount, source, details)
           VALUES (?, ?, ?, 'daily_quiz', ?)
-        `).run('xpt_' + crypto.randomUUID().slice(0, 8), user.id, totalXp, `Daily Quiz (${today}): ${correctCount}/${total}`);
+        `).run('xpt_' + crypto.randomUUID().slice(0, 8), user.id, totalXp, txDetails);
 
-        const prev = db.prepare('SELECT total_xp, daily_streak, last_active_date FROM profiles WHERE user_id = ?').get(user.id) as any;
-        const nextStreak = computeDailyStreak(prev?.last_active_date, today, prev?.daily_streak || 0);
         const nextTotalXp = (prev?.total_xp || 0) + totalXp;
         const { level } = calculateLevelFromXp(nextTotalXp);
 
-        // Update spendable XP, total XP, level, and streak accurately
         db.prepare(`
           UPDATE profiles SET
             xp = xp + ?,
@@ -2173,14 +2869,13 @@ app.post('/api/games/quiz/submit', (req: AuthRequest, res: Response) => {
             last_active_date = ?,
             updated_at = datetime('now')
           WHERE user_id = ?
-        `).run(totalXp, nextTotalXp, level, nextStreak, today, user.id);
+        `).run(totalXp, nextTotalXp, level, nextStreak, todayMoscowDate, user.id);
 
-        // Evaluate all eligible achievements server-side
-        evaluateUserAchievements(user.id);
+        newlyUnlockedAchievements = evaluateUserAchievements(user.id);
       })();
     } catch (err: any) {
       if (String(err?.message || '').includes('UNIQUE')) {
-        res.status(400).json({ error: 'Вы уже прошли ежедневную викторину сегодня. Возвращайтесь завтра!' });
+        res.status(400).json({ error: 'Вы уже прошли викторину в этом раунде. Обновление в 00:00 и 12:00 МСК!' });
         return;
       }
       throw err;
@@ -2191,88 +2886,889 @@ app.post('/api/games/quiz/submit', (req: AuthRequest, res: Response) => {
     total,
     correct_count: correctCount,
     base_score: baseScore,
+    base_xp: rawBaseXp,
     speed_bonus: speedBonus,
+    streak_bonus_xp: streakBonusXp,
+    streak_bonus_percent: streakBonusPercent,
+    daily_streak: nextStreak,
     total_xp: totalXp,
     results,
-    challenge_date: today,
+    challenge_date: cycleId,
     next_reset_at: nextResetAt,
+    refresh_interval_hours: 12,
+    timezone: 'MSK',
+    newly_unlocked_achievements: newlyUnlockedAchievements,
   });
 });
 
-// Helper for unlocking achievements safely (idempotent, never grants unrequested XP)
-function unlockAchievement(userId: string, achievementSlug: string) {
-  const ach = db.prepare('SELECT id FROM achievements WHERE slug = ?').get(achievementSlug) as any;
-  if (!ach) return;
-  db.prepare(`
+// Shared helper to record Stage 5 mini-game attempts (guess-lyrics, reverse-track, speed-track)
+function recordMiniGameAttempt(params: {
+  userId: string;
+  gameId: 'guess-lyrics' | 'reverse-track' | 'speed-track';
+  xpSource: 'guess_lyrics' | 'reverse_track' | 'speed_track';
+  cycleId: string;
+  isCorrect: boolean;
+  baseXp: number;
+  selectedValue: string;
+  correctValue: string;
+  details: Record<string, unknown>;
+}): {
+  xpEarned: number;
+  streakBonusXp: number;
+  streakBonusPercent: number;
+  nextStreak: number;
+  newlyUnlockedAchievements: UnlockedAchievementInfo[];
+} {
+  const { userId, gameId, xpSource, cycleId, isCorrect, baseXp, selectedValue, correctValue, details } = params;
+  const todayMoscowDate = getMoscowDateString();
+  const prev = db
+    .prepare('SELECT total_xp, daily_streak, last_active_date FROM profiles WHERE user_id = ?')
+    .get(userId) as any;
+  const nextStreak = computeDailyStreak(prev?.last_active_date, todayMoscowDate, prev?.daily_streak || 0);
+  const boosted = applyStreakBonusXp(baseXp, nextStreak);
+  const xpEarned = boosted.totalXp;
+  const score = isCorrect ? 100 : 0;
+  let newlyUnlockedAchievements: UnlockedAchievementInfo[] = [];
+
+  db.transaction(() => {
+    db.prepare(`
+      INSERT INTO daily_mini_game_attempts
+        (id, user_id, game_id, cycle_id, is_correct, score, xp_earned, selected_value, correct_value, details_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'dmg_' + crypto.randomUUID().slice(0, 8),
+      userId,
+      gameId,
+      cycleId,
+      isCorrect ? 1 : 0,
+      score,
+      xpEarned,
+      selectedValue,
+      correctValue,
+      JSON.stringify(details)
+    );
+
+    db.prepare(`
+      INSERT INTO game_attempts (id, user_id, game_id, score, xp_earned, details_json)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+      'att_' + crypto.randomUUID().slice(0, 8),
+      userId,
+      gameId,
+      score,
+      xpEarned,
+      JSON.stringify({ ...details, challengeDate: cycleId, streakBonusPercent: boosted.bonusPercent })
+    );
+
+    const txDetails = isCorrect
+      ? (boosted.bonusPercent > 0 ? `Верный ответ (серия +${boosted.bonusPercent}%)` : 'Верный ответ')
+      : (boosted.bonusPercent > 0 ? `Участие в раунде (серия +${boosted.bonusPercent}%)` : 'Участие в раунде');
+
+    db.prepare(`
+      INSERT INTO xp_transactions (id, user_id, amount, source, details)
+      VALUES (?, ?, ?, ?, ?)
+    `).run('xpt_' + crypto.randomUUID().slice(0, 8), userId, xpEarned, xpSource, txDetails);
+
+    const nextTotalXp = (prev?.total_xp || 0) + xpEarned;
+    const { level } = calculateLevelFromXp(nextTotalXp);
+
+    db.prepare(`
+      UPDATE profiles SET
+        xp = xp + ?,
+        total_xp = ?,
+        level = ?,
+        daily_streak = ?,
+        last_active_date = ?,
+        updated_at = datetime('now')
+      WHERE user_id = ?
+    `).run(xpEarned, nextTotalXp, level, nextStreak, todayMoscowDate, userId);
+
+    newlyUnlockedAchievements = evaluateUserAchievements(userId);
+  })();
+
+  return {
+    xpEarned,
+    streakBonusXp: boosted.bonusXp,
+    streakBonusPercent: boosted.bonusPercent,
+    nextStreak,
+    newlyUnlockedAchievements,
+  };
+}
+
+// 3. Guess The Lyric (12-hour MSK cycle, real DB lyrics pairs + Fisher-Yates 4 options)
+function resolveLyricsChallengeForCycle(cycleId: string) {
+  const lyricTracks = getLyricGameTrackPool();
+  if (lyricTracks.length === 0) return null;
+  const secret = getDailyChallengeSecret();
+  const prevCycleId = getPreviousMoscow12hCycle(cycleId);
+  const prevSelection = pickDailyLyricsChallenge({
+    cycleId: prevCycleId,
+    lyricTracks,
+    recentTrackIds: [],
+    secret,
+  });
+  return pickDailyLyricsChallenge({
+    cycleId,
+    lyricTracks,
+    recentTrackIds: prevSelection ? [prevSelection.track.id] : [],
+    secret,
+  });
+}
+
+app.get('/api/games/guess-lyrics/round', (req: Request, res: Response) => {
+  const user = getSessionUser(req);
+  const { cycleId, nextResetAt } = getMoscow12hCycle();
+  const round = resolveLyricsChallengeForCycle(cycleId);
+
+  if (!round) {
+    res.status(404).json({ error: 'В архиве пока недостаточно текстов песен для этой игры.' });
+    return;
+  }
+
+  let alreadyCompleted = false;
+  let previousAttempt: any = null;
+  if (user) {
+    const row = db.prepare(`
+      SELECT * FROM daily_mini_game_attempts WHERE user_id = ? AND game_id = 'guess-lyrics' AND cycle_id = ?
+    `).get(user.id, cycleId) as any;
+    if (row) {
+      alreadyCompleted = true;
+      let parsedDetails: any = {};
+      try {
+        parsedDetails = JSON.parse(row.details_json || '{}');
+      } catch {}
+      previousAttempt = {
+        correct: Boolean(row.is_correct),
+        selected_option_id: row.selected_value,
+        correct_option_id: row.correct_value || round.correct_option_id,
+        correct_line: parsedDetails.correctLine || round.correct_line,
+        score: Number(row.score) || 0,
+        xp_earned: Number(row.xp_earned) || 0,
+        track: parsedDetails.track || {
+          id: round.track.id,
+          title: round.track.title,
+          album_title: round.track.album_title || 'Archive Release',
+          cover_url: round.track.cover_url,
+        },
+      };
+    }
+  }
+
+  res.json({
+    challenge_date: cycleId,
+    next_reset_at: nextResetAt,
+    refresh_interval_hours: 12,
+    timezone: 'MSK',
+    round_token: `lyrics:${cycleId}`,
+    prompt_line: round.prompt_line,
+    options: round.options,
+    already_completed: alreadyCompleted,
+    previous_attempt: previousAttempt,
+  });
+});
+
+app.post('/api/games/guess-lyrics/verify', (req: AuthRequest, res: Response) => {
+  const { challenge_date, selected_option_id } = req.body || {};
+  if (!selected_option_id || typeof selected_option_id !== 'string') {
+    res.status(400).json({ error: 'Не выбран вариант ответа.' });
+    return;
+  }
+
+  const user = getSessionUser(req);
+  const { cycleId, nextResetAt } = getMoscow12hCycle();
+
+  if (isValidMoscow12hCycle(challenge_date) && challenge_date !== cycleId) {
+    res.status(409).json({
+      error: 'Начался новый 12-часовой раунд (МСК) — доступна новая строчка!',
+      code: 'DAILY_ROLLOVER',
+      challenge_date: cycleId,
+      next_reset_at: nextResetAt,
+    });
+    return;
+  }
+
+  const round = resolveLyricsChallengeForCycle(cycleId);
+  if (!round) {
+    res.status(404).json({ error: 'Игра «Угадай строчку» временно недоступна.' });
+    return;
+  }
+
+  if (!round.options.some((o) => o.id === selected_option_id)) {
+    res.status(400).json({ error: 'Выбранный вариант не относится к текущему раунду.' });
+    return;
+  }
+
+  if (user) {
+    const existing = db.prepare(`
+      SELECT id FROM daily_mini_game_attempts WHERE user_id = ? AND game_id = 'guess-lyrics' AND cycle_id = ?
+    `).get(user.id, cycleId);
+    if (existing) {
+      res.status(400).json({
+        error: 'Вы уже прошли текущий раунд «Угадай строчку». Обновление в 00:00 и 12:00 МСК!',
+        already_completed: true,
+      });
+      return;
+    }
+  }
+
+  const isCorrect = selected_option_id === round.correct_option_id;
+  const baseXp = isCorrect ? 15 : 5;
+  const trackInfo = {
+    id: round.track.id,
+    title: round.track.title,
+    album_title: round.track.album_title || 'Archive Release',
+    cover_url: round.track.cover_url,
+  };
+
+  let xpEarned = baseXp;
+  let streakBonusXp = 0;
+  let streakBonusPercent = 0;
+  let nextStreak = 0;
+  let newlyUnlockedAchievements: UnlockedAchievementInfo[] = [];
+
+  if (user) {
+    try {
+      const saved = recordMiniGameAttempt({
+        userId: user.id,
+        gameId: 'guess-lyrics',
+        xpSource: 'guess_lyrics',
+        cycleId,
+        isCorrect,
+        baseXp,
+        selectedValue: selected_option_id,
+        correctValue: round.correct_option_id,
+        details: {
+          isCorrect,
+          promptLine: round.prompt_line,
+          correctLine: round.correct_line,
+          track: trackInfo,
+        },
+      });
+      xpEarned = saved.xpEarned;
+      streakBonusXp = saved.streakBonusXp;
+      streakBonusPercent = saved.streakBonusPercent;
+      nextStreak = saved.nextStreak;
+      newlyUnlockedAchievements = saved.newlyUnlockedAchievements;
+    } catch (err: any) {
+      if (String(err?.message || '').includes('UNIQUE')) {
+        res.status(400).json({ error: 'Вы уже прошли этот раунд.', already_completed: true });
+        return;
+      }
+      throw err;
+    }
+  }
+
+  res.json({
+    correct: isCorrect,
+    selected_option_id,
+    correct_option_id: round.correct_option_id,
+    correct_line: round.correct_line,
+    score: isCorrect ? 100 : 0,
+    base_xp: baseXp,
+    streak_bonus_xp: streakBonusXp,
+    streak_bonus_percent: streakBonusPercent,
+    daily_streak: nextStreak,
+    xp_earned: xpEarned,
+    track: trackInfo,
+    challenge_date: cycleId,
+    next_reset_at: nextResetAt,
+    refresh_interval_hours: 12,
+    timezone: 'MSK',
+    newly_unlocked_achievements: newlyUnlockedAchievements,
+  });
+});
+
+// 4. Reverse Track (12-hour MSK cycle, 5-second reversed audio via Web Audio API)
+function resolveReverseTrackForCycle(cycleId: string) {
+  const { playablePool, allTitles } = getPlayableGameTrackPool();
+  if (playablePool.length === 0) return null;
+  const secret = getDailyChallengeSecret();
+  const prevCycleId = getPreviousMoscow12hCycle(cycleId);
+  const guessTrackToday = getOrCreateDailyTrackChallenge(cycleId);
+  const prevReverse = pickDailyReverseTrackChallenge({
+    cycleId: prevCycleId,
+    playableTracks: playablePool,
+    allTitleCandidates: allTitles,
+    excludeTrackIds: [],
+    secret,
+  });
+  const excludeIds = [prevReverse?.track.id, guessTrackToday?.track.id].filter(Boolean) as string[];
+  return pickDailyReverseTrackChallenge({
+    cycleId,
+    playableTracks: playablePool,
+    allTitleCandidates: allTitles,
+    excludeTrackIds: excludeIds,
+    secret,
+  });
+}
+
+app.get('/api/games/reverse-track/round', (req: Request, res: Response) => {
+  const user = getSessionUser(req);
+  const { cycleId, nextResetAt } = getMoscow12hCycle();
+  const round = resolveReverseTrackForCycle(cycleId);
+
+  if (!round) {
+    res.status(404).json({ error: 'В архиве пока нет доступных аудиофайлов для игры «Задом наперёд».' });
+    return;
+  }
+
+  let alreadyCompleted = false;
+  let previousAttempt: any = null;
+  if (user) {
+    const row = db.prepare(`
+      SELECT * FROM daily_mini_game_attempts WHERE user_id = ? AND game_id = 'reverse-track' AND cycle_id = ?
+    `).get(user.id, cycleId) as any;
+    if (row) {
+      alreadyCompleted = true;
+      const trackReveal = getTrackRevealInfo(row.correct_value || round.track.id) || {
+        id: round.track.id,
+        title: round.track.title,
+      };
+      previousAttempt = {
+        correct: Boolean(row.is_correct),
+        selected_track_id: row.selected_value,
+        correct_track_id: row.correct_value || round.track.id,
+        score: Number(row.score) || 0,
+        xp_earned: Number(row.xp_earned) || 0,
+        track: trackReveal,
+      };
+    }
+  }
+
+  res.json({
+    challenge_date: cycleId,
+    next_reset_at: nextResetAt,
+    refresh_interval_hours: 12,
+    timezone: 'MSK',
+    round_token: `reverse:${cycleId}`,
+    audio_url: round.track.audio_url,
+    snippet_start: round.snippet_start_seconds,
+    snippet_start_ratio: round.snippet_start_ratio,
+    snippet_duration: round.snippet_duration_seconds,
+    options: round.options,
+    already_completed: alreadyCompleted,
+    previous_attempt: previousAttempt,
+  });
+});
+
+app.post('/api/games/reverse-track/verify', (req: AuthRequest, res: Response) => {
+  const { challenge_date, selected_track_id } = req.body || {};
+  if (!selected_track_id || typeof selected_track_id !== 'string') {
+    res.status(400).json({ error: 'Missing selected_track_id' });
+    return;
+  }
+
+  const user = getSessionUser(req);
+  const { cycleId, nextResetAt } = getMoscow12hCycle();
+
+  if (isValidMoscow12hCycle(challenge_date) && challenge_date !== cycleId) {
+    res.status(409).json({
+      error: 'Начался новый 12-часовой раунд (МСК) — доступен свежий трек!',
+      code: 'DAILY_ROLLOVER',
+      challenge_date: cycleId,
+      next_reset_at: nextResetAt,
+    });
+    return;
+  }
+
+  const round = resolveReverseTrackForCycle(cycleId);
+  if (!round) {
+    res.status(404).json({ error: 'Испытание «Задом наперёд» временно недоступно.' });
+    return;
+  }
+
+  if (!round.options.some((o) => o.id === selected_track_id)) {
+    res.status(400).json({ error: 'Selected option is not valid for the current round.' });
+    return;
+  }
+
+  if (user) {
+    const existing = db.prepare(`
+      SELECT id FROM daily_mini_game_attempts WHERE user_id = ? AND game_id = 'reverse-track' AND cycle_id = ?
+    `).get(user.id, cycleId);
+    if (existing) {
+      res.status(400).json({
+        error: 'Вы уже прошли текущий раунд «Задом наперёд». Обновление в 00:00 и 12:00 МСК!',
+        already_completed: true,
+      });
+      return;
+    }
+  }
+
+  const correctTrackId = round.track.id;
+  const isCorrect = selected_track_id === correctTrackId;
+  const baseXp = isCorrect ? 20 : 5;
+  const trackInfo = getTrackRevealInfo(correctTrackId) || {
+    id: round.track.id,
+    title: round.track.title,
+    album_title: round.track.album_title || 'Single',
+    cover_url: round.track.cover_url,
+  };
+
+  let xpEarned = baseXp;
+  let streakBonusXp = 0;
+  let streakBonusPercent = 0;
+  let nextStreak = 0;
+  let newlyUnlockedAchievements: UnlockedAchievementInfo[] = [];
+
+  if (user) {
+    try {
+      const saved = recordMiniGameAttempt({
+        userId: user.id,
+        gameId: 'reverse-track',
+        xpSource: 'reverse_track',
+        cycleId,
+        isCorrect,
+        baseXp,
+        selectedValue: selected_track_id,
+        correctValue: correctTrackId,
+        details: { isCorrect, correctTrackId },
+      });
+      xpEarned = saved.xpEarned;
+      streakBonusXp = saved.streakBonusXp;
+      streakBonusPercent = saved.streakBonusPercent;
+      nextStreak = saved.nextStreak;
+      newlyUnlockedAchievements = saved.newlyUnlockedAchievements;
+    } catch (err: any) {
+      if (String(err?.message || '').includes('UNIQUE')) {
+        res.status(400).json({ error: 'Вы уже прошли этот раунд.', already_completed: true });
+        return;
+      }
+      throw err;
+    }
+  }
+
+  res.json({
+    correct: isCorrect,
+    correct_track_id: correctTrackId,
+    selected_track_id,
+    score: isCorrect ? 100 : 0,
+    base_xp: baseXp,
+    streak_bonus_xp: streakBonusXp,
+    streak_bonus_percent: streakBonusPercent,
+    daily_streak: nextStreak,
+    xp_earned: xpEarned,
+    track: trackInfo,
+    challenge_date: cycleId,
+    next_reset_at: nextResetAt,
+    refresh_interval_hours: 12,
+    timezone: 'MSK',
+    newly_unlocked_achievements: newlyUnlockedAchievements,
+  });
+});
+
+// 5. Speed Track 0.5x / 2.5x (12-hour MSK cycle, 5 seconds real listening time with pitch shift)
+function resolveSpeedTrackForCycle(cycleId: string) {
+  const { playablePool, allTitles } = getPlayableGameTrackPool();
+  if (playablePool.length === 0) return null;
+  const secret = getDailyChallengeSecret();
+  const prevCycleId = getPreviousMoscow12hCycle(cycleId);
+  const guessTrackToday = getOrCreateDailyTrackChallenge(cycleId);
+  const reverseToday = resolveReverseTrackForCycle(cycleId);
+  const prevSpeed = pickDailySpeedTrackChallenge({
+    cycleId: prevCycleId,
+    playableTracks: playablePool,
+    allTitleCandidates: allTitles,
+    excludeTrackIds: [],
+    secret,
+  });
+  const excludeIds = [prevSpeed?.track.id, reverseToday?.track.id, guessTrackToday?.track.id].filter(
+    Boolean
+  ) as string[];
+  return pickDailySpeedTrackChallenge({
+    cycleId,
+    playableTracks: playablePool,
+    allTitleCandidates: allTitles,
+    excludeTrackIds: excludeIds,
+    secret,
+  });
+}
+
+app.get('/api/games/speed-track/round', (req: Request, res: Response) => {
+  const user = getSessionUser(req);
+  const { cycleId, nextResetAt } = getMoscow12hCycle();
+  const round = resolveSpeedTrackForCycle(cycleId);
+
+  if (!round) {
+    res.status(404).json({ error: 'В архиве пока нет доступных аудиофайлов для игры «0.5x / 2.5x».' });
+    return;
+  }
+
+  let alreadyCompleted = false;
+  let previousAttempt: any = null;
+  if (user) {
+    const row = db.prepare(`
+      SELECT * FROM daily_mini_game_attempts WHERE user_id = ? AND game_id = 'speed-track' AND cycle_id = ?
+    `).get(user.id, cycleId) as any;
+    if (row) {
+      alreadyCompleted = true;
+      const trackReveal = getTrackRevealInfo(row.correct_value || round.track.id) || {
+        id: round.track.id,
+        title: round.track.title,
+      };
+      previousAttempt = {
+        correct: Boolean(row.is_correct),
+        selected_track_id: row.selected_value,
+        correct_track_id: row.correct_value || round.track.id,
+        score: Number(row.score) || 0,
+        xp_earned: Number(row.xp_earned) || 0,
+        speed_mode: round.speed_mode,
+        track: trackReveal,
+      };
+    }
+  }
+
+  res.json({
+    challenge_date: cycleId,
+    next_reset_at: nextResetAt,
+    refresh_interval_hours: 12,
+    timezone: 'MSK',
+    round_token: `speed:${cycleId}`,
+    audio_url: round.track.audio_url,
+    speed_mode: round.speed_mode,
+    snippet_start: round.snippet_start_seconds,
+    snippet_start_ratio: round.snippet_start_ratio,
+    snippet_duration: round.snippet_duration_seconds,
+    options: round.options,
+    already_completed: alreadyCompleted,
+    previous_attempt: previousAttempt,
+  });
+});
+
+app.post('/api/games/speed-track/verify', (req: AuthRequest, res: Response) => {
+  const { challenge_date, selected_track_id } = req.body || {};
+  if (!selected_track_id || typeof selected_track_id !== 'string') {
+    res.status(400).json({ error: 'Missing selected_track_id' });
+    return;
+  }
+
+  const user = getSessionUser(req);
+  const { cycleId, nextResetAt } = getMoscow12hCycle();
+
+  if (isValidMoscow12hCycle(challenge_date) && challenge_date !== cycleId) {
+    res.status(409).json({
+      error: 'Начался новый 12-часовой раунд (МСК) — доступен свежий трек!',
+      code: 'DAILY_ROLLOVER',
+      challenge_date: cycleId,
+      next_reset_at: nextResetAt,
+    });
+    return;
+  }
+
+  const round = resolveSpeedTrackForCycle(cycleId);
+  if (!round) {
+    res.status(404).json({ error: 'Испытание «0.5x / 2.5x» временно недоступно.' });
+    return;
+  }
+
+  if (!round.options.some((o) => o.id === selected_track_id)) {
+    res.status(400).json({ error: 'Selected option is not valid for the current round.' });
+    return;
+  }
+
+  if (user) {
+    const existing = db.prepare(`
+      SELECT id FROM daily_mini_game_attempts WHERE user_id = ? AND game_id = 'speed-track' AND cycle_id = ?
+    `).get(user.id, cycleId);
+    if (existing) {
+      res.status(400).json({
+        error: 'Вы уже прошли текущий раунд «0.5x / 2.5x». Обновление в 00:00 и 12:00 МСК!',
+        already_completed: true,
+      });
+      return;
+    }
+  }
+
+  const correctTrackId = round.track.id;
+  const isCorrect = selected_track_id === correctTrackId;
+  const baseXp = isCorrect ? 20 : 5;
+  const trackInfo = getTrackRevealInfo(correctTrackId) || {
+    id: round.track.id,
+    title: round.track.title,
+    album_title: round.track.album_title || 'Single',
+    cover_url: round.track.cover_url,
+  };
+
+  let xpEarned = baseXp;
+  let streakBonusXp = 0;
+  let streakBonusPercent = 0;
+  let nextStreak = 0;
+  let newlyUnlockedAchievements: UnlockedAchievementInfo[] = [];
+
+  if (user) {
+    try {
+      const saved = recordMiniGameAttempt({
+        userId: user.id,
+        gameId: 'speed-track',
+        xpSource: 'speed_track',
+        cycleId,
+        isCorrect,
+        baseXp,
+        selectedValue: selected_track_id,
+        correctValue: correctTrackId,
+        details: { isCorrect, correctTrackId, speedMode: round.speed_mode },
+      });
+      xpEarned = saved.xpEarned;
+      streakBonusXp = saved.streakBonusXp;
+      streakBonusPercent = saved.streakBonusPercent;
+      nextStreak = saved.nextStreak;
+      newlyUnlockedAchievements = saved.newlyUnlockedAchievements;
+    } catch (err: any) {
+      if (String(err?.message || '').includes('UNIQUE')) {
+        res.status(400).json({ error: 'Вы уже прошли этот раунд.', already_completed: true });
+        return;
+      }
+      throw err;
+    }
+  }
+
+  res.json({
+    correct: isCorrect,
+    correct_track_id: correctTrackId,
+    selected_track_id,
+    speed_mode: round.speed_mode,
+    score: isCorrect ? 100 : 0,
+    base_xp: baseXp,
+    streak_bonus_xp: streakBonusXp,
+    streak_bonus_percent: streakBonusPercent,
+    daily_streak: nextStreak,
+    xp_earned: xpEarned,
+    track: trackInfo,
+    challenge_date: cycleId,
+    next_reset_at: nextResetAt,
+    refresh_interval_hours: 12,
+    timezone: 'MSK',
+    newly_unlocked_achievements: newlyUnlockedAchievements,
+  });
+});
+
+interface UnlockedAchievementInfo {
+  id: string;
+  slug: string;
+  title_ru: string;
+  title_en: string;
+  xp_reward: number;
+  rarity: string;
+  difficulty_tier: string;
+  icon: string;
+}
+
+// Authoritative metric collector shared by achievement unlock evaluator and profile progress bars
+function collectUserAchievementMetrics(userId: string): AchievementMetrics | null {
+  const row = db.prepare(`
+    SELECT
+      p.total_xp, p.level, p.daily_streak, p.bio, p.custom_status,
+      (SELECT COUNT(*) FROM game_attempts WHERE user_id = ?) as games_played,
+      (SELECT COUNT(*) FROM game_attempts WHERE user_id = ? AND game_id = 'guess-track') as guess_played,
+      (SELECT COUNT(*) FROM game_attempts WHERE user_id = ? AND game_id = 'guess-track' AND score > 0) as guess_wins,
+      (SELECT COUNT(*) FROM game_attempts WHERE user_id = ? AND game_id = 'daily-quiz') as quiz_played,
+      (SELECT COUNT(*) FROM game_attempts WHERE user_id = ? AND game_id = 'daily-quiz' AND details_json IS NOT NULL AND json_valid(details_json) = 1 AND CAST(json_extract(details_json, '$.total') AS INTEGER) > 0 AND CAST(json_extract(details_json, '$.correctCount') AS INTEGER) >= CAST(json_extract(details_json, '$.total') AS INTEGER)) as quiz_perfect,
+      (SELECT COUNT(*) FROM user_inventory WHERE user_id = ?) as purchases_count,
+      (SELECT COUNT(*) FROM user_inventory WHERE user_id = ? AND is_equipped = 1) as equipped_count,
+      (SELECT COUNT(*) FROM posts WHERE user_id = ?) as posts_count,
+      (SELECT COUNT(*) FROM comments WHERE user_id = ?) as comments_count,
+      (SELECT COUNT(*) FROM creations WHERE user_id = ?) as creations_count,
+      (SELECT COUNT(*) FROM follows WHERE following_id = ?) as followers_count,
+      (SELECT COUNT(*) FROM follows WHERE follower_id = ?) as following_count,
+      (SELECT COUNT(*) FROM post_reads WHERE user_id = ?) as posts_read_count,
+      (SELECT COUNT(*) FROM promo_code_uses WHERE user_id = ?) as promo_redeemed_count,
+      (SELECT COALESCE(MAX(completions), 0) FROM user_track_plays WHERE user_id = ?) as max_track_completions,
+      (SELECT COUNT(*) FROM user_secret_flags WHERE user_id = ? AND flag_key = 'midnight_msk') as visited_midnight_msk,
+      (SELECT COUNT(*) FROM user_secret_flags WHERE user_id = ? AND flag_key = 'curious_rose') as clicked_secret_rose
+    FROM profiles p
+    WHERE p.user_id = ?
+  `).get(
+    userId, userId, userId, userId, userId,
+    userId, userId, userId, userId, userId,
+    userId, userId, userId, userId, userId,
+    userId, userId, userId
+  ) as any;
+
+  if (!row) return null;
+
+  return {
+    isRegistered: true,
+    hasCustomProfile: Boolean((row.bio && String(row.bio).trim()) || (row.custom_status && String(row.custom_status).trim())),
+    gamesPlayed: Number(row.games_played || 0),
+    guessTrackPlayed: Number(row.guess_played || 0),
+    guessTrackWins: Number(row.guess_wins || 0),
+    quizPlayed: Number(row.quiz_played || 0),
+    quizPerfectRuns: Number(row.quiz_perfect || 0),
+    dailyStreak: Number(row.daily_streak || 0),
+    totalXp: Number(row.total_xp || 0),
+    level: Number(row.level || 1),
+    purchasesCount: Number(row.purchases_count || 0),
+    equippedItemsCount: Number(row.equipped_count || 0),
+    postsCount: Number(row.posts_count || 0),
+    commentsCount: Number(row.comments_count || 0),
+    creationsCount: Number(row.creations_count || 0),
+    followersCount: Number(row.followers_count || 0),
+    followingCount: Number(row.following_count || 0),
+    postsReadCount: Number(row.posts_read_count || 0),
+    promoRedeemedCount: Number(row.promo_redeemed_count || 0),
+    maxTrackCompletions: Number(row.max_track_completions || 0),
+    visitedMidnightMsk: Number(row.visited_midnight_msk || 0) > 0,
+    clickedSecretRose: Number(row.clicked_secret_rose || 0) > 0,
+  };
+}
+
+// Helper for unlocking achievements safely (idempotent; awards balanced xp_reward ONCE on initial unlock)
+function unlockAchievement(userId: string, achievementSlug: string): UnlockedAchievementInfo | null {
+  const ach = db
+    .prepare('SELECT id, slug, title_ru, title_en, xp_reward, rarity, difficulty_tier, icon FROM achievements WHERE slug = ?')
+    .get(achievementSlug) as UnlockedAchievementInfo | undefined;
+  if (!ach) return null;
+
+  const insertResult = db.prepare(`
     INSERT OR IGNORE INTO user_achievements (id, user_id, achievement_id)
     VALUES (?, ?, ?)
   `).run('uach_' + crypto.randomUUID().slice(0, 8), userId, ach.id);
+
+  if (insertResult.changes !== 1) {
+    return null;
+  }
+
+  const reward = Math.max(0, Number(ach.xp_reward || 0));
+  if (reward > 0) {
+    const prev = db.prepare('SELECT xp, total_xp FROM profiles WHERE user_id = ?').get(userId) as
+      | { xp: number; total_xp: number }
+      | undefined;
+    if (prev) {
+      const nextXp = Number(prev.xp || 0) + reward;
+      const nextTotalXp = Number(prev.total_xp || 0) + reward;
+      const { level } = calculateLevelFromXp(nextTotalXp);
+
+      db.prepare(`
+        UPDATE profiles
+        SET xp = ?, total_xp = ?, level = ?, updated_at = datetime('now')
+        WHERE user_id = ?
+      `).run(nextXp, nextTotalXp, level, userId);
+
+      db.prepare(`
+        INSERT INTO xp_transactions (id, user_id, amount, source, details)
+        VALUES (?, ?, ?, 'achievement', ?)
+      `).run('xpt_' + crypto.randomUUID().slice(0, 8), userId, reward, `Достижение «${ach.title_ru}»`);
+    }
+  }
+
+  return ach;
 }
 
-// Authoritative server-side achievement evaluator using real database records
-function evaluateUserAchievements(userId: string): string[] {
+// Authoritative server-side achievement evaluator using real database records; returns newly unlocked achievements
+function evaluateUserAchievements(userId: string): UnlockedAchievementInfo[] {
   try {
-    const row = db.prepare(`
-      SELECT
-        p.total_xp, p.level, p.daily_streak, p.bio, p.custom_status,
-        (SELECT COUNT(*) FROM game_attempts WHERE user_id = ?) as games_played,
-        (SELECT COUNT(*) FROM game_attempts WHERE user_id = ? AND game_id = 'guess-track') as guess_played,
-        (SELECT COUNT(*) FROM game_attempts WHERE user_id = ? AND game_id = 'guess-track' AND score > 0) as guess_wins,
-        (SELECT COUNT(*) FROM game_attempts WHERE user_id = ? AND game_id = 'daily-quiz') as quiz_played,
-        (SELECT COUNT(*) FROM game_attempts WHERE user_id = ? AND game_id = 'daily-quiz' AND details_json IS NOT NULL AND json_valid(details_json) = 1 AND CAST(json_extract(details_json, '$.total') AS INTEGER) > 0 AND CAST(json_extract(details_json, '$.correctCount') AS INTEGER) >= CAST(json_extract(details_json, '$.total') AS INTEGER)) as quiz_perfect,
-        (SELECT COUNT(*) FROM user_inventory WHERE user_id = ?) as purchases_count,
-        (SELECT COUNT(*) FROM user_inventory WHERE user_id = ? AND is_equipped = 1) as equipped_count,
-        (SELECT COUNT(*) FROM posts WHERE user_id = ?) as posts_count,
-        (SELECT COUNT(*) FROM comments WHERE user_id = ?) as comments_count,
-        (SELECT COUNT(*) FROM creations WHERE user_id = ?) as creations_count,
-        (SELECT COUNT(*) FROM follows WHERE following_id = ?) as followers_count,
-        (SELECT COUNT(*) FROM follows WHERE follower_id = ?) as following_count
-      FROM profiles p
-      WHERE p.user_id = ?
-    `).get(
-      userId, userId, userId, userId, userId,
-      userId, userId, userId, userId, userId,
-      userId, userId, userId
-    ) as any;
+    const metrics = collectUserAchievementMetrics(userId);
+    if (!metrics) return [];
 
-    if (!row) return [];
-
-    const eligibleSlugs = evaluateAchievementSlugs({
-      isRegistered: true,
-      hasCustomProfile: Boolean((row.bio && String(row.bio).trim()) || (row.custom_status && String(row.custom_status).trim())),
-      gamesPlayed: Number(row.games_played || 0),
-      guessTrackPlayed: Number(row.guess_played || 0),
-      guessTrackWins: Number(row.guess_wins || 0),
-      quizPlayed: Number(row.quiz_played || 0),
-      quizPerfectRuns: Number(row.quiz_perfect || 0),
-      dailyStreak: Number(row.daily_streak || 0),
-      totalXp: Number(row.total_xp || 0),
-      level: Number(row.level || 1),
-      purchasesCount: Number(row.purchases_count || 0),
-      equippedItemsCount: Number(row.equipped_count || 0),
-      postsCount: Number(row.posts_count || 0),
-      commentsCount: Number(row.comments_count || 0),
-      creationsCount: Number(row.creations_count || 0),
-      followersCount: Number(row.followers_count || 0),
-      followingCount: Number(row.following_count || 0),
-    });
+    const eligibleSlugs = evaluateAchievementSlugs(metrics);
+    const newlyUnlocked: UnlockedAchievementInfo[] = [];
 
     for (const slug of eligibleSlugs) {
-      unlockAchievement(userId, slug);
+      const unlocked = unlockAchievement(userId, slug);
+      if (unlocked) {
+        newlyUnlocked.push(unlocked);
+      }
     }
-    return eligibleSlugs;
+    return newlyUnlocked;
   } catch (err) {
     console.warn('[Achievements] Failed to evaluate achievements for user:', userId, err);
     return [];
   }
 }
 
+// Secret & Activity Achievement Triggers (Server-authoritative)
+app.post('/api/achievements/check-visit', requireAuth, (req: AuthRequest, res: Response) => {
+  const userId = req.user!.id;
+  const inMidnightWindow = isMoscowMidnightWindow();
+  let newlyUnlocked: UnlockedAchievementInfo[] = [];
+
+  if (inMidnightWindow) {
+    db.prepare(`
+      INSERT OR IGNORE INTO user_secret_flags (user_id, flag_key, count)
+      VALUES (?, 'midnight_msk', 1)
+    `).run(userId);
+    newlyUnlocked = evaluateUserAchievements(userId);
+  }
+
+  res.json({
+    ok: true,
+    midnight_window: inMidnightWindow,
+    newly_unlocked_achievements: newlyUnlocked,
+  });
+});
+
+app.post('/api/achievements/track-complete', requireAuth, (req: AuthRequest, res: Response) => {
+  const userId = req.user!.id;
+  const rawTrackId = String(req.body?.track_id || '').trim().slice(0, 120);
+  if (!rawTrackId) {
+    res.status(400).json({ error: 'track_id is required.' });
+    return;
+  }
+
+  let completions = 1;
+  let newlyUnlocked: UnlockedAchievementInfo[] = [];
+
+  db.transaction(() => {
+    db.prepare(`
+      INSERT INTO user_track_plays (user_id, track_id, completions, updated_at)
+      VALUES (?, ?, 1, datetime('now'))
+      ON CONFLICT(user_id, track_id) DO UPDATE SET
+        completions = completions + 1,
+        updated_at = datetime('now')
+    `).run(userId, rawTrackId);
+
+    const row = db
+      .prepare('SELECT completions FROM user_track_plays WHERE user_id = ? AND track_id = ?')
+      .get(userId, rawTrackId) as { completions?: number } | undefined;
+    completions = Number(row?.completions || 1);
+    newlyUnlocked = evaluateUserAchievements(userId);
+  })();
+
+  res.json({
+    ok: true,
+    track_id: rawTrackId,
+    completions,
+    newly_unlocked_achievements: newlyUnlocked,
+  });
+});
+
+app.post('/api/achievements/easter-egg', requireAuth, (req: AuthRequest, res: Response) => {
+  const userId = req.user!.id;
+  const key = String(req.body?.key || '').trim();
+  if (key !== 'curious_rose') {
+    res.status(400).json({ error: 'Unknown easter egg key.' });
+    return;
+  }
+
+  let newlyUnlocked: UnlockedAchievementInfo[] = [];
+  db.transaction(() => {
+    db.prepare(`
+      INSERT INTO user_secret_flags (user_id, flag_key, count)
+      VALUES (?, 'curious_rose', 1)
+      ON CONFLICT(user_id, flag_key) DO UPDATE SET count = count + 1
+    `).run(userId);
+    newlyUnlocked = evaluateUserAchievements(userId);
+  })();
+
+  res.json({
+    ok: true,
+    newly_unlocked_achievements: newlyUnlocked,
+  });
+});
+
 // 3. Leaderboard (All-Time, Weekly, Monthly + optional Game filter)
 app.get('/api/games/leaderboard', (req: Request, res: Response) => {
   const rawTimeframe = String(req.query.timeframe || 'all');
   const timeframe = rawTimeframe === 'weekly' || rawTimeframe === 'monthly' ? rawTimeframe : 'all';
   const rawGame = String(req.query.game || 'all');
-  const gameFilter = rawGame === 'guess-track' || rawGame === 'daily-quiz' ? rawGame : 'all';
+  const ALLOWED_LEADERBOARD_GAMES = new Set([
+    'guess-track',
+    'daily-quiz',
+    'guess-lyrics',
+    'reverse-track',
+    'speed-track',
+  ]);
+  const gameFilter = ALLOWED_LEADERBOARD_GAMES.has(rawGame) ? rawGame : 'all';
 
   if (gameFilter !== 'all') {
     const timeClause =
@@ -2283,7 +3779,7 @@ app.get('/api/games/leaderboard', (req: Request, res: Response) => {
           : '';
     const leaders = db.prepare(`
       SELECT u.id, u.nickname, p.display_name, p.avatar_url, p.level,
-             p.equipped_frame, p.equipped_banner, p.equipped_name_style, p.equipped_badge,
+             p.equipped_frame, p.equipped_banner, p.equipped_name_style, p.equipped_badge, p.equipped_title,
              COALESCE(SUM(ga.xp_earned), 0) as xp,
              COALESCE(SUM(ga.score), 0) as score,
              p.daily_streak,
@@ -2303,7 +3799,7 @@ app.get('/api/games/leaderboard', (req: Request, res: Response) => {
 
   let query = `
     SELECT u.id, u.nickname, p.display_name, p.avatar_url, p.level, p.total_xp as xp, p.daily_streak,
-           p.equipped_frame, p.equipped_banner, p.equipped_name_style, p.equipped_badge,
+           p.equipped_frame, p.equipped_banner, p.equipped_name_style, p.equipped_badge, p.equipped_title,
            (SELECT COUNT(*) FROM game_attempts WHERE user_id = u.id) as games_played
     FROM users u
     JOIN profiles p ON p.user_id = u.id
@@ -2316,7 +3812,7 @@ app.get('/api/games/leaderboard', (req: Request, res: Response) => {
   if (timeframe === 'weekly') {
     query = `
       SELECT u.id, u.nickname, p.display_name, p.avatar_url, p.level,
-             p.equipped_frame, p.equipped_banner, p.equipped_name_style, p.equipped_badge,
+             p.equipped_frame, p.equipped_banner, p.equipped_name_style, p.equipped_badge, p.equipped_title,
              COALESCE(SUM(xt.amount), 0) as xp, p.daily_streak,
              (SELECT COUNT(*) FROM game_attempts ga WHERE ga.user_id = u.id AND datetime(ga.created_at) >= datetime('now', '-7 days')) as games_played
       FROM users u
@@ -2331,7 +3827,7 @@ app.get('/api/games/leaderboard', (req: Request, res: Response) => {
   } else if (timeframe === 'monthly') {
     query = `
       SELECT u.id, u.nickname, p.display_name, p.avatar_url, p.level,
-             p.equipped_frame, p.equipped_banner, p.equipped_name_style, p.equipped_badge,
+             p.equipped_frame, p.equipped_banner, p.equipped_name_style, p.equipped_badge, p.equipped_title,
              COALESCE(SUM(xt.amount), 0) as xp, p.daily_streak,
              (SELECT COUNT(*) FROM game_attempts ga WHERE ga.user_id = u.id AND datetime(ga.created_at) >= datetime('now', '-30 days')) as games_played
       FROM users u
@@ -2345,8 +3841,106 @@ app.get('/api/games/leaderboard', (req: Request, res: Response) => {
     `;
   }
 
-  const leaders = db.prepare(query).all();
+  const rawLeaders = db.prepare(query).all() as any[];
+  const leaders = rawLeaders.map((row) => ({
+    ...row,
+    level: timeframe === 'all' ? calculateLevelFromXp(Number(row.xp || 0)).level : row.level,
+  }));
   res.json({ leaders, timeframe, game: gameFilter });
+});
+
+// ----------------------------------------------------------------------------
+// API: PROMO CODES
+// ----------------------------------------------------------------------------
+
+app.post('/api/promo/redeem', requireAuth, promoRateLimit, (req: AuthRequest, res: Response) => {
+  if (!req.user) {
+    res.status(401).json({ error: 'Authentication required' });
+    return;
+  }
+
+  const normalizedCode = normalizePromoCode(String(req.body?.code || ''));
+  if (!normalizedCode || normalizedCode.length > 64) {
+    res.status(400).json({ error: 'Введите промокод.' });
+    return;
+  }
+
+  const promo = db
+    .prepare('SELECT id, code, xp_reward, is_active FROM promo_codes WHERE LOWER(TRIM(code)) = ? LIMIT 1')
+    .get(normalizedCode) as { id: string; code: string; xp_reward: number; is_active: number } | undefined;
+
+  if (!promo || !promo.is_active) {
+    res.status(404).json({ error: 'Неверный промокод.' });
+    return;
+  }
+
+  const alreadyUsed = db
+    .prepare('SELECT id FROM promo_code_uses WHERE promo_code_id = ? AND user_id = ? LIMIT 1')
+    .get(promo.id, req.user.id);
+  if (alreadyUsed) {
+    res.status(409).json({ error: 'Вы уже использовали этот промокод.' });
+    return;
+  }
+
+  let updatedXp = 0;
+  let updatedTotalXp = 0;
+  let updatedLevel = 1;
+  let newlyUnlockedAchievements: UnlockedAchievementInfo[] = [];
+
+  try {
+    db.transaction(() => {
+      db.prepare(`
+        INSERT INTO promo_code_uses (id, promo_code_id, user_id, xp_awarded)
+        VALUES (?, ?, ?, ?)
+      `).run('pcu_' + crypto.randomUUID().slice(0, 10), promo.id, req.user!.id, promo.xp_reward);
+
+      db.prepare(`
+        INSERT INTO xp_transactions (id, user_id, amount, source, details)
+        VALUES (?, ?, ?, 'promo_code', ?)
+      `).run('xpt_' + crypto.randomUUID().slice(0, 8), req.user!.id, promo.xp_reward, `Промокод «${promo.code}»`);
+
+      const prev = db
+        .prepare('SELECT xp, total_xp FROM profiles WHERE user_id = ?')
+        .get(req.user!.id) as { xp: number; total_xp: number } | undefined;
+      updatedXp = Number(prev?.xp || 0) + promo.xp_reward;
+      updatedTotalXp = Number(prev?.total_xp || 0) + promo.xp_reward;
+      updatedLevel = calculateLevelFromXp(updatedTotalXp).level;
+
+      db.prepare(`
+        UPDATE profiles
+        SET xp = ?, total_xp = ?, level = ?, updated_at = datetime('now')
+        WHERE user_id = ?
+      `).run(updatedXp, updatedTotalXp, updatedLevel, req.user!.id);
+
+      newlyUnlockedAchievements = evaluateUserAchievements(req.user!.id);
+      if (newlyUnlockedAchievements.length > 0) {
+        const afterAch = db
+          .prepare('SELECT xp, total_xp, level FROM profiles WHERE user_id = ?')
+          .get(req.user!.id) as { xp: number; total_xp: number; level: number } | undefined;
+        if (afterAch) {
+          updatedXp = Number(afterAch.xp || updatedXp);
+          updatedTotalXp = Number(afterAch.total_xp || updatedTotalXp);
+          updatedLevel = Number(afterAch.level || updatedLevel);
+        }
+      }
+    })();
+  } catch (err: any) {
+    if (String(err?.message || '').includes('UNIQUE')) {
+      res.status(409).json({ error: 'Вы уже использовали этот промокод.' });
+      return;
+    }
+    throw err;
+  }
+
+  res.json({
+    ok: true,
+    code: promo.code,
+    xp_reward: promo.xp_reward,
+    xp: updatedXp,
+    total_xp: updatedTotalXp,
+    level: updatedLevel,
+    newly_unlocked_achievements: newlyUnlockedAchievements,
+  });
 });
 
 // ----------------------------------------------------------------------------
@@ -2386,6 +3980,7 @@ const SHOP_CATEGORY_COLUMN_MAP: Record<string, string> = {
   banner: 'equipped_banner',
   name_style: 'equipped_name_style',
   badge: 'equipped_badge',
+  title: 'equipped_title',
   theme: 'equipped_theme',
   effect: 'equipped_effect',
 };
@@ -2452,10 +4047,10 @@ app.post('/api/shop/buy', requireAuth, (req: AuthRequest, res: Response) => {
     return;
   }
 
-  evaluateUserAchievements(userId);
+  const newlyUnlocked = evaluateUserAchievements(userId);
 
   const updatedProfile = db.prepare('SELECT xp, total_xp, level FROM profiles WHERE user_id = ?').get(userId) as any;
-  res.json({ ok: true, new_xp: updatedProfile.xp, profile: updatedProfile });
+  res.json({ ok: true, new_xp: updatedProfile.xp, profile: updatedProfile, newly_unlocked_achievements: newlyUnlocked });
 });
 
 app.post('/api/shop/equip', requireAuth, (req: AuthRequest, res: Response) => {
@@ -2507,8 +4102,13 @@ app.post('/api/shop/equip', requireAuth, (req: AuthRequest, res: Response) => {
     }
   })();
 
-  evaluateUserAchievements(userId);
-  res.json({ ok: true, is_equipped: shouldEquip, category: owned.category });
+  const newlyUnlocked = evaluateUserAchievements(userId);
+  const equippedState = db.prepare(`
+    SELECT equipped_frame, equipped_banner, equipped_name_style, equipped_badge,
+           equipped_title, equipped_theme, equipped_effect
+    FROM profiles WHERE user_id = ?
+  `).get(userId);
+  res.json({ ok: true, is_equipped: shouldEquip, category: owned.category, equipped: equippedState, newly_unlocked_achievements: newlyUnlocked });
 });
 
 app.get('/api/shop/inventory', requireAuth, (req: AuthRequest, res: Response) => {
@@ -2581,9 +4181,11 @@ app.get('/api/community/posts', (req: Request, res: Response) => {
     SELECT p.*, u.nickname as author_nickname, pr.display_name as author_name,
            pr.avatar_url as author_avatar, pr.level as author_level,
            pr.equipped_frame as author_frame, pr.equipped_name_style as author_name_style,
-           pr.equipped_badge as author_badge,
+           pr.equipped_badge as author_badge, pr.equipped_title as author_title,
            c.name_ru as category_name_ru, c.name_en as category_name_en, c.slug as category_slug,
-           c.is_official as category_is_official
+           c.is_official as category_is_official,
+           (SELECT COUNT(*) FROM reactions r WHERE r.target_type = 'post' AND r.target_id = p.id AND r.reaction_type = 'rose') as rose_count,
+           (SELECT COUNT(*) FROM reactions r WHERE r.target_type = 'post' AND r.target_id = p.id AND r.reaction_type = 'skull') as skull_count
     FROM posts p
     JOIN users u ON u.id = p.user_id
     JOIN profiles pr ON pr.user_id = u.id
@@ -2593,7 +4195,26 @@ app.get('/api/community/posts', (req: Request, res: Response) => {
     LIMIT 100
   `;
 
-  const posts = db.prepare(query).all(...params);
+  const rawPosts = db.prepare(query).all(...params) as any[];
+  const userPostReactions = new Map<string, 'rose' | 'skull'>();
+  if (user && rawPosts.length > 0) {
+    const rxRows = db
+      .prepare("SELECT target_id, reaction_type FROM reactions WHERE target_type = 'post' AND user_id = ?")
+      .all(user.id) as Array<{ target_id: string; reaction_type: string }>;
+    for (const r of rxRows) {
+      if (r.reaction_type === 'rose' || r.reaction_type === 'skull') {
+        userPostReactions.set(r.target_id, r.reaction_type);
+      }
+    }
+  }
+
+  const posts = rawPosts.map((p) => ({
+    ...p,
+    rose_count: Number(p.rose_count || 0),
+    skull_count: Number(p.skull_count || 0),
+    user_reaction: userPostReactions.get(p.id) || null,
+  }));
+
   res.json({ posts });
 });
 
@@ -2603,9 +4224,11 @@ app.get('/api/community/posts/:id', (req: Request, res: Response) => {
     SELECT p.*, u.nickname as author_nickname, pr.display_name as author_name,
            pr.avatar_url as author_avatar, pr.level as author_level,
            pr.equipped_frame as author_frame, pr.equipped_name_style as author_name_style,
-           pr.equipped_badge as author_badge,
+           pr.equipped_badge as author_badge, pr.equipped_title as author_title,
            c.name_ru as category_name_ru, c.name_en as category_name_en, c.slug as category_slug,
-           c.is_official as category_is_official
+           c.is_official as category_is_official,
+           (SELECT COUNT(*) FROM reactions r WHERE r.target_type = 'post' AND r.target_id = p.id AND r.reaction_type = 'rose') as rose_count,
+           (SELECT COUNT(*) FROM reactions r WHERE r.target_type = 'post' AND r.target_id = p.id AND r.reaction_type = 'skull') as skull_count
     FROM posts p
     JOIN users u ON u.id = p.user_id
     JOIN profiles pr ON pr.user_id = u.id
@@ -2624,28 +4247,44 @@ app.get('/api/community/posts/:id', (req: Request, res: Response) => {
     return;
   }
 
-  // Increment view count
+  // Increment view count & lightweight unique post_reads counter (no CloudSync spam on GET)
   db.prepare('UPDATE posts SET views_count = views_count + 1 WHERE id = ?').run(post.id);
+  if (user) {
+    try {
+      db.prepare('INSERT OR IGNORE INTO post_reads (user_id, post_id) VALUES (?, ?)').run(user.id, post.id);
+    } catch {}
+  }
 
   const comments = db.prepare(`
     SELECT cm.*, u.nickname as author_nickname, pr.display_name as author_name,
            pr.avatar_url as author_avatar, pr.level as author_level,
            pr.equipped_frame as author_frame, pr.equipped_name_style as author_name_style,
-           pr.equipped_badge as author_badge
+           pr.equipped_badge as author_badge, pr.equipped_title as author_title
     FROM comments cm
     JOIN users u ON u.id = cm.user_id
     JOIN profiles pr ON pr.user_id = u.id
-    WHERE cm.post_id = ?
+    WHERE cm.post_id = ? ${isStaff ? '' : 'AND COALESCE(cm.is_hidden, 0) = 0'}
     ORDER BY cm.created_at ASC
   `).all(post.id);
 
-  let userReaction = null;
+  let userReaction: 'rose' | 'skull' | null = null;
   if (user) {
     const rx = db.prepare("SELECT reaction_type FROM reactions WHERE target_type = 'post' AND target_id = ? AND user_id = ?").get(post.id, user.id) as any;
-    userReaction = rx?.reaction_type || null;
+    if (rx?.reaction_type === 'rose' || rx?.reaction_type === 'skull') {
+      userReaction = rx.reaction_type;
+    }
   }
 
-  res.json({ post, comments, userReaction });
+  res.json({
+    post: {
+      ...post,
+      rose_count: Number(post.rose_count || 0),
+      skull_count: Number(post.skull_count || 0),
+      user_reaction: userReaction,
+    },
+    comments,
+    userReaction,
+  });
 });
 
 app.post('/api/community/posts', requireAuth, (req: AuthRequest, res: Response) => {
@@ -2696,12 +4335,14 @@ app.post('/api/community/posts', requireAuth, (req: AuthRequest, res: Response) 
     const { level } = calculateLevelFromXp(updated.total_xp);
     db.prepare('UPDATE profiles SET level = ? WHERE user_id = ?').run(level, req.user!.id);
 
+    let newlyUnlocked: UnlockedAchievementInfo[] = [];
     db.prepare(`
       INSERT INTO xp_transactions (id, user_id, amount, source, details)
       VALUES (?, ?, 20, 'community_post', ?)
-    `).run('xpt_' + crypto.randomUUID().slice(0, 8), req.user!.id, `Created post: ${cleanTitle.slice(0, 30)}`);
+    `).run('xpt_' + crypto.randomUUID().slice(0, 8), req.user!.id, `Тема: «${cleanTitle.slice(0, 40)}»`);
 
-    evaluateUserAchievements(req.user!.id);
+    newlyUnlocked = evaluateUserAchievements(req.user!.id);
+    return newlyUnlocked;
   })();
 
   res.json({ ok: true, id, status });
@@ -2794,7 +4435,7 @@ app.post('/api/community/posts/:id/comments', requireAuth, (req: AuthRequest, re
     return;
   }
 
-  const targetPost = db.prepare('SELECT id, is_locked FROM posts WHERE id = ?').get(req.params.id) as any;
+  const targetPost = db.prepare('SELECT id, user_id, title, is_locked FROM posts WHERE id = ?').get(req.params.id) as any;
   if (!targetPost) {
     res.status(404).json({ error: 'Post not found.' });
     return;
@@ -2806,12 +4447,19 @@ app.post('/api/community/posts/:id/comments', requireAuth, (req: AuthRequest, re
     return;
   }
 
+  let parentComment: any = null;
+  if (parent_id && typeof parent_id === 'string') {
+    parentComment = db.prepare('SELECT id, user_id FROM comments WHERE id = ?').get(parent_id) as any;
+  }
+
   const id = 'cm_' + crypto.randomUUID().slice(0, 8);
+  let newlyUnlocked: UnlockedAchievementInfo[] = [];
+
   db.transaction(() => {
     db.prepare(`
       INSERT INTO comments (id, user_id, post_id, content, parent_id)
       VALUES (?, ?, ?, ?, ?)
-    `).run(id, req.user!.id, req.params.id, cleanContent, parent_id || null);
+    `).run(id, req.user!.id, req.params.id, cleanContent, parentComment ? parentComment.id : null);
 
     db.prepare(`
       UPDATE posts SET comments_count = comments_count + 1, updated_at = datetime('now')
@@ -2829,18 +4477,38 @@ app.post('/api/community/posts/:id/comments', requireAuth, (req: AuthRequest, re
 
     db.prepare(`
       INSERT INTO xp_transactions (id, user_id, amount, source, details)
-      VALUES (?, ?, 5, 'comment', 'Posted a comment')
+      VALUES (?, ?, 5, 'comment', 'Комментарий в обсуждении')
     `).run('xpt_' + crypto.randomUUID().slice(0, 8), req.user!.id);
 
-    evaluateUserAchievements(req.user!.id);
+    // Notify post author and/or parent comment author (deduplicated)
+    const recipients = new Set<string>();
+    if (targetPost.user_id && targetPost.user_id !== req.user!.id) recipients.add(targetPost.user_id);
+    if (parentComment?.user_id && parentComment.user_id !== req.user!.id) recipients.add(parentComment.user_id);
+
+    for (const recipientId of recipients) {
+      createReplyNotification({
+        recipientUserId: recipientId,
+        actor: req.user!,
+        targetType: 'post',
+        targetId: targetPost.id,
+        targetTitle: targetPost.title,
+        targetLink: `/community?post=${encodeURIComponent(targetPost.id)}`,
+        excerpt: cleanContent,
+      });
+    }
+
+    newlyUnlocked = evaluateUserAchievements(req.user!.id);
   })();
 
-  res.json({ ok: true, id });
+  res.json({ ok: true, id, newly_unlocked_achievements: newlyUnlocked });
 });
 
 app.post('/api/community/posts/:id/react', requireAuth, (req: AuthRequest, res: Response) => {
-  const { reaction_type } = req.body; // 'rose', 'flame', 'skull', 'heart'
-  const valid = ['rose', 'flame', 'skull', 'heart'].includes(reaction_type) ? reaction_type : 'rose';
+  const { reaction_type } = req.body || {};
+  if (reaction_type !== 'rose' && reaction_type !== 'skull') {
+    res.status(400).json({ error: 'Поддерживаются только реакции «Роза» (rose) и «Череп» (skull).' });
+    return;
+  }
   const postId = req.params.id;
 
   const target = db.prepare('SELECT id FROM posts WHERE id = ?').get(postId);
@@ -2849,32 +4517,57 @@ app.post('/api/community/posts/:id/react', requireAuth, (req: AuthRequest, res: 
     return;
   }
 
-  const existing = db.prepare(`
-    SELECT id, reaction_type FROM reactions WHERE target_type = 'post' AND target_id = ? AND user_id = ?
-  `).get(postId, req.user!.id) as any;
+  let reacted = false;
+  let nextType: 'rose' | 'skull' | null = null;
 
-  if (existing) {
-    if (existing.reaction_type === valid) {
-      // Remove reaction
-      db.prepare('DELETE FROM reactions WHERE id = ?').run(existing.id);
-      db.prepare('UPDATE posts SET reactions_count = MAX(0, reactions_count - 1) WHERE id = ?').run(postId);
-      res.json({ reacted: false });
-      return;
+  db.transaction(() => {
+    const existing = db.prepare(`
+      SELECT id, reaction_type FROM reactions WHERE target_type = 'post' AND target_id = ? AND user_id = ?
+    `).get(postId, req.user!.id) as any;
+
+    if (existing) {
+      if (existing.reaction_type === reaction_type) {
+        db.prepare('DELETE FROM reactions WHERE id = ?').run(existing.id);
+        reacted = false;
+        nextType = null;
+      } else {
+        db.prepare('UPDATE reactions SET reaction_type = ? WHERE id = ?').run(reaction_type, existing.id);
+        reacted = true;
+        nextType = reaction_type;
+      }
     } else {
-      // Change reaction
-      db.prepare('UPDATE reactions SET reaction_type = ? WHERE id = ?').run(valid, existing.id);
-      res.json({ reacted: true, reaction_type: valid });
-      return;
+      db.prepare(`
+        INSERT INTO reactions (id, user_id, target_type, target_id, reaction_type)
+        VALUES (?, ?, 'post', ?, ?)
+      `).run('rx_' + crypto.randomUUID().slice(0, 8), req.user!.id, postId, reaction_type);
+      reacted = true;
+      nextType = reaction_type;
     }
-  } else {
-    // Add new reaction
-    db.prepare(`
-      INSERT INTO reactions (id, user_id, target_type, target_id, reaction_type)
-      VALUES (?, ?, 'post', ?, ?)
-    `).run('rx_' + crypto.randomUUID().slice(0, 8), req.user!.id, postId, valid);
-    db.prepare('UPDATE posts SET reactions_count = reactions_count + 1 WHERE id = ?').run(postId);
-    res.json({ reacted: true, reaction_type: valid });
-  }
+
+    const total = (db.prepare(`
+      SELECT COUNT(*) as c FROM reactions WHERE target_type = 'post' AND target_id = ? AND reaction_type IN ('rose', 'skull')
+    `).get(postId) as any)?.c || 0;
+    db.prepare('UPDATE posts SET reactions_count = ? WHERE id = ?').run(total, postId);
+  })();
+
+  const counts = db.prepare(`
+    SELECT
+      SUM(CASE WHEN reaction_type = 'rose' THEN 1 ELSE 0 END) as rose_count,
+      SUM(CASE WHEN reaction_type = 'skull' THEN 1 ELSE 0 END) as skull_count
+    FROM reactions
+    WHERE target_type = 'post' AND target_id = ?
+  `).get(postId) as any;
+
+  const roseCount = Number(counts?.rose_count || 0);
+  const skullCount = Number(counts?.skull_count || 0);
+
+  res.json({
+    reacted,
+    reaction_type: nextType,
+    rose_count: roseCount,
+    skull_count: skullCount,
+    reactions_count: roseCount + skullCount,
+  });
 });
 
 app.delete('/api/community/posts/:id', requireAuth, (req: AuthRequest, res: Response) => {
@@ -2890,6 +4583,19 @@ app.delete('/api/community/posts/:id', requireAuth, (req: AuthRequest, res: Resp
 
   db.prepare('DELETE FROM posts WHERE id = ?').run(req.params.id);
   res.json({ ok: true });
+});
+
+app.post('/api/community/comments/:id/hide', requireAdminOrMod, (req: AuthRequest, res: Response) => {
+  const comment = db.prepare('SELECT id, is_hidden FROM comments WHERE id = ?').get(req.params.id) as any;
+  if (!comment) {
+    res.status(404).json({ error: 'Comment not found' });
+    return;
+  }
+  const nextHidden = req.body?.is_hidden !== undefined
+    ? (req.body.is_hidden ? 1 : 0)
+    : (comment.is_hidden ? 0 : 1);
+  db.prepare("UPDATE comments SET is_hidden = ?, updated_at = datetime('now') WHERE id = ?").run(nextHidden, comment.id);
+  res.json({ ok: true, is_hidden: nextHidden });
 });
 
 app.delete('/api/community/comments/:id', requireAuth, (req: AuthRequest, res: Response) => {
@@ -2962,18 +4668,39 @@ app.get('/api/creations', (req: Request, res: Response) => {
     orderBy = 'c.likes_count DESC, c.created_at DESC';
   }
 
-  const creations = db.prepare(`
+  const rawCreations = db.prepare(`
     SELECT c.*, u.nickname as author_nickname, pr.display_name as author_name,
            pr.avatar_url as author_avatar, pr.level as author_level,
            pr.equipped_frame as author_frame, pr.equipped_name_style as author_name_style,
-           pr.equipped_badge as author_badge
+           pr.equipped_badge as author_badge,
+           (SELECT COUNT(*) FROM reactions r WHERE r.target_type = 'creation' AND r.target_id = c.id AND r.reaction_type = 'rose') as rose_count,
+           (SELECT COUNT(*) FROM reactions r WHERE r.target_type = 'creation' AND r.target_id = c.id AND r.reaction_type = 'skull') as skull_count
     FROM creations c
     JOIN users u ON u.id = c.user_id
     JOIN profiles pr ON pr.user_id = u.id
     WHERE ${conditions.join(' AND ')}
     ORDER BY ${orderBy}
     LIMIT 100
-  `).all(...params);
+  `).all(...params) as any[];
+
+  const userCreationReactions = new Map<string, 'rose' | 'skull'>();
+  if (user && rawCreations.length > 0) {
+    const rxRows = db
+      .prepare("SELECT target_id, reaction_type FROM reactions WHERE target_type = 'creation' AND user_id = ?")
+      .all(user.id) as Array<{ target_id: string; reaction_type: string }>;
+    for (const r of rxRows) {
+      if (r.reaction_type === 'rose' || r.reaction_type === 'skull') {
+        userCreationReactions.set(r.target_id, r.reaction_type);
+      }
+    }
+  }
+
+  const creations = rawCreations.map((c) => ({
+    ...c,
+    rose_count: Number(c.rose_count || 0),
+    skull_count: Number(c.skull_count || 0),
+    user_reaction: userCreationReactions.get(c.id) || null,
+  }));
 
   res.json({ creations });
 });
@@ -2984,7 +4711,9 @@ app.get('/api/creations/:id', (req: Request, res: Response) => {
     SELECT c.*, u.nickname as author_nickname, pr.display_name as author_name,
            pr.avatar_url as author_avatar, pr.level as author_level,
            pr.equipped_frame as author_frame, pr.equipped_name_style as author_name_style,
-           pr.equipped_badge as author_badge
+           pr.equipped_badge as author_badge,
+           (SELECT COUNT(*) FROM reactions r WHERE r.target_type = 'creation' AND r.target_id = c.id AND r.reaction_type = 'rose') as rose_count,
+           (SELECT COUNT(*) FROM reactions r WHERE r.target_type = 'creation' AND r.target_id = c.id AND r.reaction_type = 'skull') as skull_count
     FROM creations c
     JOIN users u ON u.id = c.user_id
     JOIN profiles pr ON pr.user_id = u.id
@@ -3012,20 +4741,34 @@ app.get('/api/creations/:id', (req: Request, res: Response) => {
     FROM comments cm
     JOIN users u ON u.id = cm.user_id
     JOIN profiles pr ON pr.user_id = u.id
-    WHERE cm.creation_id = ?
+    WHERE cm.creation_id = ? ${isStaff ? '' : 'AND COALESCE(cm.is_hidden, 0) = 0'}
     ORDER BY cm.created_at ASC
   `).all(creation.id);
 
-  let liked = false;
+  let userReaction: 'rose' | 'skull' | null = null;
   let favorited = false;
   if (user) {
-    const rx = db.prepare("SELECT id FROM reactions WHERE target_type = 'creation' AND target_id = ? AND user_id = ?").get(creation.id, user.id);
-    liked = Boolean(rx);
+    const rx = db.prepare("SELECT reaction_type FROM reactions WHERE target_type = 'creation' AND target_id = ? AND user_id = ?").get(creation.id, user.id) as any;
+    if (rx?.reaction_type === 'rose' || rx?.reaction_type === 'skull') {
+      userReaction = rx.reaction_type;
+    }
     const fav = db.prepare("SELECT id FROM favorites WHERE target_type = 'creation' AND target_id = ? AND user_id = ?").get(creation.id, user.id);
     favorited = Boolean(fav);
   }
 
-  res.json({ creation: { ...creation, views_count: (creation.views_count || 0) + 1 }, comments, liked, favorited });
+  res.json({
+    creation: {
+      ...creation,
+      views_count: (creation.views_count || 0) + 1,
+      rose_count: Number(creation.rose_count || 0),
+      skull_count: Number(creation.skull_count || 0),
+      user_reaction: userReaction,
+    },
+    comments,
+    liked: userReaction === 'rose',
+    userReaction,
+    favorited,
+  });
 });
 
 app.post('/api/creations/:id/comments', requireAuth, (req: AuthRequest, res: Response) => {
@@ -3036,18 +4779,25 @@ app.post('/api/creations/:id/comments', requireAuth, (req: AuthRequest, res: Res
     return;
   }
 
-  const creation = db.prepare('SELECT id FROM creations WHERE id = ?').get(req.params.id);
+  const creation = db.prepare('SELECT id, user_id, title FROM creations WHERE id = ?').get(req.params.id) as any;
   if (!creation) {
     res.status(404).json({ error: 'Creation not found.' });
     return;
   }
 
+  let parentComment: any = null;
+  if (parent_id && typeof parent_id === 'string') {
+    parentComment = db.prepare('SELECT id, user_id FROM comments WHERE id = ?').get(parent_id) as any;
+  }
+
   const id = 'cm_' + crypto.randomUUID().slice(0, 8);
+  let newlyUnlocked: UnlockedAchievementInfo[] = [];
+
   db.transaction(() => {
     db.prepare(`
       INSERT INTO comments (id, user_id, creation_id, content, parent_id)
       VALUES (?, ?, ?, ?, ?)
-    `).run(id, req.user!.id, req.params.id, cleanContent, parent_id || null);
+    `).run(id, req.user!.id, req.params.id, cleanContent, parentComment ? parentComment.id : null);
 
     db.prepare(`
       UPDATE profiles SET xp = xp + 5, total_xp = total_xp + 5, updated_at = datetime('now')
@@ -3059,13 +4809,29 @@ app.post('/api/creations/:id/comments', requireAuth, (req: AuthRequest, res: Res
 
     db.prepare(`
       INSERT INTO xp_transactions (id, user_id, amount, source, details)
-      VALUES (?, ?, 5, 'comment', 'Commented on gallery creation')
+      VALUES (?, ?, 5, 'comment', 'Комментарий в творчестве')
     `).run('xpt_' + crypto.randomUUID().slice(0, 8), req.user!.id);
 
-    evaluateUserAchievements(req.user!.id);
+    const recipients = new Set<string>();
+    if (creation.user_id && creation.user_id !== req.user!.id) recipients.add(creation.user_id);
+    if (parentComment?.user_id && parentComment.user_id !== req.user!.id) recipients.add(parentComment.user_id);
+
+    for (const recipientId of recipients) {
+      createReplyNotification({
+        recipientUserId: recipientId,
+        actor: req.user!,
+        targetType: 'creation',
+        targetId: creation.id,
+        targetTitle: creation.title,
+        targetLink: `/creations?creation=${encodeURIComponent(creation.id)}`,
+        excerpt: cleanContent,
+      });
+    }
+
+    newlyUnlocked = evaluateUserAchievements(req.user!.id);
   })();
 
-  res.json({ ok: true, id });
+  res.json({ ok: true, id, newly_unlocked_achievements: newlyUnlocked });
 });
 
 app.post('/api/creations', requireAuth, (req: AuthRequest, res: Response) => {
@@ -3175,28 +4941,72 @@ app.post('/api/admin/creations/:id/moderate', requireAdminOrMod, (req: AuthReque
 });
 
 app.post('/api/creations/:id/react', requireAuth, (req: AuthRequest, res: Response) => {
+  const rawType = req.body?.reaction_type;
+  const reactionType: 'rose' | 'skull' = rawType === 'skull' ? 'skull' : 'rose';
+  if (rawType !== undefined && rawType !== 'rose' && rawType !== 'skull') {
+    res.status(400).json({ error: 'Поддерживаются только реакции «Роза» (rose) и «Череп» (skull).' });
+    return;
+  }
+
   const creationId = req.params.id;
   const target = db.prepare('SELECT id FROM creations WHERE id = ?').get(creationId);
   if (!target) {
     res.status(404).json({ error: 'Creation not found.' });
     return;
   }
-  const existing = db.prepare(`
-    SELECT id FROM reactions WHERE target_type = 'creation' AND target_id = ? AND user_id = ?
-  `).get(creationId, req.user!.id) as any;
 
-  if (existing) {
-    db.prepare('DELETE FROM reactions WHERE id = ?').run(existing.id);
-    db.prepare('UPDATE creations SET likes_count = MAX(0, likes_count - 1) WHERE id = ?').run(creationId);
-    res.json({ liked: false });
-  } else {
-    db.prepare(`
-      INSERT INTO reactions (id, user_id, target_type, target_id, reaction_type)
-      VALUES (?, ?, 'creation', ?, 'rose')
-    `).run('rx_' + crypto.randomUUID().slice(0, 8), req.user!.id, creationId);
-    db.prepare('UPDATE creations SET likes_count = likes_count + 1 WHERE id = ?').run(creationId);
-    res.json({ liked: true });
-  }
+  let reacted = false;
+  let nextType: 'rose' | 'skull' | null = null;
+
+  db.transaction(() => {
+    const existing = db.prepare(`
+      SELECT id, reaction_type FROM reactions WHERE target_type = 'creation' AND target_id = ? AND user_id = ?
+    `).get(creationId, req.user!.id) as any;
+
+    if (existing) {
+      if (existing.reaction_type === reactionType) {
+        db.prepare('DELETE FROM reactions WHERE id = ?').run(existing.id);
+        reacted = false;
+        nextType = null;
+      } else {
+        db.prepare('UPDATE reactions SET reaction_type = ? WHERE id = ?').run(reactionType, existing.id);
+        reacted = true;
+        nextType = reactionType;
+      }
+    } else {
+      db.prepare(`
+        INSERT INTO reactions (id, user_id, target_type, target_id, reaction_type)
+        VALUES (?, ?, 'creation', ?, ?)
+      `).run('rx_' + crypto.randomUUID().slice(0, 8), req.user!.id, creationId, reactionType);
+      reacted = true;
+      nextType = reactionType;
+    }
+
+    const roseTotal = (db.prepare(`
+      SELECT COUNT(*) as c FROM reactions WHERE target_type = 'creation' AND target_id = ? AND reaction_type = 'rose'
+    `).get(creationId) as any)?.c || 0;
+    db.prepare('UPDATE creations SET likes_count = ? WHERE id = ?').run(roseTotal, creationId);
+  })();
+
+  const counts = db.prepare(`
+    SELECT
+      SUM(CASE WHEN reaction_type = 'rose' THEN 1 ELSE 0 END) as rose_count,
+      SUM(CASE WHEN reaction_type = 'skull' THEN 1 ELSE 0 END) as skull_count
+    FROM reactions
+    WHERE target_type = 'creation' AND target_id = ?
+  `).get(creationId) as any;
+
+  const roseCount = Number(counts?.rose_count || 0);
+  const skullCount = Number(counts?.skull_count || 0);
+
+  res.json({
+    reacted,
+    reaction_type: nextType,
+    liked: nextType === 'rose',
+    rose_count: roseCount,
+    skull_count: skullCount,
+    likes_count: roseCount,
+  });
 });
 
 app.post('/api/creations/:id/favorite', requireAuth, (req: AuthRequest, res: Response) => {
@@ -3249,8 +5059,9 @@ app.get('/api/profiles/:nickname', (req: Request, res: Response) => {
   const profile = db.prepare(`
     SELECT u.id, u.nickname, u.email, u.email_verified, u.role_id, u.is_banned, u.created_at as registered_at,
            p.display_name, p.avatar_url, p.bio, p.level, p.xp, p.total_xp, p.daily_streak, p.is_private,
-           p.custom_status, p.equipped_frame, p.equipped_banner, p.equipped_name_style, p.equipped_badge,
-           p.equipped_theme, p.equipped_effect, p.featured_achievements_json, p.username_changed_at
+           p.custom_status, p.favorite_track, p.equipped_frame, p.equipped_banner, p.equipped_name_style, p.equipped_badge,
+           p.equipped_title, p.equipped_theme, p.equipped_effect, p.featured_achievements_json, p.username_changed_at,
+           p.privacy_settings
     FROM users u
     JOIN profiles p ON p.user_id = u.id
     WHERE u.nickname = ? COLLATE NOCASE OR u.nickname = ? COLLATE NOCASE
@@ -3263,8 +5074,15 @@ app.get('/api/profiles/:nickname', (req: Request, res: Response) => {
   }
 
   const isOwnProfile = Boolean(currentUser && currentUser.id === profile.id);
+  const privacySettings = parsePrivacySettings(profile.privacy_settings);
+  const hiddenSections = {
+    community: !isOwnProfile && privacySettings.hide_community,
+    streak: !isOwnProfile && privacySettings.hide_streak,
+    xp_history: !isOwnProfile && privacySettings.hide_xp_history,
+    game_stats: !isOwnProfile && privacySettings.hide_game_stats,
+  };
 
-  // Detailed counts & game stats
+  // Detailed counts & game stats (including unique topics read)
   const counts = db.prepare(`
     SELECT
       (SELECT COUNT(*) FROM follows WHERE following_id = ?) as followers_count,
@@ -3272,6 +5090,7 @@ app.get('/api/profiles/:nickname', (req: Request, res: Response) => {
       (SELECT COUNT(*) FROM posts WHERE user_id = ?) as posts_count,
       (SELECT COUNT(*) FROM creations WHERE user_id = ?) as creations_count,
       (SELECT COUNT(*) FROM comments WHERE user_id = ?) as comments_count,
+      (SELECT COUNT(*) FROM post_reads WHERE user_id = ?) as posts_read_count,
       (SELECT COUNT(*) FROM game_attempts WHERE user_id = ?) as games_played,
       (SELECT COUNT(*) FROM game_attempts WHERE user_id = ? AND game_id = 'guess-track') as guess_track_played,
       (SELECT COUNT(*) FROM game_attempts WHERE user_id = ? AND game_id = 'guess-track' AND score > 0) as guess_track_wins,
@@ -3279,7 +5098,7 @@ app.get('/api/profiles/:nickname', (req: Request, res: Response) => {
       (SELECT COUNT(*) FROM game_attempts WHERE user_id = ? AND game_id = 'daily-quiz' AND details_json IS NOT NULL AND json_valid(details_json) = 1 AND CAST(json_extract(details_json, '$.total') AS INTEGER) > 0 AND CAST(json_extract(details_json, '$.correctCount') AS INTEGER) >= CAST(json_extract(details_json, '$.total') AS INTEGER)) as quiz_perfect_runs,
       (SELECT COALESCE(MAX(score), 0) FROM game_attempts WHERE user_id = ? AND game_id = 'daily-quiz') as quiz_best_score
   `).get(
-    profile.id, profile.id, profile.id, profile.id, profile.id,
+    profile.id, profile.id, profile.id, profile.id, profile.id, profile.id,
     profile.id, profile.id, profile.id, profile.id, profile.id, profile.id
   ) as any;
 
@@ -3295,7 +5114,7 @@ app.get('/api/profiles/:nickname', (req: Request, res: Response) => {
   // Unlocked achievements
   const unlockedRows = db.prepare(`
     SELECT a.id, a.slug, a.title_ru, a.title_en, a.desc_ru, a.desc_en,
-           a.condition_ru, a.condition_en, a.category, a.rarity, a.icon, ua.unlocked_at
+           a.condition_ru, a.condition_en, a.category, a.rarity, a.difficulty_tier, a.is_secret, a.xp_reward, a.icon, ua.unlocked_at
     FROM user_achievements ua
     JOIN achievements a ON a.id = ua.achievement_id
     WHERE ua.user_id = ?
@@ -3307,18 +5126,40 @@ app.get('/api/profiles/:nickname', (req: Request, res: Response) => {
     unlockedMap.set(row.slug, row.unlocked_at);
   }
 
-  // Full achievements catalog (unlocked + locked with conditions & rarities)
+  const achMetrics = collectUserAchievementMetrics(profile.id);
+
+  // Full achievements catalog (with difficulty tier, XP reward, server-computed progress, and masked secret hints)
   const allAchievementsCatalog = db.prepare(`
-    SELECT id, slug, title_ru, title_en, desc_ru, desc_en, condition_ru, condition_en, category, rarity, icon
+    SELECT id, slug, title_ru, title_en, desc_ru, desc_en, condition_ru, condition_en,
+           category, rarity, difficulty_tier, is_secret, xp_reward, icon
     FROM achievements
-    ORDER BY CASE rarity WHEN 'legendary' THEN 1 WHEN 'epic' THEN 2 WHEN 'rare' THEN 3 ELSE 4 END, title_ru ASC
+    ORDER BY
+      CASE difficulty_tier WHEN 'easy' THEN 1 WHEN 'hard' THEN 2 WHEN 'secret' THEN 3 ELSE 4 END,
+      xp_reward ASC,
+      title_ru ASC
   `).all() as any[];
 
-  const allAchievements = allAchievementsCatalog.map((a) => ({
-    ...a,
-    is_unlocked: unlockedMap.has(a.slug),
-    unlocked_at: unlockedMap.get(a.slug) || null,
-  }));
+  const allAchievements = allAchievementsCatalog.map((a) => {
+    const isUnlocked = unlockedMap.has(a.slug);
+    const isSecretLocked = Boolean(a.is_secret) && !isUnlocked;
+    const progress = achMetrics
+      ? getAchievementProgress(a.slug, achMetrics, isUnlocked)
+      : { current: isUnlocked ? 1 : 0, target: 1 };
+
+    return {
+      ...a,
+      is_secret: Boolean(a.is_secret),
+      difficulty_tier: a.difficulty_tier || (a.is_secret ? 'secret' : 'easy'),
+      xp_reward: Number(a.xp_reward || 0),
+      desc_ru: isSecretLocked ? '???' : a.desc_ru,
+      desc_en: isSecretLocked ? '???' : a.desc_en,
+      condition_ru: isSecretLocked ? '???' : a.condition_ru,
+      condition_en: isSecretLocked ? '???' : a.condition_en,
+      progress: isSecretLocked ? { current: 0, target: 1 } : progress,
+      is_unlocked: isUnlocked,
+      unlocked_at: unlockedMap.get(a.slug) || null,
+    };
+  });
 
   // Featured showcase achievements (verified to be unlocked by this user)
   const savedFeatured = parseFeaturedAchievements(profile.featured_achievements_json);
@@ -3329,18 +5170,22 @@ app.get('/api/profiles/:nickname', (req: Request, res: Response) => {
         .filter(Boolean)
     : unlockedRows.slice(0, 3);
 
-  // User's recent creations and posts
-  const recentCreations = db.prepare(`
-    SELECT * FROM creations WHERE user_id = ? AND (status = 'approved' OR user_id = ?) ORDER BY created_at DESC LIMIT 6
-  `).all(profile.id, currentUser?.id || '');
+  // User's recent creations and posts (omitted server-side if community section is hidden from non-owner)
+  const recentCreations = hiddenSections.community
+    ? []
+    : db.prepare(`
+        SELECT * FROM creations WHERE user_id = ? AND (status = 'approved' OR user_id = ?) ORDER BY created_at DESC LIMIT 6
+      `).all(profile.id, currentUser?.id || '');
 
-  const recentPosts = db.prepare(`
-    SELECT p.*, c.name_ru as category_name_ru, c.name_en as category_name_en
-    FROM posts p
-    JOIN post_categories c ON c.id = p.category_id
-    WHERE p.user_id = ? AND (p.status = 'approved' OR p.user_id = ?)
-    ORDER BY p.created_at DESC LIMIT 6
-  `).all(profile.id, currentUser?.id || '');
+  const recentPosts = hiddenSections.community
+    ? []
+    : db.prepare(`
+        SELECT p.*, c.name_ru as category_name_ru, c.name_en as category_name_en
+        FROM posts p
+        JOIN post_categories c ON c.id = p.category_id
+        WHERE p.user_id = ? AND (p.status = 'approved' OR p.user_id = ?)
+        ORDER BY p.created_at DESC LIMIT 6
+      `).all(profile.id, currentUser?.id || '');
 
   // User inventory (collection)
   const inventory = db.prepare(`
@@ -3352,38 +5197,94 @@ app.get('/api/profiles/:nickname', (req: Request, res: Response) => {
   `).all(profile.id);
 
   // User's favorite creations
-  const favoriteCreations = db.prepare(`
-    SELECT c.*, u.nickname as author_nickname, pr.display_name as author_name
-    FROM favorites f
-    JOIN creations c ON c.id = f.target_id
-    JOIN users u ON u.id = c.user_id
-    JOIN profiles pr ON pr.user_id = u.id
-    WHERE f.user_id = ? AND f.target_type = 'creation' AND c.status = 'approved'
-    ORDER BY f.created_at DESC
-    LIMIT 12
-  `).all(profile.id);
+  const favoriteCreations = hiddenSections.community
+    ? []
+    : db.prepare(`
+        SELECT c.*, u.nickname as author_nickname, pr.display_name as author_name
+        FROM favorites f
+        JOIN creations c ON c.id = f.target_id
+        JOIN users u ON u.id = c.user_id
+        JOIN profiles pr ON pr.user_id = u.id
+        WHERE f.user_id = ? AND f.target_type = 'creation' AND c.status = 'approved'
+        ORDER BY f.created_at DESC
+        LIMIT 12
+      `).all(profile.id);
 
-  // Privacy: never leak email or username cooldown metadata to other users
-  const { email, email_verified, featured_achievements_json, username_changed_at, ...publicProfile } = profile;
+  // Privacy: never leak email, username cooldown, or hidden sections to other users
+  const {
+    email,
+    email_verified,
+    featured_achievements_json,
+    username_changed_at,
+    privacy_settings: _rawPrivacy,
+    ...publicProfile
+  } = profile;
+
   const usernameCooldown = isOwnProfile ? canChangeUsername(username_changed_at) : null;
+  const resolvedTotalXp = Number(publicProfile.total_xp ?? publicProfile.xp ?? 0);
+  const { level: computedProfileLevel } = calculateLevelFromXp(resolvedTotalXp);
+  const streakDays = Number(publicProfile.daily_streak || 0);
+
+  const safeCounts = {
+    followers_count: Number(counts?.followers_count || 0),
+    following_count: Number(counts?.following_count || 0),
+    posts_count: hiddenSections.community ? null : Number(counts?.posts_count || 0),
+    creations_count: hiddenSections.community ? null : Number(counts?.creations_count || 0),
+    comments_count: hiddenSections.community ? null : Number(counts?.comments_count || 0),
+    posts_read_count: hiddenSections.community ? null : Number(counts?.posts_read_count || 0),
+    games_played: hiddenSections.game_stats ? null : Number(counts?.games_played || 0),
+    guess_track_played: hiddenSections.game_stats ? null : Number(counts?.guess_track_played || 0),
+    guess_track_wins: hiddenSections.game_stats ? null : Number(counts?.guess_track_wins || 0),
+    quiz_played: hiddenSections.game_stats ? null : Number(counts?.quiz_played || 0),
+    quiz_perfect_runs: hiddenSections.game_stats ? null : Number(counts?.quiz_perfect_runs || 0),
+    quiz_best_score: hiddenSections.game_stats ? null : Number(counts?.quiz_best_score || 0),
+  };
+
+  // Resolve favorite track: explicit profile setting or most-listened track from user_track_plays
+  let resolvedFavoriteTrack: string | null =
+    publicProfile.favorite_track && String(publicProfile.favorite_track).trim()
+      ? String(publicProfile.favorite_track).trim()
+      : null;
+  if (!resolvedFavoriteTrack) {
+    try {
+      const topPlay = db.prepare(`
+        SELECT COALESCE(t.title, s.title) as title
+        FROM user_track_plays utp
+        LEFT JOIN tracks t ON t.id = utp.track_id
+        LEFT JOIN singles s ON s.id = utp.track_id
+        WHERE utp.user_id = ? AND COALESCE(t.title, s.title) IS NOT NULL
+        ORDER BY utp.completions DESC, utp.updated_at DESC
+        LIMIT 1
+      `).get(profile.id) as { title?: string } | undefined;
+      if (topPlay?.title) {
+        resolvedFavoriteTrack = topPlay.title;
+      }
+    } catch {}
+  }
 
   res.json({
     profile: {
       ...publicProfile,
+      favorite_track: resolvedFavoriteTrack,
+      daily_streak: hiddenSections.streak ? null : streakDays,
+      streak_bonus_percent: hiddenSections.streak ? null : getStreakBonusPercent(streakDays),
       display_name: publicProfile.display_name && String(publicProfile.display_name).trim()
         ? publicProfile.display_name
         : publicProfile.nickname,
-      total_xp: publicProfile.total_xp ?? publicProfile.xp ?? 0,
+      total_xp: resolvedTotalXp,
+      level: computedProfileLevel,
+      hidden_sections: hiddenSections,
       ...(isOwnProfile
         ? {
             email: email || null,
             email_verified: Number(email_verified || 0),
+            privacy_settings: privacySettings,
             username_change_allowed: usernameCooldown?.allowed ?? true,
             username_next_allowed_at: usernameCooldown?.nextAllowedAt ?? null,
             username_cooldown_days: usernameCooldown?.remainingDays ?? 0,
           }
         : {}),
-      ...counts,
+      ...safeCounts,
       isFollowing,
       achievements: unlockedRows,
       allAchievements,
@@ -3398,25 +5299,55 @@ app.get('/api/profiles/:nickname', (req: Request, res: Response) => {
 });
 
 app.get('/api/profiles/:nickname/history', (req: Request, res: Response) => {
+  const currentUser = getSessionUser(req);
   const rawLookup = String(req.params.nickname || '').trim();
   const cleanLookup = normalizeUsername(rawLookup);
   const user = db
-    .prepare('SELECT id FROM users WHERE nickname = ? COLLATE NOCASE OR nickname = ? COLLATE NOCASE')
+    .prepare(`
+      SELECT u.id, u.nickname, p.privacy_settings
+      FROM users u
+      JOIN profiles p ON p.user_id = u.id
+      WHERE u.nickname = ? COLLATE NOCASE OR u.nickname = ? COLLATE NOCASE
+      LIMIT 1
+    `)
     .get(rawLookup, cleanLookup) as any;
+
   if (!user) {
     res.status(404).json({ error: 'User not found' });
     return;
   }
 
+  const isOwnProfile = Boolean(currentUser && currentUser.id === user.id);
+  const privacy = parsePrivacySettings(user.privacy_settings);
+
+  // Enforce server-side privacy: XP History is hidden from non-owners by default
+  if (!isOwnProfile && privacy.hide_xp_history) {
+    res.json({
+      hidden: true,
+      nickname: user.nickname,
+      xpTransactions: [],
+      gameAttempts: [],
+    });
+    return;
+  }
+
   const xpTransactions = db.prepare(`
-    SELECT * FROM xp_transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 25
+    SELECT * FROM xp_transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 30
   `).all(user.id);
 
-  const gameAttempts = db.prepare(`
-    SELECT * FROM game_attempts WHERE user_id = ? ORDER BY created_at DESC LIMIT 25
-  `).all(user.id);
+  const gameAttempts =
+    !isOwnProfile && privacy.hide_game_stats
+      ? []
+      : db.prepare(`
+          SELECT * FROM game_attempts WHERE user_id = ? ORDER BY created_at DESC LIMIT 25
+        `).all(user.id);
 
-  res.json({ xpTransactions, gameAttempts });
+  res.json({
+    hidden: false,
+    nickname: user.nickname,
+    xpTransactions,
+    gameAttempts,
+  });
 });
 
 app.post('/api/profiles/:nickname/follow', requireAuth, (req: AuthRequest, res: Response) => {
@@ -3444,9 +5375,9 @@ app.post('/api/profiles/:nickname/follow', requireAuth, (req: AuthRequest, res: 
       req.user!.id,
       target.id
     );
-    evaluateUserAchievements(req.user!.id);
+    const newlyUnlocked = evaluateUserAchievements(req.user!.id);
     evaluateUserAchievements(target.id);
-    res.json({ following: true });
+    res.json({ following: true, newly_unlocked_achievements: newlyUnlocked });
   }
 });
 
@@ -3458,8 +5389,10 @@ app.put('/api/profiles/me', requireAuth, (req: AuthRequest, res: Response) => {
     avatar_url,
     is_private,
     custom_status,
+    favorite_track,
     featured_achievements,
     username,
+    privacy_settings,
   } = req.body || {};
 
   let nextDisplayName: string | null = null;
@@ -3475,6 +5408,22 @@ app.put('/api/profiles/me', requireAuth, (req: AuthRequest, res: Response) => {
   if (avatar_url && !isSafeMediaUrl(String(avatar_url))) {
     res.status(400).json({ error: 'Некорректная ссылка на аватар.' });
     return;
+  }
+
+  let nextPrivacyJson: string | null = null;
+  if (privacy_settings !== undefined) {
+    if (!privacy_settings || typeof privacy_settings !== 'object' || Array.isArray(privacy_settings)) {
+      res.status(400).json({ error: 'Некорректный формат настроек приватности.' });
+      return;
+    }
+    const existingPrivacyRow = db
+      .prepare('SELECT privacy_settings FROM profiles WHERE user_id = ?')
+      .get(userId) as { privacy_settings?: string | null } | undefined;
+    const mergedPrivacy = {
+      ...parsePrivacySettings(existingPrivacyRow?.privacy_settings),
+      ...privacy_settings,
+    };
+    nextPrivacyJson = JSON.stringify(parsePrivacySettings(mergedPrivacy));
   }
 
   let nextFeaturedJson: string | null = null;
@@ -3535,16 +5484,21 @@ app.put('/api/profiles/me', requireAuth, (req: AuthRequest, res: Response) => {
       }
 
       const collision = db
-        .prepare('SELECT id FROM users WHERE nickname = ? COLLATE NOCASE AND id != ?')
+        .prepare('SELECT id FROM users WHERE LOWER(TRIM(nickname)) = ? AND id != ?')
         .get(uCheck.normalized, userId);
       if (collision) {
-        res.status(409).json({ error: 'Этот @username уже занят другим пользователем.' });
+        res.status(409).json({ error: 'Этот юзернейм уже занят' });
         return;
       }
 
       changedUsername = uCheck.normalized;
     }
   }
+
+  const hasAvatarUpdate = avatar_url !== undefined;
+  const resolvedAvatarUrl = hasAvatarUpdate
+    ? (String(avatar_url || '').trim() || '/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg')
+    : null;
 
   db.transaction(() => {
     if (changedUsername) {
@@ -3559,24 +5513,30 @@ app.put('/api/profiles/me', requireAuth, (req: AuthRequest, res: Response) => {
       UPDATE profiles SET
         display_name = COALESCE(?, display_name),
         bio = COALESCE(?, bio),
-        avatar_url = COALESCE(?, avatar_url),
+        avatar_url = CASE WHEN ? = 1 THEN ? ELSE avatar_url END,
         is_private = COALESCE(?, is_private),
         custom_status = COALESCE(?, custom_status),
+        favorite_track = CASE WHEN ? = 1 THEN ? ELSE favorite_track END,
         featured_achievements_json = COALESCE(?, featured_achievements_json),
+        privacy_settings = COALESCE(?, privacy_settings),
         updated_at = datetime('now')
       WHERE user_id = ?
     `).run(
       nextDisplayName,
       bio !== undefined ? String(bio).slice(0, 500) : null,
-      avatar_url !== undefined ? (avatar_url ? String(avatar_url).trim() : null) : null,
+      hasAvatarUpdate ? 1 : 0,
+      resolvedAvatarUrl,
       is_private !== undefined ? (is_private ? 1 : 0) : null,
       custom_status !== undefined ? String(custom_status).slice(0, 120) : null,
+      favorite_track !== undefined ? 1 : 0,
+      favorite_track !== undefined ? (String(favorite_track).trim().slice(0, 80) || null) : null,
       nextFeaturedJson,
+      nextPrivacyJson,
       userId
     );
   })();
 
-  evaluateUserAchievements(userId);
+  const newlyUnlocked = evaluateUserAchievements(userId);
 
   let refreshedToken: string | undefined;
   if (changedUsername) {
@@ -3591,6 +5551,7 @@ app.put('/api/profiles/me', requireAuth, (req: AuthRequest, res: Response) => {
     ok: true,
     nickname: changedUsername || req.user!.nickname,
     ...(refreshedToken ? { token: refreshedToken } : {}),
+    newly_unlocked_achievements: newlyUnlocked,
   });
 });
 
@@ -3651,38 +5612,64 @@ app.get('/api/admin/users', requireAdminOrMod, (req: Request, res: Response) => 
   const likeParam = `%${rawSearch}%`;
   const cleanLike = `%${cleanSearch}%`;
 
+  const sortParam = String(req.query.sort || 'registered_desc');
+  const ORDER_BY_MAP: Record<string, string> = {
+    registered_desc: 'u.created_at DESC',
+    registered_asc: 'u.created_at ASC',
+    xp_desc: 'COALESCE(p.total_xp, p.xp, 0) DESC, p.level DESC',
+    level_desc: 'p.level DESC, COALESCE(p.total_xp, p.xp, 0) DESC',
+    games_desc: 'games_played DESC, COALESCE(p.total_xp, p.xp, 0) DESC',
+    active_desc: 'last_active_at DESC',
+    username_asc: 'LOWER(u.nickname) ASC',
+  };
+  const orderClause = ORDER_BY_MAP[sortParam] || ORDER_BY_MAP.registered_desc;
+
+  const baseSelect = `
+    SELECT u.id, u.nickname, u.email, u.email_verified, u.role_id, u.is_banned, u.ban_reason,
+           u.failed_login_attempts, u.locked_until, u.created_at as registered_at,
+           p.display_name, p.avatar_url, p.level, p.xp, p.total_xp, p.daily_streak, p.last_active_date,
+           MAX(
+             COALESCE(p.updated_at, u.created_at),
+             COALESCE((SELECT MAX(created_at) FROM game_attempts WHERE user_id = u.id), ''),
+             COALESCE((SELECT MAX(created_at) FROM posts WHERE user_id = u.id), ''),
+             COALESCE((SELECT MAX(created_at) FROM comments WHERE user_id = u.id), ''),
+             COALESCE(u.updated_at, u.created_at)
+           ) as last_active_at,
+           (SELECT COUNT(*) FROM posts WHERE user_id = u.id) as posts_count,
+           (SELECT COUNT(*) FROM creations WHERE user_id = u.id) as creations_count,
+           (SELECT COUNT(*) FROM game_attempts WHERE user_id = u.id) as games_played,
+           (SELECT COUNT(*) FROM game_attempts WHERE user_id = u.id AND game_id = 'daily-quiz') as daily_quiz_played,
+           (SELECT COUNT(*) FROM game_attempts WHERE user_id = u.id AND game_id = 'guess-track') as guess_track_played,
+           (SELECT COUNT(*) FROM user_achievements WHERE user_id = u.id) as achievements_count,
+           (SELECT COUNT(*) FROM user_inventory WHERE user_id = u.id) as inventory_count
+    FROM users u
+    JOIN profiles p ON p.user_id = u.id
+  `;
+
   const users = rawSearch
     ? db.prepare(`
-        SELECT u.id, u.nickname, u.email, u.email_verified, u.role_id, u.is_banned, u.ban_reason,
-               u.failed_login_attempts, u.locked_until, u.created_at as registered_at,
-               p.display_name, p.avatar_url, p.level, p.xp, p.total_xp, p.daily_streak,
-               (SELECT COUNT(*) FROM posts WHERE user_id = u.id) as posts_count,
-               (SELECT COUNT(*) FROM creations WHERE user_id = u.id) as creations_count,
-               (SELECT COUNT(*) FROM game_attempts WHERE user_id = u.id) as games_played,
-               (SELECT COUNT(*) FROM user_achievements WHERE user_id = u.id) as achievements_count,
-               (SELECT COUNT(*) FROM user_inventory WHERE user_id = u.id) as inventory_count
-        FROM users u
-        JOIN profiles p ON p.user_id = u.id
+        ${baseSelect}
         WHERE u.nickname LIKE ? COLLATE NOCASE
            OR u.nickname LIKE ? COLLATE NOCASE
            OR p.display_name LIKE ? COLLATE NOCASE
            OR COALESCE(u.email, '') LIKE ? COLLATE NOCASE
-        ORDER BY u.created_at DESC
+        ORDER BY ${orderClause}
       `).all(likeParam, cleanLike, likeParam, likeParam)
     : db.prepare(`
-        SELECT u.id, u.nickname, u.email, u.email_verified, u.role_id, u.is_banned, u.ban_reason,
-               u.failed_login_attempts, u.locked_until, u.created_at as registered_at,
-               p.display_name, p.avatar_url, p.level, p.xp, p.total_xp, p.daily_streak,
-               (SELECT COUNT(*) FROM posts WHERE user_id = u.id) as posts_count,
-               (SELECT COUNT(*) FROM creations WHERE user_id = u.id) as creations_count,
-               (SELECT COUNT(*) FROM game_attempts WHERE user_id = u.id) as games_played,
-               (SELECT COUNT(*) FROM user_achievements WHERE user_id = u.id) as achievements_count,
-               (SELECT COUNT(*) FROM user_inventory WHERE user_id = u.id) as inventory_count
-        FROM users u
-        JOIN profiles p ON p.user_id = u.id
-        ORDER BY u.created_at DESC
+        ${baseSelect}
+        ORDER BY ${orderClause}
       `).all();
-  res.json({ users });
+
+  const summary = db.prepare(`
+    SELECT
+      (SELECT COUNT(*) FROM users) as total_users,
+      (SELECT COUNT(*) FROM users WHERE datetime(created_at) >= datetime('now', '-24 hours')) as new_last_24h,
+      (SELECT COUNT(*) FROM game_attempts) as total_games_played,
+      (SELECT COUNT(*) FROM game_attempts WHERE game_id = 'daily-quiz') as total_quizzes_played,
+      (SELECT COUNT(*) FROM game_attempts WHERE game_id = 'guess-track') as total_guess_track_played
+  `).get();
+
+  res.json({ users, summary, sort: sortParam });
 });
 
 app.get('/api/admin/users/:id/details', requireAdminOrMod, (req: Request, res: Response) => {
@@ -3692,7 +5679,7 @@ app.get('/api/admin/users/:id/details', requireAdminOrMod, (req: Request, res: R
            u.failed_login_attempts, u.locked_until, u.created_at as registered_at,
            p.display_name, p.avatar_url, p.bio, p.custom_status, p.level, p.xp, p.total_xp, p.daily_streak,
            p.equipped_frame, p.equipped_banner, p.equipped_name_style, p.equipped_badge,
-           p.equipped_theme, p.equipped_effect,
+           p.equipped_title, p.equipped_theme, p.equipped_effect,
            (SELECT COUNT(*) FROM game_attempts WHERE user_id = u.id) as games_played,
            (SELECT COUNT(*) FROM game_attempts WHERE user_id = u.id AND game_id = 'guess-track' AND score > 0) as guess_track_wins,
            (SELECT COUNT(*) FROM game_attempts WHERE user_id = u.id AND game_id = 'daily-quiz') as quiz_played,
@@ -3984,24 +5971,123 @@ app.post('/api/reports', requireAuth, (req: AuthRequest, res: Response) => {
   res.json({ ok: true, id });
 });
 
-// Admin Quiz Question management
+// Admin Quiz Settings (enable/disable quiz + manual active_quiz_ids mode)
+app.get('/api/admin/quiz/settings', requireAdminOrMod, (_req: Request, res: Response) => {
+  const settings = getQuizSettingsFromDb();
+  const poolInfo = getCombinedQuizPool();
+  res.json({
+    quiz_enabled: settings.quiz_enabled,
+    active_quiz_ids: settings.active_quiz_ids,
+    total_pool_count: poolInfo.validById.size,
+  });
+});
+
+app.put('/api/admin/quiz/settings', requireAdminOrMod, (req: AuthRequest, res: Response) => {
+  const { quiz_enabled, active_quiz_ids } = req.body || {};
+
+  db.transaction(() => {
+    if (typeof quiz_enabled === 'boolean') {
+      db.prepare(`
+        INSERT INTO app_meta (key, value) VALUES ('quiz_enabled', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      `).run(quiz_enabled ? '1' : '0');
+    }
+
+    if (Array.isArray(active_quiz_ids)) {
+      const cleaned = Array.from(
+        new Set(
+          active_quiz_ids
+            .filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+            .map((id) => id.trim())
+            .slice(0, 20)
+        )
+      );
+      db.prepare(`
+        INSERT INTO app_meta (key, value) VALUES ('active_quiz_ids', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      `).run(JSON.stringify(cleaned));
+    }
+  })();
+
+  const updated = getQuizSettingsFromDb();
+  res.json({ ok: true, ...updated });
+});
+
+// Admin Quiz Question management (with generated discography pool counter + bulk import)
 app.get('/api/admin/quiz-questions', requireAdminOrMod, (_req: Request, res: Response) => {
   const questions = db.prepare('SELECT * FROM quiz_questions ORDER BY created_at DESC').all();
-  res.json({ questions });
+  const poolInfo = getCombinedQuizPool();
+  const settings = getQuizSettingsFromDb();
+  res.json({
+    questions,
+    custom_active_count: poolInfo.customCount,
+    generated_pool_count: poolInfo.generatedCount,
+    total_pool_count: poolInfo.validById.size,
+    quiz_enabled: settings.quiz_enabled,
+    active_quiz_ids: settings.active_quiz_ids,
+  });
+});
+
+app.post('/api/admin/quiz-questions/bulk', requireAdminOrMod, (req: AuthRequest, res: Response) => {
+  const rawInput = req.body?.raw_text ?? req.body?.items;
+  const parsed = parseBulkQuizInput(rawInput);
+
+  if (parsed.items.length === 0) {
+    res.status(400).json({
+      error: parsed.errors[0] || 'Не удалось распознать ни одного валидного вопроса для импорта.',
+      errors: parsed.errors,
+    });
+    return;
+  }
+
+  const insertedIds: string[] = [];
+  const insertStmt = db.prepare(`
+    INSERT INTO quiz_questions (id, question_ru, question_en, options_json, correct_index, explanation_ru, explanation_en, difficulty)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  db.transaction(() => {
+    for (const item of parsed.items) {
+      const id = 'qz_' + crypto.randomUUID().slice(0, 8);
+      insertStmt.run(
+        id,
+        item.question_ru,
+        item.question_en,
+        JSON.stringify(item.options),
+        item.correct_index,
+        item.explanation_ru,
+        item.explanation_en,
+        item.difficulty
+      );
+      insertedIds.push(id);
+    }
+  })();
+
+  res.json({
+    ok: true,
+    imported_count: insertedIds.length,
+    skipped_count: parsed.errors.length,
+    errors: parsed.errors,
+    ids: insertedIds,
+  });
 });
 
 app.post('/api/admin/quiz-questions', requireAdminOrMod, (req: AuthRequest, res: Response) => {
   const { question_ru, question_en, options, correct_index, explanation_ru, explanation_en, difficulty } = req.body || {};
+  const cleanRu = typeof question_ru === 'string' ? question_ru.trim() : '';
+  const cleanEn = typeof question_en === 'string' && question_en.trim() ? question_en.trim() : cleanRu;
   if (
-    typeof question_ru !== 'string' ||
-    !question_ru.trim() ||
-    typeof question_en !== 'string' ||
-    !question_en.trim() ||
+    !cleanRu ||
     !Array.isArray(options) ||
     options.length < 2 ||
     correct_index === undefined
   ) {
-    res.status(400).json({ error: 'Missing required quiz question fields' });
+    res.status(400).json({ error: 'Заполните текст вопроса, варианты ответа и укажите верный индекс.' });
+    return;
+  }
+  const cleanOptions = options.map((o: any) => String(o || '').trim()).filter(Boolean);
+  if (cleanOptions.length < 2) {
+    res.status(400).json({ error: 'Нужно указать минимум 2 непустых варианта ответа.' });
     return;
   }
   const id = 'qz_' + crypto.randomUUID().slice(0, 8);
@@ -4010,13 +6096,13 @@ app.post('/api/admin/quiz-questions', requireAdminOrMod, (req: AuthRequest, res:
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id,
-    question_ru.trim(),
-    question_en.trim(),
-    JSON.stringify(options),
-    Math.max(0, Math.min(Number(correct_index) || 0, options.length - 1)),
-    typeof explanation_ru === 'string' ? explanation_ru : '',
-    typeof explanation_en === 'string' ? explanation_en : '',
-    Number(difficulty) || 1
+    cleanRu,
+    cleanEn,
+    JSON.stringify(cleanOptions),
+    Math.max(0, Math.min(Number(correct_index) || 0, cleanOptions.length - 1)),
+    typeof explanation_ru === 'string' ? explanation_ru.trim() : '',
+    typeof explanation_en === 'string' && explanation_en.trim() ? explanation_en.trim() : (typeof explanation_ru === 'string' ? explanation_ru.trim() : ''),
+    Math.max(1, Math.min(3, Number(difficulty) || 1))
   );
 
   res.json({ ok: true, id });
@@ -4041,12 +6127,12 @@ app.put('/api/admin/quiz-questions/:id', requireAdminOrMod, (req: AuthRequest, r
       is_active = COALESCE(?, is_active)
     WHERE id = ?
   `).run(
-    typeof question_ru === 'string' ? question_ru : null,
-    typeof question_en === 'string' ? question_en : null,
-    Array.isArray(options) ? JSON.stringify(options) : null,
+    typeof question_ru === 'string' ? question_ru.trim() : null,
+    typeof question_en === 'string' ? question_en.trim() : null,
+    Array.isArray(options) ? JSON.stringify(options.map((o: any) => String(o || '').trim()).filter(Boolean)) : null,
     correct_index !== undefined ? Number(correct_index) : null,
-    typeof explanation_ru === 'string' ? explanation_ru : null,
-    typeof explanation_en === 'string' ? explanation_en : null,
+    typeof explanation_ru === 'string' ? explanation_ru.trim() : null,
+    typeof explanation_en === 'string' ? explanation_en.trim() : null,
     difficulty !== undefined ? Number(difficulty) : null,
     is_active !== undefined ? (is_active ? 1 : 0) : null,
     req.params.id
@@ -4085,6 +6171,7 @@ app.get('/api/admin/leaderboard', requireAdminOrMod, (req: Request, res: Respons
   const gameFilter = rawGame === 'guess-track' || rawGame === 'daily-quiz' ? rawGame : 'all';
   const search = String(req.query.search || '').trim().toLowerCase();
   const today = getUtcDateString();
+  const trackSlot = getUtc12HourSlot();
 
   const timeConditionGa =
     timeframe === 'weekly'
@@ -4118,11 +6205,11 @@ app.get('/api/admin/leaderboard', requireAdminOrMod, (req: Request, res: Respons
       (SELECT COALESCE(SUM(ga.score), 0) FROM game_attempts ga WHERE ga.user_id = u.id ${gameFilter !== 'all' ? 'AND ga.game_id = @gameFilter' : ''} ${timeConditionGa}) as game_score,
       (SELECT COALESCE(SUM(ga.xp_earned), 0) FROM game_attempts ga WHERE ga.user_id = u.id ${gameFilter !== 'all' ? 'AND ga.game_id = @gameFilter' : ''} ${timeConditionGa}) as game_xp,
       (SELECT COALESCE(SUM(xt.amount), 0) FROM xp_transactions xt WHERE xt.user_id = u.id AND xt.amount > 0 ${timeConditionXt}) as period_xp,
-      EXISTS(SELECT 1 FROM daily_track_attempts dta WHERE dta.user_id = u.id AND dta.challenge_date = @today) as completed_today_track,
+      EXISTS(SELECT 1 FROM daily_track_attempts dta WHERE dta.user_id = u.id AND dta.challenge_date = @trackSlot) as completed_today_track,
       EXISTS(SELECT 1 FROM quiz_attempts qa WHERE qa.user_id = u.id AND qa.challenge_date = @today) as completed_today_quiz
     FROM users u
     JOIN profiles p ON p.user_id = u.id
-  `).all({ gameFilter, today }) as any[];
+  `).all({ gameFilter, today, trackSlot }) as any[];
 
   const enriched = rows
     .map((row) => {
@@ -4163,10 +6250,10 @@ app.get('/api/admin/leaderboard', requireAdminOrMod, (req: Request, res: Respons
       return b.scoped_games_played - a.scoped_games_played;
     });
 
-  const todayTrack = getOrCreateDailyTrackChallenge(today);
+  const todayTrack = getOrCreateDailyTrackChallenge(trackSlot);
   const todayQuiz = getOrCreateDailyQuizChallenge(today);
   const totalAttempts = (db.prepare('SELECT COUNT(*) as c FROM game_attempts').get() as any)?.c || 0;
-  const todayTrackAttempts = (db.prepare('SELECT COUNT(*) as c FROM daily_track_attempts WHERE challenge_date = ?').get(today) as any)?.c || 0;
+  const todayTrackAttempts = (db.prepare('SELECT COUNT(*) as c FROM daily_track_attempts WHERE challenge_date = ?').get(trackSlot) as any)?.c || 0;
   const todayQuizAttempts = (db.prepare('SELECT COUNT(*) as c FROM quiz_attempts WHERE challenge_date = ?').get(today) as any)?.c || 0;
 
   res.json({
@@ -4175,7 +6262,9 @@ app.get('/api/admin/leaderboard', requireAdminOrMod, (req: Request, res: Respons
     game: gameFilter,
     summary: {
       today_utc: today,
+      track_slot_utc: trackSlot,
       next_reset_at: getNextUtcMidnightIso(today),
+      next_track_reset_at: getNextUtc12HourResetIso(trackSlot),
       total_ranked: enriched.length,
       total_attempts: totalAttempts,
       today_track_title: todayTrack?.track.title || null,
@@ -4266,7 +6355,8 @@ app.post('/api/admin/leaderboard/clear', requireAdmin, (req: AuthRequest, res: R
         removed.profiles_updated += 1;
       }
     } else if (rawScope === 'daily-attempts') {
-      removed.daily_track_attempts = db.prepare('DELETE FROM daily_track_attempts WHERE challenge_date = ?').run(today).changes;
+      const trackSlot = getUtc12HourSlot();
+      removed.daily_track_attempts = db.prepare('DELETE FROM daily_track_attempts WHERE challenge_date IN (?, ?)').run(trackSlot, today).changes;
       removed.quiz_attempts = db.prepare('DELETE FROM quiz_attempts WHERE challenge_date = ?').run(today).changes;
     }
 
@@ -4333,7 +6423,8 @@ app.delete('/api/admin/leaderboard/users/:userId', requireAdmin, (req: AuthReque
       removed.xp_transactions = db.prepare("DELETE FROM xp_transactions WHERE user_id = ? AND source = 'daily_quiz'").run(userId).changes;
       adjustUserProfileAfterXpRemoval(userId, Number(sumRow?.sum_xp) || 0);
     } else if (rawScope === 'daily-attempts') {
-      removed.daily_track_attempts = db.prepare('DELETE FROM daily_track_attempts WHERE user_id = ? AND challenge_date = ?').run(userId, today).changes;
+      const trackSlot = getUtc12HourSlot();
+      removed.daily_track_attempts = db.prepare('DELETE FROM daily_track_attempts WHERE user_id = ? AND challenge_date IN (?, ?)').run(userId, trackSlot, today).changes;
       removed.quiz_attempts = db.prepare('DELETE FROM quiz_attempts WHERE user_id = ? AND challenge_date = ?').run(userId, today).changes;
     }
 

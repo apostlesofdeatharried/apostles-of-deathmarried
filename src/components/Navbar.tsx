@@ -1,8 +1,11 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import { useI18n } from '../context/I18nContext.js';
-import { useAuth } from '../context/AuthContext.js';
+import { authFetch, useAuth } from '../context/AuthContext.js';
 import { ShopModal } from './ShopModal.js';
-import { formatHandle, renderEquippedBadge } from '../utils/cosmetics.js';
+import { dispatchAchievementUnlocked } from './AchievementToast.js';
+import { safeJson } from '../utils/logic.js';
+import { formatHandle, renderEquippedBadge, renderEquippedTitle } from '../utils/cosmetics.js';
+import { NotificationCenter } from './NotificationCenter.js';
 import { Menu, X, Shield, User, LogOut, ChevronDown, ShoppingBag } from 'lucide-react';
 
 interface NavbarProps {
@@ -12,10 +15,39 @@ interface NavbarProps {
 
 export const Navbar: React.FC<NavbarProps> = ({ currentTab, onSelectTab }) => {
   const { lang, setLang, t } = useI18n();
-  const { user, openAuth, logout } = useAuth();
+  const { user, openAuth, logout, refresh } = useAuth();
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [userDropdownOpen, setUserDropdownOpen] = useState(false);
   const [shopOpen, setShopOpen] = useState(false);
+  const [rosePulse, setRosePulse] = useState(false);
+  const roseClicksRef = useRef(0);
+  const roseTriggeredRef = useRef(false);
+
+  const handleRoseClick = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    roseClicksRef.current += 1;
+    setRosePulse(true);
+    window.setTimeout(() => setRosePulse(false), 240);
+
+    if (roseClicksRef.current >= 5 && !roseTriggeredRef.current && user) {
+      roseTriggeredRef.current = true;
+      authFetch('/api/achievements/easter-egg', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key: 'curious_rose' }),
+      })
+        .then((res) => (res.ok ? safeJson<any>(res, null) : null))
+        .then((data) => {
+          if (data?.newly_unlocked_achievements?.length > 0) {
+            dispatchAchievementUnlocked(data.newly_unlocked_achievements);
+            refresh();
+          }
+        })
+        .catch(() => {
+          roseTriggeredRef.current = false;
+        });
+    }
+  };
 
   const navItems = [
     { id: 'home', label: t('navHome') },
@@ -46,7 +78,12 @@ export const Navbar: React.FC<NavbarProps> = ({ currentTab, onSelectTab }) => {
               className="flex items-center gap-2.5 shrink-0 group text-left focus:outline-none cursor-pointer whitespace-nowrap"
               aria-label="Apostles of deathmarried home"
             >
-              <div className="relative w-8 h-8 rounded-full overflow-hidden border border-white/[0.12] group-hover:border-white/40 transition-colors shrink-0">
+              <div
+                onClick={handleRoseClick}
+                className={`relative w-8 h-8 rounded-full overflow-hidden border transition-all duration-200 shrink-0 ${
+                  rosePulse ? 'scale-115 border-[#c96075]' : 'border-white/[0.12] group-hover:border-white/40'
+                }`}
+              >
                 <img
                   src="/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg"
                   alt="Rose"
@@ -133,6 +170,9 @@ export const Navbar: React.FC<NavbarProps> = ({ currentTab, onSelectTab }) => {
               </button>
             </div>
 
+            {/* Notification Center (logged-in users) */}
+            <NotificationCenter />
+
             {/* User profile dropdown or Auth button */}
             {user ? (
               <div className="relative">
@@ -169,6 +209,7 @@ export const Navbar: React.FC<NavbarProps> = ({ currentTab, onSelectTab }) => {
                         {formatHandle(user.nickname)}
                       </div>
                       <div className="flex items-center gap-1.5 flex-wrap pt-0.5">
+                        {renderEquippedTitle(user.equipped_title, lang, true)}
                         {renderEquippedBadge(user.equipped_badge, lang, true)}
                         <span className="font-mono text-[10px] text-[#8e877e]">
                           {user.xp} XP · {user.role_id}
@@ -229,6 +270,7 @@ export const Navbar: React.FC<NavbarProps> = ({ currentTab, onSelectTab }) => {
 
           {/* Mobile menu trigger */}
           <div className="flex xl:hidden items-center gap-2 shrink-0">
+            <NotificationCenter />
             <button
               onClick={() => setShopOpen(true)}
               className="p-1.5 text-[#ded8ce] hover:text-white cursor-pointer"

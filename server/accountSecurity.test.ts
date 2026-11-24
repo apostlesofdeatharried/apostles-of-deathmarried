@@ -12,7 +12,11 @@ import {
   isSameOriginRequest,
   generateVerificationCode,
   hashVerificationCode,
+  createSignedEmailVerificationToken,
+  verifySignedEmailVerificationToken,
+  normalizePromoCode,
   evaluateAchievementSlugs,
+  getAchievementProgress,
 } from './accountSecurity';
 
 test('normalizeUsername and validateUsername enforce clean unique handles', () => {
@@ -107,6 +111,57 @@ test('verification code hashing never stores plaintext codes', () => {
   assert.equal(h1.length, 64);
 });
 
+test('stateless HMAC email verification tokens validate email, code, purpose, userId, and TTL', () => {
+  const secret = 'test-session-secret-0123456789abcdef';
+  const now = Date.parse('2026-11-23T10:00:00Z');
+  const signed = createSignedEmailVerificationToken('Listener@Example.RU', '482910', 'register', secret, null, now);
+  assert.ok(signed.verification_token.startsWith('ev1.'));
+
+  // Valid check (case-insensitive email)
+  assert.equal(
+    verifySignedEmailVerificationToken(signed.verification_token, 'listener@example.ru', '482910', 'register', secret, null, now + 60_000).valid,
+    true
+  );
+  // Wrong 6-digit code
+  assert.equal(
+    verifySignedEmailVerificationToken(signed.verification_token, 'listener@example.ru', '999999', 'register', secret, null, now + 60_000).valid,
+    false
+  );
+  // Changed email
+  assert.equal(
+    verifySignedEmailVerificationToken(signed.verification_token, 'other@example.ru', '482910', 'register', secret, null, now + 60_000).valid,
+    false
+  );
+  // Wrong purpose
+  assert.equal(
+    verifySignedEmailVerificationToken(signed.verification_token, 'listener@example.ru', '482910', 'verify_existing', secret, null, now + 60_000).valid,
+    false
+  );
+  // Expired (> 10 minutes)
+  assert.equal(
+    verifySignedEmailVerificationToken(signed.verification_token, 'listener@example.ru', '482910', 'register', secret, null, now + 11 * 60_000).valid,
+    false
+  );
+  // Tampered signature
+  assert.equal(
+    verifySignedEmailVerificationToken(signed.verification_token + 'x', 'listener@example.ru', '482910', 'register', secret, null, now + 60_000).valid,
+    false
+  );
+  // Existing user binding check
+  const existingSigned = createSignedEmailVerificationToken('old@example.ru', '123456', 'verify_existing', secret, 'usr_123', now);
+  assert.equal(
+    verifySignedEmailVerificationToken(existingSigned.verification_token, 'old@example.ru', '123456', 'verify_existing', secret, 'usr_123', now + 1000).valid,
+    true
+  );
+  assert.equal(
+    verifySignedEmailVerificationToken(existingSigned.verification_token, 'old@example.ru', '123456', 'verify_existing', secret, 'usr_other', now + 1000).valid,
+    false
+  );
+  // Promo normalization
+  assert.equal(normalizePromoCode('  APOSTLES  '), 'apostles');
+  assert.equal(normalizePromoCode('DeathMarried'), 'deathmarried');
+});
+
 test('evaluateAchievementSlugs unlocks server-authoritative achievements accurately', () => {
   const fresh = evaluateAchievementSlugs({
     isRegistered: true,
@@ -146,6 +201,11 @@ test('evaluateAchievementSlugs unlocks server-authoritative achievements accurat
     creationsCount: 2,
     followersCount: 5,
     followingCount: 4,
+    postsReadCount: 25,
+    promoRedeemedCount: 1,
+    maxTrackCompletions: 10,
+    visitedMidnightMsk: true,
+    clickedSecretRose: true,
   });
   assert.ok(veteran.includes('first_note'));
   assert.ok(veteran.includes('phantom_ear'));
@@ -154,5 +214,41 @@ test('evaluateAchievementSlugs unlocks server-authoritative achievements accurat
   assert.ok(veteran.includes('gothic_treasury'));
   assert.ok(veteran.includes('dressed_in_velvet'));
   assert.ok(veteran.includes('archon_of_sound'));
-  assert.equal(veteran.length, 27);
+  // New community & secret easter egg achievements
+  assert.ok(veteran.includes('easy_first_reply'));
+  assert.ok(veteran.includes('easy_avid_reader'));
+  assert.ok(veteran.includes('hard_community_reader'));
+  assert.ok(veteran.includes('secret_midnight_visitor'));
+  assert.ok(veteran.includes('secret_on_repeat'));
+  assert.ok(veteran.includes('secret_curious_rose'));
+  assert.ok(veteran.includes('secret_first_code'));
+  assert.ok(veteran.includes('secret_flawless_quiz'));
+  assert.equal(veteran.length, 35);
+
+  // Verify numeric progress reporting
+  const prog = getAchievementProgress(
+    'secret_on_repeat',
+    {
+      isRegistered: true,
+      gamesPlayed: 0,
+      guessTrackPlayed: 0,
+      guessTrackWins: 0,
+      quizPlayed: 0,
+      quizPerfectRuns: 0,
+      dailyStreak: 0,
+      totalXp: 0,
+      level: 1,
+      purchasesCount: 0,
+      equippedItemsCount: 0,
+      postsCount: 0,
+      commentsCount: 0,
+      creationsCount: 0,
+      followersCount: 0,
+      followingCount: 0,
+      maxTrackCompletions: 7,
+    },
+    false
+  );
+  assert.deepEqual(prog, { current: 7, target: 10 });
 });
+

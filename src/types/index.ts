@@ -1,7 +1,7 @@
 export type UserRole = 'guest' | 'user' | 'moderator' | 'admin';
 
-export type ShopCategory = 'frame' | 'banner' | 'name_style' | 'badge' | 'theme' | 'effect';
-export type ItemRarity = 'common' | 'uncommon' | 'rare' | 'epic' | 'legendary';
+export type ShopCategory = 'frame' | 'banner' | 'name_style' | 'badge' | 'title' | 'theme' | 'effect';
+export type ItemRarity = 'common' | 'uncommon' | 'rare' | 'epic' | 'legendary' | 'mythic';
 export type AchievementRarity = 'common' | 'rare' | 'epic' | 'legendary';
 
 export interface UserProfile {
@@ -21,6 +21,7 @@ export interface UserProfile {
   equipped_banner?: string | null;
   equipped_name_style?: string | null;
   equipped_badge?: string | null;
+  equipped_title?: string | null;
   equipped_theme?: string | null;
   equipped_effect?: string | null;
   featured_achievements?: string[];
@@ -32,6 +33,8 @@ export interface UserProfile {
   creations_count?: number;
   is_banned?: number;
   is_private?: number;
+  accepted_rules?: number;
+  favorite_track?: string | null;
   registered_at?: string;
 }
 
@@ -166,12 +169,16 @@ export interface Post {
   author_frame?: string;
   author_name_style?: string;
   author_badge?: string;
+  author_title?: string;
   category_name_ru: string;
   category_name_en: string;
   category_slug: string;
   category_is_official?: number;
   is_official_category?: number;
   has_liked?: boolean;
+  rose_count?: number;
+  skull_count?: number;
+  user_reaction?: 'rose' | 'skull' | null;
 }
 
 export interface Comment {
@@ -179,9 +186,12 @@ export interface Comment {
   user_id: string;
   post_id?: string;
   creation_id?: string;
+  album_id?: string | null;
+  single_id?: string | null;
   parent_id?: string | null;
   content: string;
   status?: string;
+  is_hidden?: number;
   created_at: string;
   author_nickname: string;
   author_name: string;
@@ -190,6 +200,7 @@ export interface Comment {
   author_frame?: string;
   author_name_style?: string;
   author_badge?: string;
+  author_title?: string;
   replies?: Comment[];
 }
 
@@ -205,6 +216,9 @@ export interface Creation {
   rejection_reason?: string;
   views_count: number;
   likes_count: number;
+  rose_count?: number;
+  skull_count?: number;
+  user_reaction?: 'rose' | 'skull' | null;
   created_at: string;
   author_nickname: string;
   author_name: string;
@@ -214,6 +228,22 @@ export interface Creation {
   author_name_style?: string;
   author_badge?: string;
   has_liked?: boolean;
+}
+
+export interface AppNotification {
+  id: string;
+  user_id: string;
+  actor_id?: string | null;
+  actor_nickname: string;
+  actor_name: string;
+  type: string;
+  target_type: 'post' | 'creation' | 'album' | 'single';
+  target_id: string;
+  target_title: string;
+  target_link: string;
+  excerpt: string;
+  is_read: number;
+  created_at: string;
 }
 
 export interface LeaderboardEntry {
@@ -231,6 +261,7 @@ export interface LeaderboardEntry {
   equipped_banner?: string;
   equipped_name_style?: string;
   equipped_badge?: string;
+  equipped_title?: string;
 }
 
 export interface ShopItem {

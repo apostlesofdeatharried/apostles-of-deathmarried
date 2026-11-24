@@ -1,8 +1,22 @@
 import crypto from 'crypto';
 import fs from 'fs';
+import {
+  extractLyricPairs,
+  getMoscow12hCycle,
+  isValidMoscow12hCycle,
+  getNextMoscow12hResetIso,
+  getPreviousMoscow12hCycle,
+} from '../src/utils/logic.js';
 
 export const DAILY_SNIPPET_DURATION_SECONDS = 5;
 export const DEFAULT_DAILY_QUIZ_COUNT = 5;
+
+export {
+  getMoscow12hCycle,
+  isValidMoscow12hCycle,
+  getNextMoscow12hResetIso,
+  getPreviousMoscow12hCycle,
+};
 
 export interface PlayableTrackCandidate {
   id: string;
@@ -14,9 +28,23 @@ export interface PlayableTrackCandidate {
   cover_url?: string;
 }
 
+export interface LyricTrackCandidate {
+  id: string;
+  title: string;
+  lyrics: string;
+  source: 'track' | 'single';
+  album_title?: string;
+  cover_url?: string;
+}
+
 export interface TitleOption {
   id: string;
   title: string;
+}
+
+export interface LyricOption {
+  id: string;
+  text: string;
 }
 
 export interface DailyTrackSelection {
@@ -26,6 +54,19 @@ export interface DailyTrackSelection {
   snippet_start_ratio: number;
   snippet_duration_seconds: number;
   options: TitleOption[];
+}
+
+export interface DailySpeedTrackSelection extends DailyTrackSelection {
+  speed_mode: 0.5 | 2.5;
+}
+
+export interface DailyLyricsSelection {
+  challenge_date: string;
+  track: LyricTrackCandidate;
+  prompt_line: string;
+  correct_option_id: string;
+  correct_line: string;
+  options: LyricOption[];
 }
 
 export interface RawQuizQuestion {
@@ -52,6 +93,7 @@ export interface ValidatedQuizQuestion {
 }
 
 const UTC_DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
+const UTC_12H_SLOT_REGEX = /^\d{4}-\d{2}-\d{2}-H([01])$/;
 
 /**
  * Returns the current UTC calendar date formatted as YYYY-MM-DD.
@@ -82,6 +124,33 @@ export function getNextUtcMidnightIso(utcDate: string): string {
     return new Date(Date.parse(`${today}T00:00:00.000Z`) + 86400000).toISOString();
   }
   return new Date(baseMs + 86400000).toISOString();
+}
+
+/**
+ * Legacy 12-hour UTC slot helpers kept for backwards compatibility with tests.
+ */
+export function getUtc12HourSlot(now: Date = new Date()): string {
+  const datePart = getUtcDateString(now);
+  const half = now.getUTCHours() < 12 ? 0 : 1;
+  return `${datePart}-H${half}`;
+}
+
+export function isValidUtc12HourSlot(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const match = UTC_12H_SLOT_REGEX.exec(value);
+  if (!match) return false;
+  return isValidUtcDateString(value.slice(0, 10));
+}
+
+export function getNextUtc12HourResetIso(slotKey: string): string {
+  const TWELVE_HOURS_MS = 12 * 60 * 60 * 1000;
+  if (!isValidUtc12HourSlot(slotKey)) {
+    return getNextUtc12HourResetIso(getUtc12HourSlot());
+  }
+  const datePart = slotKey.slice(0, 10);
+  const half = slotKey.endsWith('-H1') ? 1 : 0;
+  const baseMs = Date.parse(`${datePart}T00:00:00.000Z`) + half * TWELVE_HOURS_MS;
+  return new Date(baseMs + TWELVE_HOURS_MS).toISOString();
 }
 
 /**
@@ -116,18 +185,17 @@ export function deterministicShuffle<T>(items: readonly T[], seedInput: string, 
 }
 
 /**
- * Computes exact 5-second (or track-bounded) snippet start and duration.
- * Allows positions across beginning, middle, and near-end while guaranteeing
- * [snippetStart, snippetStart + snippetDuration] never exceeds track duration.
+ * Computes exact snippet start and duration bounded cleanly within track length.
  */
 export function computeDailySnippetWindow(
   durationSeconds: number,
-  utcDate: string,
+  cycleId: string,
   trackId: string,
   secret: string,
-  targetDuration: number = DAILY_SNIPPET_DURATION_SECONDS
+  targetDuration: number = DAILY_SNIPPET_DURATION_SECONDS,
+  scopePrefix: string = 'daily-track-snippet'
 ): { snippet_start_seconds: number; snippet_start_ratio: number; snippet_duration_seconds: number } {
-  const ratio = computeDeterministicUnitFloat(`daily-track-snippet:${utcDate}:${trackId}`, secret);
+  const ratio = computeDeterministicUnitFloat(`${scopePrefix}:${cycleId}:${trackId}`, secret);
   const safeDur = Number.isFinite(durationSeconds) && durationSeconds > 0 ? Math.floor(durationSeconds) : 0;
 
   if (safeDur <= 0) {
@@ -157,9 +225,9 @@ export function computeDailySnippetWindow(
 }
 
 /**
- * Deterministically picks the shared UTC daily track, 5-second snippet window,
- * and shuffled multiple-choice options.
- * Avoids recently used track IDs whenever enough playable tracks exist.
+ * Deterministically picks the shared 12-hour track challenge, 5-second snippet window,
+ * and Fisher-Yates shuffled multiple-choice options.
+ * Supports `gameScope` so guess-track, reverse-track, and speed-track select independent tracks!
  */
 export function pickDailyTrackChallenge(params: {
   utcDate: string;
@@ -168,6 +236,8 @@ export function pickDailyTrackChallenge(params: {
   recentTrackIds?: string[];
   secret: string;
   optionsCount?: number;
+  gameScope?: string;
+  sourceWindowSeconds?: number;
 }): DailyTrackSelection | null {
   const {
     utcDate,
@@ -176,9 +246,10 @@ export function pickDailyTrackChallenge(params: {
     recentTrackIds = [],
     secret,
     optionsCount = 4,
+    gameScope = 'daily-track',
+    sourceWindowSeconds = DAILY_SNIPPET_DURATION_SECONDS,
   } = params;
 
-  // Deduplicate and stably sort playable tracks so order never varies across instances
   const uniqueMap = new Map<string, PlayableTrackCandidate>();
   for (const t of playableTracks) {
     if (!t || !t.id || !t.title?.trim() || !t.audio_url?.trim()) continue;
@@ -189,13 +260,13 @@ export function pickDailyTrackChallenge(params: {
   const sortedPool = Array.from(uniqueMap.values()).sort((a, b) => a.id.localeCompare(b.id));
   if (sortedPool.length === 0) return null;
 
-  // Avoid recently played tracks while ensuring at least 1 candidate remains
   const maxRecentToExclude = Math.max(0, Math.min(recentTrackIds.length, sortedPool.length - 1));
   const excludedSet = new Set(recentTrackIds.slice(0, maxRecentToExclude));
   const preferredPool = sortedPool.filter((t) => !excludedSet.has(t.id));
   const candidatePool = preferredPool.length > 0 ? preferredPool : sortedPool;
 
-  const pickedIdx = hmacUint32(`daily-track-pick:${utcDate}`, secret) % candidatePool.length;
+  const pickSeed = gameScope === 'daily-track' ? `daily-track-pick:${utcDate}` : `${gameScope}-pick:${utcDate}`;
+  const pickedIdx = hmacUint32(pickSeed, secret) % candidatePool.length;
   const track = candidatePool[pickedIdx];
 
   const window = computeDailySnippetWindow(
@@ -203,10 +274,10 @@ export function pickDailyTrackChallenge(params: {
     utcDate,
     track.id,
     secret,
-    DAILY_SNIPPET_DURATION_SECONDS
+    sourceWindowSeconds,
+    gameScope === 'daily-track' ? 'daily-track-snippet' : `${gameScope}-snippet`
   );
 
-  // Build unique distractor list (avoid duplicating target track id or exact normalized title)
   const seenTitles = new Set<string>([track.title.trim().toLowerCase()]);
   const distractorCandidates: TitleOption[] = [];
   const sortedTitles = [...allTitleCandidates].sort((a, b) => a.id.localeCompare(b.id));
@@ -221,13 +292,13 @@ export function pickDailyTrackChallenge(params: {
 
   const shuffledDistractors = deterministicShuffle(
     distractorCandidates,
-    `daily-track-distractors:${utcDate}:${track.id}`,
+    `${gameScope}-distractors:${utcDate}:${track.id}`,
     secret
   ).slice(0, Math.max(0, optionsCount - 1));
 
   const options = deterministicShuffle(
     [{ id: track.id, title: track.title.trim() }, ...shuffledDistractors],
-    `daily-track-options:${utcDate}:${track.id}`,
+    `${gameScope}-options:${utcDate}:${track.id}`,
     secret
   );
 
@@ -236,13 +307,194 @@ export function pickDailyTrackChallenge(params: {
     track,
     snippet_start_seconds: window.snippet_start_seconds,
     snippet_start_ratio: window.snippet_start_ratio,
-    snippet_duration_seconds: window.snippet_duration_seconds,
+    snippet_duration_seconds: DAILY_SNIPPET_DURATION_SECONDS,
     options,
   };
 }
 
 /**
- * Validates a quiz question row from SQLite before including it in a daily quiz set.
+ * Picks the 12-hour MSK "Задом наперёд" (5-second reversed audio) challenge.
+ */
+export function pickDailyReverseTrackChallenge(params: {
+  cycleId: string;
+  playableTracks: PlayableTrackCandidate[];
+  allTitleCandidates: TitleOption[];
+  excludeTrackIds?: string[];
+  secret: string;
+}): DailyTrackSelection | null {
+  return pickDailyTrackChallenge({
+    utcDate: params.cycleId,
+    playableTracks: params.playableTracks,
+    allTitleCandidates: params.allTitleCandidates,
+    recentTrackIds: params.excludeTrackIds || [],
+    secret: params.secret,
+    gameScope: 'reverse-track',
+    sourceWindowSeconds: DAILY_SNIPPET_DURATION_SECONDS,
+  });
+}
+
+/**
+ * Picks the 12-hour MSK "0.5x / 2.5x" (5 seconds of real listening time) challenge.
+ * Deterministically picks either 0.5x slowed or 2.5x sped-up mode per cycle.
+ */
+export function pickDailySpeedTrackChallenge(params: {
+  cycleId: string;
+  playableTracks: PlayableTrackCandidate[];
+  allTitleCandidates: TitleOption[];
+  excludeTrackIds?: string[];
+  secret: string;
+}): DailySpeedTrackSelection | null {
+  const speedMode: 0.5 | 2.5 =
+    hmacUint32(`speed-track-mode:${params.cycleId}`, params.secret) % 2 === 0 ? 0.5 : 2.5;
+  // Real listening duration is 5s: 0.5x consumes 2.5s of source, 2.5x consumes 12.5s of source
+  const sourceSpan = Math.ceil(DAILY_SNIPPET_DURATION_SECONDS * speedMode);
+
+  const base = pickDailyTrackChallenge({
+    utcDate: params.cycleId,
+    playableTracks: params.playableTracks,
+    allTitleCandidates: params.allTitleCandidates,
+    recentTrackIds: params.excludeTrackIds || [],
+    secret: params.secret,
+    gameScope: 'speed-track',
+    sourceWindowSeconds: sourceSpan,
+  });
+  if (!base) return null;
+
+  return {
+    ...base,
+    speed_mode: speedMode,
+  };
+}
+
+/**
+ * Deterministically picks the 12-hour MSK "Угадай строчку" challenge from real DB lyrics.
+ * Shows Line 1 and gives 4 Fisher-Yates shuffled options (real Line 2 + 3 plausible lines from other tracks).
+ */
+export function pickDailyLyricsChallenge(params: {
+  cycleId: string;
+  lyricTracks: LyricTrackCandidate[];
+  recentTrackIds?: string[];
+  secret: string;
+}): DailyLyricsSelection | null {
+  const { cycleId, lyricTracks, recentTrackIds = [], secret } = params;
+
+  interface IndexedPair {
+    pairKey: string;
+    track: LyricTrackCandidate;
+    prompt: string;
+    answer: string;
+  }
+
+  const sortedTracks = [...lyricTracks]
+    .filter((t) => t && t.id && t.title?.trim() && t.lyrics?.trim())
+    .sort((a, b) => a.id.localeCompare(b.id));
+
+  const allPairs: IndexedPair[] = [];
+  const allDistractorLines: Array<{ trackId: string; text: string }> = [];
+  const seenGlobalLines = new Set<string>();
+
+  for (const track of sortedTracks) {
+    const pairs = extractLyricPairs(track.lyrics);
+    pairs.forEach((p, idx) => {
+      allPairs.push({
+        pairKey: `${track.id}:${idx}`,
+        track,
+        prompt: p.prompt,
+        answer: p.answer,
+      });
+      const normAns = p.answer.toLowerCase();
+      if (!seenGlobalLines.has(`${track.id}:${normAns}`)) {
+        seenGlobalLines.add(`${track.id}:${normAns}`);
+        allDistractorLines.push({ trackId: track.id, text: p.answer });
+      }
+      const normPr = p.prompt.toLowerCase();
+      if (!seenGlobalLines.has(`${track.id}:${normPr}`)) {
+        seenGlobalLines.add(`${track.id}:${normPr}`);
+        allDistractorLines.push({ trackId: track.id, text: p.prompt });
+      }
+    });
+  }
+
+  if (allPairs.length === 0) return null;
+
+  // Prefer tracks not used in the previous 12h MSK cycle(s)
+  const uniqueTrackIds = Array.from(new Set(allPairs.map((p) => p.track.id)));
+  const maxExclude = Math.max(0, Math.min(recentTrackIds.length, uniqueTrackIds.length - 1));
+  const excludedTracks = new Set(recentTrackIds.slice(0, maxExclude));
+  const preferredPairs = allPairs.filter((p) => !excludedTracks.has(p.track.id));
+  const pool = preferredPairs.length > 0 ? preferredPairs : allPairs;
+
+  const pickedIdx = hmacUint32(`guess-lyrics-pick:${cycleId}`, secret) % pool.length;
+  const chosen = pool[pickedIdx];
+
+  // Collect 3 unique distractor lines — strictly preferring lines from OTHER tracks
+  const forbidden = new Set<string>([
+    chosen.prompt.toLowerCase(),
+    chosen.answer.toLowerCase(),
+  ]);
+
+  const otherTrackLines: string[] = [];
+  const sameTrackFallbackLines: string[] = [];
+  const seenCandidateText = new Set<string>();
+
+  for (const item of allDistractorLines) {
+    const norm = item.text.toLowerCase();
+    if (forbidden.has(norm) || seenCandidateText.has(norm)) continue;
+    seenCandidateText.add(norm);
+    if (item.trackId !== chosen.track.id) {
+      otherTrackLines.push(item.text);
+    } else {
+      sameTrackFallbackLines.push(item.text);
+    }
+  }
+
+  const shuffledOther = deterministicShuffle(
+    otherTrackLines,
+    `guess-lyrics-distractors-other:${cycleId}:${chosen.pairKey}`,
+    secret
+  );
+  const shuffledSame = deterministicShuffle(
+    sameTrackFallbackLines,
+    `guess-lyrics-distractors-same:${cycleId}:${chosen.pairKey}`,
+    secret
+  );
+
+  const distractors = [...shuffledOther, ...shuffledSame].slice(0, 3);
+  if (distractors.length < 1) return null;
+
+  const makeOptionId = (text: string) =>
+    'lo_' +
+    crypto
+      .createHmac('sha256', secret || 'apostles-daily-default-salt')
+      .update(`${cycleId}:${chosen.pairKey}:${text}`)
+      .digest('hex')
+      .slice(0, 10);
+
+  const correctOptionId = makeOptionId(chosen.answer);
+  const rawOptions: LyricOption[] = [
+    { id: correctOptionId, text: chosen.answer },
+    ...distractors.map((text) => ({ id: makeOptionId(text), text })),
+  ];
+
+  // Unbiased Fisher-Yates shuffle across all 4 options
+  const options = deterministicShuffle(
+    rawOptions,
+    `guess-lyrics-options:${cycleId}:${chosen.pairKey}`,
+    secret
+  );
+
+  return {
+    challenge_date: cycleId,
+    track: chosen.track,
+    prompt_line: chosen.prompt,
+    correct_option_id: correctOptionId,
+    correct_line: chosen.answer,
+    options,
+  };
+}
+
+/**
+ * Validates a quiz question row from SQLite before including it in a quiz set.
  */
 export function parseAndValidateQuizQuestion(raw: RawQuizQuestion): ValidatedQuizQuestion | null {
   if (!raw || typeof raw.id !== 'string' || !raw.id.trim()) return null;
@@ -271,6 +523,9 @@ export function parseAndValidateQuizQuestion(raw: RawQuizQuestion): ValidatedQui
     return null;
   }
 
+  const diffNum = Number(raw.difficulty);
+  const normalizedDifficulty = diffNum === 3 ? 3 : diffNum === 2 ? 2 : 1;
+
   return {
     id: raw.id,
     question_ru: questionRu || questionEn,
@@ -279,15 +534,12 @@ export function parseAndValidateQuizQuestion(raw: RawQuizQuestion): ValidatedQui
     correct_index: correctIndex,
     explanation_ru: typeof raw.explanation_ru === 'string' ? raw.explanation_ru : '',
     explanation_en: typeof raw.explanation_en === 'string' ? raw.explanation_en : '',
-    difficulty: Number(raw.difficulty) || 1,
+    difficulty: normalizedDifficulty,
   };
 }
 
 /**
- * Deterministically forms a daily quiz question set for a given UTC date.
- * - Filters out invalid/inactive/malformed questions.
- * - Never includes duplicate question IDs in the same day's set.
- * - Avoids recently used question IDs whenever the question bank has enough fresh questions.
+ * Deterministically forms a quiz question set for a given 12-hour cycle.
  */
 export function pickDailyQuizSet(params: {
   utcDate: string;
@@ -332,8 +584,29 @@ export function pickDailyQuizSet(params: {
 }
 
 /**
+ * Shuffles a quiz question's answer options using Fisher-Yates shuffle and remaps
+ * correct_index accurately so the correct answer lands on a random/uniform position.
+ */
+export function shuffleQuizQuestionOptions(
+  question: ValidatedQuizQuestion,
+  seedInput: string,
+  secret: string
+): ValidatedQuizQuestion {
+  const indexed = question.options.map((text, idx) => ({
+    text,
+    isCorrect: idx === question.correct_index,
+  }));
+  const shuffled = deterministicShuffle(indexed, `quiz-opt-shuffle:${seedInput}:${question.id}`, secret);
+  const nextCorrectIndex = shuffled.findIndex((item) => item.isCorrect);
+  return {
+    ...question,
+    options: shuffled.map((item) => item.text),
+    correct_index: nextCorrectIndex >= 0 ? nextCorrectIndex : 0,
+  };
+}
+
+/**
  * Reads exact duration in seconds from a local PCM RIFF/WAVE file header.
- * Returns null if the file is missing or not a standard WAV file.
  */
 export function readLocalWavDurationSeconds(filePath: string): number | null {
   try {

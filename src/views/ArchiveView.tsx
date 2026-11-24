@@ -5,6 +5,9 @@ import { useAuth, authFetch } from '../context/AuthContext.js';
 import { Album, Single, Track, StreamingLinks } from '../types/index.js';
 import { formatDuration, safeJson } from '../utils/logic.js';
 import { CoverArt } from '../components/CoverArt.js';
+import { ReleaseComments } from '../components/ReleaseComments.js';
+import { ShareCardModal } from '../components/ShareCardModal.js';
+import type { ShareCardContext } from '../utils/shareCardGenerator.js';
 import {
   Play,
   Disc,
@@ -16,6 +19,7 @@ import {
   Disc3,
   Search,
   Radio,
+  Share2,
 } from 'lucide-react';
 
 export const StreamingBadges: React.FC<{ links?: StreamingLinks; compact?: boolean; titleLabel?: string }> = ({ links, compact, titleLabel }) => {
@@ -106,6 +110,10 @@ export const ArchiveView: React.FC = () => {
     links?: StreamingLinks;
   } | null>(null);
 
+  // Interactive lyric quote selection (1-4 lines) & Share Card modal
+  const [selectedLyricIndices, setSelectedLyricIndices] = useState<number[]>([]);
+  const [shareContext, setShareContext] = useState<ShareCardContext | null>(null);
+
   const fetchArchive = async () => {
     try {
       const [resAlb, resSng] = await Promise.all([
@@ -127,17 +135,178 @@ export const ArchiveView: React.FC = () => {
     fetchArchive();
   }, []);
 
+  // Reset selected lyric lines whenever active lyrics target changes
+  useEffect(() => {
+    setSelectedLyricIndices([]);
+  }, [selectedLyricsTrack?.id, selectedSingle?.id]);
+
+  // Deep-link from URL query (?album=... / ?single=...) or notification click
+  useEffect(() => {
+    if (albums.length === 0 && singles.length === 0) return;
+
+    const openTarget = (releaseType: string, releaseId: string) => {
+      if (releaseType === 'album') {
+        const found = albums.find((a) => a.id === releaseId);
+        if (found) {
+          setSelectedSingle(null);
+          setSelectedAlbum(found);
+        }
+      } else if (releaseType === 'single') {
+        const found = singles.find((s) => s.id === releaseId);
+        if (found) {
+          setSelectedSingle(found);
+        }
+      }
+    };
+
+    const params = new URLSearchParams(window.location.search);
+    const qAlbum = params.get('album');
+    const qSingle = params.get('single');
+    if (qAlbum) openTarget('album', qAlbum);
+    else if (qSingle) openTarget('single', qSingle);
+
+    const handleOpenReleaseEvent = (e: CustomEvent<{ releaseType?: string; releaseId?: string }>) => {
+      if (e.detail?.releaseType && e.detail?.releaseId) {
+        openTarget(e.detail.releaseType, e.detail.releaseId);
+      }
+    };
+    window.addEventListener('open-archive-release', handleOpenReleaseEvent as EventListener);
+    return () => {
+      window.removeEventListener('open-archive-release', handleOpenReleaseEvent as EventListener);
+    };
+  }, [albums, singles]);
+
+  const toggleLyricLine = (idx: number) => {
+    setSelectedLyricIndices((prev) => {
+      if (prev.includes(idx)) return prev.filter((n) => n !== idx);
+      if (prev.length >= 4) return prev;
+      return [...prev, idx].sort((a, b) => a - b);
+    });
+  };
+
+  const renderInteractiveLyrics = (
+    rawLyrics: string,
+    meta: {
+      trackTitle: string;
+      releaseTitle?: string;
+      coverUrl?: string | null;
+      shareUrl: string;
+      compact?: boolean;
+    }
+  ) => {
+    const lines = rawLyrics.split(/\r?\n/);
+    const selectedTexts = selectedLyricIndices
+      .map((i) => (lines[i] || '').trim())
+      .filter((s) => s.length > 0);
+
+    const handleShareQuote = () => {
+      const picked =
+        selectedTexts.length > 0
+          ? selectedTexts
+          : lines
+              .map((l) => l.trim())
+              .filter((l) => l.length > 0 && !l.startsWith('['))
+              .slice(0, 2);
+      if (picked.length === 0) return;
+      setShareContext({
+        type: 'lyrics',
+        trackTitle: meta.trackTitle,
+        releaseTitle: meta.releaseTitle,
+        coverUrl: meta.coverUrl,
+        lines: picked,
+        shareUrl: meta.shareUrl,
+      });
+    };
+
+    return (
+      <div className="space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 rounded-md bg-white/[0.03] border border-white/[0.06] font-mono text-[10px] text-[#8e877e]">
+          <span>
+            {selectedTexts.length > 0
+              ? `Выбрано строк: ${selectedTexts.length}/4`
+              : 'Нажмите на 1–4 любимые строчки для карточки'}
+          </span>
+          <div className="flex items-center gap-2">
+            {selectedTexts.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setSelectedLyricIndices([])}
+                className="text-[#8e877e] hover:text-white cursor-pointer"
+              >
+                Сбросить
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={handleShareQuote}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-[#821c2c]/30 hover:bg-[#821c2c]/50 border border-[#a4283c]/70 text-[#f2eee9] transition-colors cursor-pointer"
+            >
+              <Share2 className="w-3 h-3" />
+              <span>Поделиться строчкой</span>
+            </button>
+          </div>
+        </div>
+
+        <div
+          className={`${
+            meta.compact ? 'max-h-52 text-xs text-left p-2.5 bg-black/40 rounded border border-white/[0.04]' : 'text-sm sm:text-base text-center'
+          } overflow-y-auto space-y-1 font-sans`}
+        >
+          {lines.map((line, idx) => {
+            const trimmed = line.trim();
+            if (!trimmed) {
+              return <div key={idx} className="h-2.5" />;
+            }
+            const isSectionHeader = trimmed.startsWith('[') && trimmed.endsWith(']');
+            if (isSectionHeader) {
+              return (
+                <div
+                  key={idx}
+                  className="font-mono text-[10px] uppercase tracking-widest text-[#736c64] pt-2 pb-0.5 select-none"
+                >
+                  {trimmed}
+                </div>
+              );
+            }
+            const isSelected = selectedLyricIndices.includes(idx);
+            const limitReached = !isSelected && selectedLyricIndices.length >= 4;
+            return (
+              <button
+                key={idx}
+                type="button"
+                disabled={limitReached}
+                onClick={() => toggleLyricLine(idx)}
+                className={`block w-full px-2.5 py-1 rounded transition-colors cursor-pointer ${
+                  meta.compact ? 'text-left' : 'text-center'
+                } ${
+                  isSelected
+                    ? 'bg-[#821c2c]/30 border border-[#c96075]/60 text-white font-medium'
+                    : limitReached
+                      ? 'text-bone/45 cursor-not-allowed'
+                      : 'text-bone/85 hover:bg-white/[0.05] hover:text-white border border-transparent'
+                }`}
+              >
+                {line}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    );
+  };
+
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
-      if (streamingToast) setStreamingToast(null);
+      if (shareContext) setShareContext(null);
+      else if (streamingToast) setStreamingToast(null);
       else if (selectedLyricsTrack) setSelectedLyricsTrack(null);
       else if (selectedSingle) setSelectedSingle(null);
       else if (newAlbumModal) setNewAlbumModal(false);
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [streamingToast, selectedLyricsTrack, selectedSingle, newAlbumModal]);
+  }, [shareContext, streamingToast, selectedLyricsTrack, selectedSingle, newAlbumModal]);
 
   const handlePlayAlbum = (album: Album) => {
     if (!album.tracks || album.tracks.length === 0) return;
@@ -415,6 +584,9 @@ export const ArchiveView: React.FC = () => {
               )}
             </div>
           </div>
+
+          {/* Album Comments Section */}
+          <ReleaseComments releaseType="album" releaseId={selectedAlbum.id} />
         </div>
       ) : (
         /* MAIN ARCHIVE GRID */
@@ -734,17 +906,31 @@ export const ArchiveView: React.FC = () => {
                 <StreamingBadges links={selectedSingle.streaming_links} titleLabel={t('streamingPlatforms')} />
               </div>
 
-              {/* Lyrics if available */}
+              {/* Lyrics if available (interactive line selection for quote card) */}
               {selectedSingle.lyrics && (
-                <div className="pt-4 border-t border-white/[0.06] text-left">
-                  <div className="font-mono text-[10px] uppercase tracking-widest text-ash/70 mb-2">
+                <div className="pt-4 border-t border-white/[0.06] text-left space-y-2">
+                  <div className="font-mono text-[10px] uppercase tracking-widest text-ash/70">
                     {t('lyricsFor')}
                   </div>
-                  <div className="font-sans text-xs text-bone/80 whitespace-pre-line leading-relaxed max-h-48 overflow-y-auto p-3 bg-black/40 rounded border border-white/[0.04]">
-                    {selectedSingle.lyrics}
-                  </div>
+                  {renderInteractiveLyrics(selectedSingle.lyrics, {
+                    trackTitle: selectedSingle.title,
+                    releaseTitle: `Сингл · ${selectedSingle.release_year}`,
+                    coverUrl: selectedSingle.cover_url,
+                    shareUrl: `${window.location.origin}/archive?single=${encodeURIComponent(selectedSingle.id)}`,
+                    compact: true,
+                  })}
                 </div>
               )}
+
+              {/* Compact Single Comments */}
+              <div className="pt-3 border-t border-white/[0.06]">
+                <ReleaseComments
+                  releaseType="single"
+                  releaseId={selectedSingle.id}
+                  compact
+                  defaultOpen={false}
+                />
+              </div>
             </div>
           </div>
         </div>
@@ -775,8 +961,21 @@ export const ArchiveView: React.FC = () => {
               </h3>
               <div className="font-mono text-[10px] text-ash/60 uppercase">deathmarried</div>
             </div>
-            <div className="font-sans text-sm sm:text-base leading-relaxed text-bone/90 whitespace-pre-line text-center border-t border-white/[0.06] pt-6 font-normal">
-              {selectedLyricsTrack.lyrics || t('noLyrics')}
+            <div className="border-t border-white/[0.06] pt-5">
+              {selectedLyricsTrack.lyrics ? (
+                renderInteractiveLyrics(selectedLyricsTrack.lyrics, {
+                  trackTitle: selectedLyricsTrack.title,
+                  releaseTitle: selectedAlbum?.title || 'deathmarried',
+                  coverUrl: selectedAlbum?.cover_url || null,
+                  shareUrl: selectedAlbum
+                    ? `${window.location.origin}/archive?album=${encodeURIComponent(selectedAlbum.id)}`
+                    : `${window.location.origin}/archive`,
+                })
+              ) : (
+                <div className="font-sans text-sm text-bone/70 text-center py-4">
+                  {t('noLyrics')}
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -926,6 +1125,13 @@ export const ArchiveView: React.FC = () => {
           </div>
         </div>
       )}
+
+      {/* Viral Quote Share Card Modal */}
+      <ShareCardModal
+        isOpen={shareContext !== null}
+        context={shareContext}
+        onClose={() => setShareContext(null)}
+      />
     </div>
   );
 };

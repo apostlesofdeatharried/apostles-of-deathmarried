@@ -6,14 +6,15 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { MotionConfig } from 'motion/react';
 import { I18nProvider, useI18n } from './context/I18nContext.js';
-import { AuthProvider, useAuth } from './context/AuthContext.js';
+import { AuthProvider, useAuth, authFetch } from './context/AuthContext.js';
 import { PlayerProvider } from './context/PlayerContext.js';
 import { Navbar } from './components/Navbar.js';
 import { MusicPlayer } from './components/MusicPlayer.js';
 import { Footer } from './components/Footer.js';
 import { AuthModal } from './components/AuthModal.js';
 import { IntroAnimation } from './components/IntroAnimation.js';
-import { parseRoute, buildPath, AppTab, ParsedRoute } from './utils/logic.js';
+import { AchievementToastContainer, dispatchAchievementUnlocked } from './components/AchievementToast.js';
+import { parseRoute, buildPath, safeJson, AppTab, ParsedRoute } from './utils/logic.js';
 
 import { HomeView } from './views/HomeView.js';
 import { ArchiveView } from './views/ArchiveView.js';
@@ -35,8 +36,28 @@ const TAB_TITLES: Record<AppTab, string> = {
 
 function MainApp() {
   const { t } = useI18n();
-  const { user, loading: authLoading } = useAuth();
+  const { user, loading: authLoading, refresh } = useAuth();
   const isAdminOrMod = Boolean(user && (user.role_id === 'admin' || user.role_id === 'moderator'));
+
+  // Check secret Moscow midnight visitor achievement (00:00-00:15 MSK) once per hour per session
+  useEffect(() => {
+    if (!user?.id) return;
+    const key = `aod_msk_visit_${user.id}_${new Date().toISOString().slice(0, 13)}`;
+    try {
+      if (sessionStorage.getItem(key)) return;
+      sessionStorage.setItem(key, '1');
+    } catch {}
+
+    authFetch('/api/achievements/check-visit', { method: 'POST' })
+      .then((res) => (res.ok ? safeJson<any>(res, null) : null))
+      .then((data) => {
+        if (data?.newly_unlocked_achievements?.length > 0) {
+          dispatchAchievementUnlocked(data.newly_unlocked_achievements);
+          refresh();
+        }
+      })
+      .catch(() => {});
+  }, [user?.id, refresh]);
 
   const [route, setRoute] = useState<ParsedRoute>(() => parseRoute(window.location.pathname));
   const [introSeen, setIntroSeen] = useState<boolean>(() => {
@@ -96,13 +117,56 @@ function MainApp() {
     const handleNavProfile = (e: CustomEvent<string>) => {
       if (e.detail) navigate('profile', e.detail);
     };
+    const handleNavNotification = (
+      e: CustomEvent<{ targetType?: string; targetId?: string; targetLink?: string }>
+    ) => {
+      const detail = e.detail;
+      if (!detail) return;
+      const targetType = detail.targetType;
+      const targetId = detail.targetId;
+      const tab: AppTab =
+        targetType === 'post'
+          ? 'community'
+          : targetType === 'creation'
+            ? 'creations'
+            : targetType === 'album' || targetType === 'single'
+              ? 'archive'
+              : 'home';
+
+      const targetUrl =
+        detail.targetLink && detail.targetLink.startsWith('/')
+          ? detail.targetLink
+          : buildPath(tab);
+
+      window.history.pushState({ tab }, '', targetUrl);
+      setRoute({ tab });
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+
+      if (targetId) {
+        window.setTimeout(() => {
+          if (targetType === 'post') {
+            window.dispatchEvent(new CustomEvent('open-community-post', { detail: targetId }));
+          } else if (targetType === 'creation') {
+            window.dispatchEvent(new CustomEvent('open-creation', { detail: targetId }));
+          } else if (targetType === 'album' || targetType === 'single') {
+            window.dispatchEvent(
+              new CustomEvent('open-archive-release', {
+                detail: { releaseType: targetType, releaseId: targetId },
+              })
+            );
+          }
+        }, 80);
+      }
+    };
     window.addEventListener('popstate', handlePopState);
     window.addEventListener('navigate-tab', handleNavTab as EventListener);
     window.addEventListener('navigate-profile', handleNavProfile as EventListener);
+    window.addEventListener('navigate-notification', handleNavNotification as EventListener);
     return () => {
       window.removeEventListener('popstate', handlePopState);
       window.removeEventListener('navigate-tab', handleNavTab as EventListener);
       window.removeEventListener('navigate-profile', handleNavProfile as EventListener);
+      window.removeEventListener('navigate-notification', handleNavNotification as EventListener);
     };
   }, [navigate]);
 
@@ -161,6 +225,9 @@ function MainApp() {
 
       {/* Authentication Modal */}
       <AuthModal />
+
+      {/* Global Achievement Unlock Notifications */}
+      <AchievementToastContainer />
     </div>
   );
 }

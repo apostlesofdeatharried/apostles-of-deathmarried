@@ -2,7 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   calculateLevelFromXp,
+  getQuizQuestionXp,
+  calculateQuizScoreByDifficulty,
   calculateQuizScore,
+  calculateMiniGameXp,
   validateNickname,
   validatePassword,
   checkAchievementEligibility,
@@ -17,37 +20,65 @@ import {
   classifyMediaUpload,
   transliterateToAsciiSlug,
   buildSafeAsciiFilename,
+  getMoscowDateString,
+  isMoscowMidnightWindow,
+  getStreakBonusPercent,
+  applyStreakBonusXp,
+  parsePrivacySettings,
+  formatXpTransactionLabel,
 } from './logic';
 
-test('calculateLevelFromXp correctly maps XP thresholds to levels and percentages', () => {
+test('calculateLevelFromXp maps balanced XP thresholds smoothly without multi-level jumps', () => {
   const lvl1 = calculateLevelFromXp(0);
   assert.equal(lvl1.level, 1);
   assert.equal(lvl1.progressPercent, 0);
+  assert.equal(lvl1.nextLevelXp, 100);
 
-  const lvl1Mid = calculateLevelFromXp(37);
+  const lvl1Mid = calculateLevelFromXp(50);
   assert.equal(lvl1Mid.level, 1);
-  assert.ok(lvl1Mid.progressPercent > 0 && lvl1Mid.progressPercent <= 100);
+  assert.equal(lvl1Mid.progressPercent, 50);
 
   const lvl2 = calculateLevelFromXp(100);
   assert.equal(lvl2.level, 2);
 
+  // One strong quiz (75-95 XP) from 0 XP should not jump straight past Level 2
+  const afterOneQuiz = calculateLevelFromXp(85);
+  assert.equal(afterOneQuiz.level, 1);
+
+  const lvl3 = calculateLevelFromXp(305);
+  assert.equal(lvl3.level, 3);
+
   const highLvl = calculateLevelFromXp(1000);
-  assert.ok(highLvl.level >= 5);
+  assert.equal(highLvl.level, 5);
 });
 
-test('calculateQuizScore handles questions, accuracy, and speed bonuses', () => {
+test('Daily Quiz difficulty XP (10/15/25) and mini-game rewards (15-20 XP) are balanced', () => {
+  assert.equal(getQuizQuestionXp(1), 10);
+  assert.equal(getQuizQuestionXp(2), 15);
+  assert.equal(getQuizQuestionXp(3), 25);
+
+  const byDiff = calculateQuizScoreByDifficulty([
+    { isCorrect: true, difficulty: 1 },
+    { isCorrect: true, difficulty: 2 },
+    { isCorrect: false, difficulty: 3 },
+    { isCorrect: true, difficulty: 3 },
+  ]);
+  assert.equal(byDiff.totalXp, 50); // 10 + 15 + 25
+  assert.equal(byDiff.speedBonus, 0);
+
   const zero = calculateQuizScore(5, 0, 10);
   assert.equal(zero.totalXp, 0);
 
-  const perfectFast = calculateQuizScore(5, 5, 10);
-  assert.equal(perfectFast.baseScore, 125);
-  // (30 - 10) * 2 * 1 = 40
-  assert.equal(perfectFast.speedBonus, 40);
-  assert.equal(perfectFast.totalXp, 165);
+  const balanced = calculateQuizScore(5, 5, 10);
+  assert.equal(balanced.baseScore, 75);
+  assert.equal(balanced.speedBonus, 0);
+  assert.equal(balanced.totalXp, 75);
 
-  const slowQuiz = calculateQuizScore(5, 5, 45);
-  assert.equal(slowQuiz.speedBonus, 0);
-  assert.equal(slowQuiz.totalXp, 125);
+  // Mini-games: 15-20 XP on win, 5 XP on participation
+  assert.equal(calculateMiniGameXp(false, 5), 5);
+  assert.equal(calculateMiniGameXp(true, 0), 15);
+  assert.equal(calculateMiniGameXp(true, 3), 18);
+  assert.equal(calculateMiniGameXp(true, 10), 20);
 });
 
 test('validateNickname enforces length and characters', () => {
@@ -233,3 +264,79 @@ test('transliterateToAsciiSlug and buildSafeAsciiFilename produce strictly ASCII
   assert.equal(fWave, '1700000000003_lyubovyu_3_24-bit_deadbeef.wav');
   assert.match(fWave, /^[\x20-\x7E]+$/);
 });
+
+test('Moscow date & midnight window (00:00-00:15 MSK, UTC+3) evaluate accurately', () => {
+  // 2026-11-22T21:05:00Z === 2026-11-23 00:05 MSK
+  const insideMskMidnight = Date.parse('2026-11-22T21:05:00Z');
+  assert.equal(getMoscowDateString(insideMskMidnight), '2026-11-23');
+  assert.equal(isMoscowMidnightWindow(insideMskMidnight), true);
+
+  // 2026-11-22T21:15:59Z === 2026-11-23 00:15:59 MSK (still within 00:00-00:15)
+  assert.equal(isMoscowMidnightWindow(Date.parse('2026-11-22T21:15:59Z')), true);
+
+  // 2026-11-22T21:16:00Z === 2026-11-23 00:16 MSK (outside window)
+  assert.equal(isMoscowMidnightWindow(Date.parse('2026-11-22T21:16:00Z')), false);
+
+  // 2026-11-22T20:59:59Z === 2026-11-22 23:59:59 MSK (previous Moscow day, outside window)
+  assert.equal(getMoscowDateString(Date.parse('2026-11-22T20:59:59Z')), '2026-11-22');
+  assert.equal(isMoscowMidnightWindow(Date.parse('2026-11-22T20:59:59Z')), false);
+});
+
+test('Daily streak bonus grants +5% per day capped at +50%', () => {
+  assert.equal(getStreakBonusPercent(0), 0);
+  assert.equal(getStreakBonusPercent(1), 5);
+  assert.equal(getStreakBonusPercent(5), 25);
+  assert.equal(getStreakBonusPercent(10), 50);
+  assert.equal(getStreakBonusPercent(25), 50);
+
+  assert.deepEqual(applyStreakBonusXp(20, 0), { totalXp: 20, bonusXp: 0, bonusPercent: 0 });
+  assert.deepEqual(applyStreakBonusXp(20, 5), { totalXp: 25, bonusXp: 5, bonusPercent: 25 });
+  assert.deepEqual(applyStreakBonusXp(100, 12), { totalXp: 150, bonusXp: 50, bonusPercent: 50 });
+});
+
+test('parsePrivacySettings defaults XP history to hidden and safely merges overrides', () => {
+  assert.deepEqual(parsePrivacySettings(null), {
+    hide_community: false,
+    hide_streak: false,
+    hide_xp_history: true,
+    hide_game_stats: false,
+  });
+
+  assert.deepEqual(
+    parsePrivacySettings(JSON.stringify({ hide_xp_history: false, hide_community: true, hide_streak: 'invalid' })),
+    {
+      hide_community: true,
+      hide_streak: false,
+      hide_xp_history: false,
+      hide_game_stats: false,
+    }
+  );
+});
+
+test('formatXpTransactionLabel translates legacy English and current entries to Russian', () => {
+  assert.deepEqual(formatXpTransactionLabel('guess_track', 'Guess Track (2026-11-22-H0): Correct', 'ru'), {
+    title: 'Угадай трек',
+    subtitle: 'Верный ответ',
+  });
+  assert.deepEqual(formatXpTransactionLabel('guess_track', 'Guess Track (2026-11-22-H0): Participation', 'ru'), {
+    title: 'Угадай трек',
+    subtitle: 'Участие в раунде',
+  });
+  assert.deepEqual(formatXpTransactionLabel('daily_quiz', 'Daily Quiz (2026-11-22): 4/5', 'ru'), {
+    title: 'Ежедневная викторина',
+    subtitle: 'Результат: 4/5',
+  });
+  assert.deepEqual(formatXpTransactionLabel('community_post', 'Created post: Ночной релиз', 'ru'), {
+    title: 'Новая тема в сообществе',
+    subtitle: 'Ночной релиз',
+  });
+  assert.deepEqual(formatXpTransactionLabel('comment', 'Posted a comment', 'ru'), {
+    title: 'Комментарий в сообществе',
+    subtitle: 'Ответ в обсуждении',
+  });
+  assert.deepEqual(formatXpTransactionLabel('promo_code', 'Промокод «APOSTLES»', 'ru'), {
+    title: 'Промокод',
+    subtitle: 'Промокод «APOSTLES»',
+  });
+});
+

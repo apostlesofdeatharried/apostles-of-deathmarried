@@ -1,5 +1,8 @@
 import React, { createContext, useContext, useState, useRef, useEffect, useCallback } from 'react';
 import { Track } from '../types/index.js';
+import { authFetch, getStoredToken } from './AuthContext.js';
+import { dispatchAchievementUnlocked } from '../components/AchievementToast.js';
+import { safeJson } from '../utils/logic.js';
 
 interface PlayerContextType {
   currentTrack: Track | null;
@@ -76,6 +79,28 @@ export const PlayerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const nextTrackRef = useRef<() => void>(() => {});
+  const currentTrackRef = useRef<Track | null>(null);
+  const listenedSecondsRef = useRef<number>(0);
+  const lastTimeRef = useRef<number>(0);
+
+  const reportTrackCompletion = useCallback((track: Track | null, durationSec: number) => {
+    if (!track?.id || !getStoredToken()) return;
+    const minRequired = durationSec > 0 ? Math.min(durationSec * 0.7, Math.max(10, durationSec - 2)) : 15;
+    if (listenedSecondsRef.current < minRequired) return;
+
+    authFetch('/api/achievements/track-complete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ track_id: track.id }),
+    })
+      .then((res) => (res.ok ? safeJson<any>(res, null) : null))
+      .then((data) => {
+        if (data?.newly_unlocked_achievements?.length > 0) {
+          dispatchAchievementUnlocked(data.newly_unlocked_achievements);
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   // Initialize audio element once
   useEffect(() => {
@@ -86,6 +111,11 @@ export const PlayerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     const onTimeUpdate = () => {
       const nextTime = Number.isFinite(audio.currentTime) ? audio.currentTime : 0;
       setProgress(nextTime);
+      const delta = nextTime - lastTimeRef.current;
+      if (!audio.paused && delta > 0 && delta < 2.5) {
+        listenedSecondsRef.current += delta;
+      }
+      lastTimeRef.current = nextTime;
     };
 
     const onLoadedMetadata = () => {
@@ -104,6 +134,11 @@ export const PlayerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     };
 
     const onEnded = () => {
+      const finished = currentTrackRef.current;
+      const dur = Number.isFinite(audio.duration) ? audio.duration : finished?.duration_seconds || 0;
+      reportTrackCompletion(finished, dur);
+      listenedSecondsRef.current = 0;
+      lastTimeRef.current = 0;
       nextTrackRef.current();
     };
 
@@ -135,6 +170,9 @@ export const PlayerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     if (!audioRef.current) return;
     const audio = audioRef.current;
 
+    currentTrackRef.current = track;
+    listenedSecondsRef.current = 0;
+    lastTimeRef.current = 0;
     setCurrentTrack(track);
     setIsVisible(true);
     setPlaybackError(null);

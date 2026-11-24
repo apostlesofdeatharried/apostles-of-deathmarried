@@ -37,6 +37,12 @@ export interface RegisterPayload {
   email: string;
   password: string;
   confirm_password: string;
+  captcha_token?: string;
+  captcha_answer?: string;
+  email_verification_token?: string;
+  email_code?: string;
+  website?: string;
+  client_fp?: string;
 }
 
 interface AuthContextType {

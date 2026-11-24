@@ -59,6 +59,20 @@ const formatAdminDate = (dateStr?: string) => {
   return isNaN(d.getTime()) ? dateStr : d.toLocaleDateString();
 };
 
+const formatAdminDateTime = (dateStr?: string | null) => {
+  if (!dateStr) return '—';
+  const iso = dateStr.includes('T') ? dateStr : dateStr.replace(' ', 'T') + 'Z';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return dateStr;
+  return d.toLocaleString(undefined, {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+};
+
 export const AdminView: React.FC = () => {
   const { user, bindAdmin, openAuth } = useAuth();
   const { t, lang } = useI18n();
@@ -85,8 +99,18 @@ export const AdminView: React.FC = () => {
   const [moderationStatusFilter, setModerationStatusFilter] = useState<'pending' | 'all'>('pending');
   const [loading, setLoading] = useState(true);
 
-  // User Management Expansion State
+  // User Management & Statistics State
   const [userSearch, setUserSearch] = useState('');
+  const [userSort, setUserSort] = useState<
+    'registered_desc' | 'registered_asc' | 'xp_desc' | 'level_desc' | 'games_desc' | 'active_desc' | 'username_asc'
+  >('registered_desc');
+  const [usersSummary, setUsersSummary] = useState<{
+    total_users: number;
+    new_last_24h: number;
+    total_games_played: number;
+    total_quizzes_played: number;
+    total_guess_track_played: number;
+  } | null>(null);
   const [usersLoading, setUsersLoading] = useState(false);
   const [resetPassModal, setResetPassModal] = useState<{ id: string; nickname: string; display_name?: string } | null>(null);
   const [resetPassValue, setResetPassValue] = useState('');
@@ -98,7 +122,7 @@ export const AdminView: React.FC = () => {
   const [userDetailsTab, setUserDetailsTab] = useState<'overview' | 'achievements' | 'items'>('overview');
   const [togglingAssetId, setTogglingAssetId] = useState<string | null>(null);
 
-  // Quiz Question Form State
+  // Quiz Question Form & Bulk Import State
   const [editingQuizId, setEditingQuizId] = useState<string | null>(null);
   const [quizQuestionRu, setQuizQuestionRu] = useState('');
   const [quizQuestionEn, setQuizQuestionEn] = useState('');
@@ -109,6 +133,14 @@ export const AdminView: React.FC = () => {
   const [quizCorrectIndex, setQuizCorrectIndex] = useState('0');
   const [quizExplanationRu, setQuizExplanationRu] = useState('');
   const [quizDifficulty, setQuizDifficulty] = useState('1');
+  const [quizPoolMeta, setQuizPoolMeta] = useState<{
+    custom_active_count: number;
+    generated_pool_count: number;
+    total_pool_count: number;
+  } | null>(null);
+  const [bulkQuizOpen, setBulkQuizOpen] = useState(false);
+  const [bulkQuizText, setBulkQuizText] = useState('');
+  const [importingBulkQuiz, setImportingBulkQuiz] = useState(false);
 
   // In-UI Delete Confirmation Modal
   const [deleteModal, setDeleteModal] = useState<DeleteModalState | null>(null);
@@ -261,14 +293,21 @@ export const AdminView: React.FC = () => {
     return () => window.clearTimeout(timer);
   }, [activeTab, lbTimeframe, lbGameFilter, lbSearch]);
 
-  const fetchAdminUsers = async (searchQuery: string = userSearch) => {
+  const fetchAdminUsers = async (
+    searchQuery: string = userSearch,
+    sortKey: typeof userSort = userSort
+  ) => {
     setUsersLoading(true);
     try {
-      const qs = searchQuery.trim() ? `?search=${encodeURIComponent(searchQuery.trim())}` : '';
+      const params = new URLSearchParams();
+      if (searchQuery.trim()) params.set('search', searchQuery.trim());
+      if (sortKey) params.set('sort', sortKey);
+      const qs = params.toString() ? `?${params.toString()}` : '';
       const res = await authFetch(`/api/admin/users${qs}`, { cache: 'no-store' });
       const data = await safeJson<any>(res, null);
       if (res.ok && data) {
         setUsersList(data.users || []);
+        if (data.summary) setUsersSummary(data.summary);
       }
     } catch (e: any) {
       setErrorMessage(e?.message || 'Failed to load users');
@@ -280,10 +319,10 @@ export const AdminView: React.FC = () => {
   useEffect(() => {
     if (activeTab !== 'users') return;
     const timer = window.setTimeout(() => {
-      fetchAdminUsers(userSearch);
+      fetchAdminUsers(userSearch, userSort);
     }, 180);
     return () => window.clearTimeout(timer);
-  }, [activeTab, userSearch]);
+  }, [activeTab, userSearch, userSort]);
 
   const openUserDetails = async (userId: string) => {
     setLoadingUserDetails(true);
@@ -416,7 +455,11 @@ export const AdminView: React.FC = () => {
       ]);
 
       if (resStats.ok) setStats((await safeJson<any>(resStats, {})).stats);
-      if (resUsers.ok) setUsersList((await safeJson<any>(resUsers, {})).users || []);
+      if (resUsers.ok) {
+        const uData = await safeJson<any>(resUsers, {});
+        setUsersList(uData.users || []);
+        if (uData.summary) setUsersSummary(uData.summary);
+      }
       if (resAlb.ok) {
         const albs = (await safeJson<any>(resAlb, {})).albums || [];
         setAlbumsList(albs);
@@ -429,7 +472,15 @@ export const AdminView: React.FC = () => {
       if (resSng.ok) setSinglesList((await safeJson<any>(resSng, {})).singles || []);
       if (resAud.ok) setMediaFilesList((await safeJson<any>(resAud, {})).files || []);
       if (resGame.ok) setGameTracksList((await safeJson<any>(resGame, {})).tracks || []);
-      if (resQuiz.ok) setQuizQuestionsList((await safeJson<any>(resQuiz, {})).questions || []);
+      if (resQuiz.ok) {
+        const qData = await safeJson<any>(resQuiz, {});
+        setQuizQuestionsList(qData.questions || []);
+        setQuizPoolMeta({
+          custom_active_count: qData.custom_active_count ?? 0,
+          generated_pool_count: qData.generated_pool_count ?? 0,
+          total_pool_count: qData.total_pool_count ?? (qData.questions || []).length,
+        });
+      }
       if (resPosts.ok) setAllPostsList((await safeJson<any>(resPosts, {})).posts || []);
       if (resCreations.ok) setAllCreationsList((await safeJson<any>(resCreations, {})).creations || []);
       if (resReports.ok) setReportsList((await safeJson<any>(resReports, {})).reports || []);
@@ -549,6 +600,51 @@ export const AdminView: React.FC = () => {
       setErrorMessage(e?.message || 'Network error');
     } finally {
       setSavingQuiz(false);
+    }
+  };
+
+  const handleBulkImportQuiz = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (importingBulkQuiz || !bulkQuizText.trim()) return;
+    setImportingBulkQuiz(true);
+    setErrorMessage(null);
+    try {
+      const res = await authFetch('/api/admin/quiz-questions/bulk', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ raw_text: bulkQuizText }),
+      });
+      const data = await safeJson<{
+        imported_count?: number;
+        skipped_count?: number;
+        error?: string;
+        errors?: string[];
+      }>(res, {});
+      if (res.ok) {
+        const skippedNote =
+          data.skipped_count && data.skipped_count > 0
+            ? lang === 'ru'
+              ? ` (пропущено строк: ${data.skipped_count})`
+              : ` (${data.skipped_count} skipped)`
+            : '';
+        setStatusMessage(
+          lang === 'ru'
+            ? `Импортировано вопросов викторины: ${data.imported_count || 0}${skippedNote}`
+            : `Imported ${data.imported_count || 0} quiz questions${skippedNote}`
+        );
+        setBulkQuizText('');
+        setBulkQuizOpen(false);
+        fetchAdminData();
+      } else {
+        setErrorMessage(
+          data.error ||
+            (lang === 'ru' ? 'Не удалось импортировать вопросы.' : 'Failed to bulk import quiz questions.')
+        );
+      }
+    } catch (err: any) {
+      setErrorMessage(err?.message || 'Network error');
+    } finally {
+      setImportingBulkQuiz(false);
     }
   };
 
@@ -1366,7 +1462,7 @@ export const AdminView: React.FC = () => {
           { id: 'gametracks', label: lang === 'ru' ? 'Игры & Викторина' : 'Games & Quiz', icon: Volume2, count: gameTracksList.length },
           { id: 'leaderboard', label: lang === 'ru' ? 'Таблица лидеров' : 'Leaderboards', icon: Trophy, count: adminLeaderboardSummary?.total_ranked ?? adminLeaderboard.length },
           { id: 'moderation', label: lang === 'ru' ? 'Модерация & Посты' : 'Moderation', icon: ShieldAlert, count: pendingPosts.length + pendingCreations.length + pendingReports.length },
-          { id: 'users', label: lang === 'ru' ? 'Аккаунты & Доступ' : 'Accounts & RBAC', icon: Users, count: usersList.length },
+          { id: 'users', label: lang === 'ru' ? 'Пользователи и статистика' : 'Users & Stats', icon: Users, count: usersSummary?.total_users ?? usersList.length },
           { id: 'stats', label: lang === 'ru' ? 'Статистика' : 'Statistics', icon: Activity },
         ].map((tab) => {
           const Icon = tab.icon;
@@ -2606,39 +2702,109 @@ export const AdminView: React.FC = () => {
             </div>
           )}
 
+          {/* Read-only KPI Summary Cards */}
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 font-mono">
+            <div className="p-4 rounded-xl bg-[#100f13] border border-white/[0.08] space-y-1">
+              <div className="text-[10px] uppercase tracking-wider text-ash/70">
+                {lang === 'ru' ? 'Всего пользователей' : 'Total Users'}
+              </div>
+              <div className="text-2xl font-semibold text-ivory">
+                {usersSummary?.total_users ?? usersList.length}
+              </div>
+              <div className="text-[10px] text-ash/60">
+                {lang === 'ru' ? 'зарегистрировано в архиве' : 'registered accounts'}
+              </div>
+            </div>
+
+            <div className="p-4 rounded-xl bg-[#100f13] border border-white/[0.08] space-y-1">
+              <div className="text-[10px] uppercase tracking-wider text-ash/70">
+                {lang === 'ru' ? 'Новых за 24 часа' : 'New (Last 24h)'}
+              </div>
+              <div className="text-2xl font-semibold text-[#6ee7b7]">
+                +{usersSummary?.new_last_24h ?? 0}
+              </div>
+              <div className="text-[10px] text-ash/60">
+                {lang === 'ru' ? 'регистраций за сутки' : 'signups in 24h'}
+              </div>
+            </div>
+
+            <div className="p-4 rounded-xl bg-[#100f13] border border-white/[0.08] space-y-1">
+              <div className="text-[10px] uppercase tracking-wider text-ash/70">
+                {lang === 'ru' ? 'Всего сыграно игр' : 'Total Games Played'}
+              </div>
+              <div className="text-2xl font-semibold text-ivory">
+                {usersSummary?.total_games_played ?? 0}
+              </div>
+              <div className="text-[10px] text-ash/60">
+                {lang === 'ru' ? 'все попытки пользователей' : 'all game attempts'}
+              </div>
+            </div>
+
+            <div className="p-4 rounded-xl bg-[#100f13] border border-white/[0.08] space-y-1">
+              <div className="text-[10px] uppercase tracking-wider text-ash/70">
+                {lang === 'ru' ? 'Викторина / Угадай трек' : 'Quiz / Guess Track'}
+              </div>
+              <div className="text-2xl font-semibold text-[#e4a4ad]">
+                {usersSummary?.total_quizzes_played ?? 0}
+                <span className="text-sm text-ash/50 mx-1">/</span>
+                {usersSummary?.total_guess_track_played ?? 0}
+              </div>
+              <div className="text-[10px] text-ash/60">
+                {lang === 'ru' ? 'распределение по режимам' : 'breakdown by game'}
+              </div>
+            </div>
+          </div>
+
           {/* Registered Users List */}
           <div className="bg-[#100f13] border border-white/[0.08] rounded-xl overflow-hidden shadow-xl">
-            <div className="p-4 border-b border-white/[0.06] flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="p-4 border-b border-white/[0.06] flex flex-col lg:flex-row lg:items-center justify-between gap-3">
               <div className="flex items-center gap-2.5">
                 <span className="font-mono text-xs uppercase tracking-wider text-bone font-medium">
-                  {lang === 'ru' ? 'Зарегистрированные пользователи' : 'Archive Registered Members'} ({usersList.length})
+                  {lang === 'ru' ? 'Пользователи и статистика' : 'Users & Statistics'} ({usersList.length})
                 </span>
                 {usersLoading && (
                   <span className="font-mono text-[10px] text-ash/60 uppercase">
-                    {lang === 'ru' ? 'Поиск...' : 'Searching...'}
+                    {lang === 'ru' ? 'Обновление...' : 'Loading...'}
                   </span>
                 )}
               </div>
 
-              <div className="relative w-full sm:w-80">
-                <Search className="w-3.5 h-3.5 text-ash/60 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
-                <input
-                  type="text"
-                  value={userSearch}
-                  onChange={(e) => setUserSearch(e.target.value)}
-                  placeholder={lang === 'ru' ? 'Поиск по имени, @username или email...' : 'Search by name, @username or email...'}
-                  className="w-full pl-9 pr-8 py-2 bg-[#16151a] border border-white/[0.1] rounded-lg text-xs font-mono text-white placeholder:text-ash/40 focus:outline-none focus:border-[#821c2c]"
-                />
-                {userSearch && (
-                  <button
-                    type="button"
-                    onClick={() => setUserSearch('')}
-                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-ash/60 hover:text-white cursor-pointer"
-                    aria-label="Clear search"
-                  >
-                    <X className="w-3.5 h-3.5" />
-                  </button>
-                )}
+              <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 w-full lg:w-auto">
+                <select
+                  value={userSort}
+                  onChange={(e) => setUserSort(e.target.value as typeof userSort)}
+                  aria-label={lang === 'ru' ? 'Сортировка пользователей' : 'Sort users'}
+                  className="px-3 py-2 bg-[#16151a] border border-white/[0.1] rounded-lg text-xs font-mono text-white focus:outline-none focus:border-[#821c2c] cursor-pointer"
+                >
+                  <option value="registered_desc">{lang === 'ru' ? 'Сначала новые' : 'Newest first'}</option>
+                  <option value="active_desc">{lang === 'ru' ? 'По последней активности' : 'Last active'}</option>
+                  <option value="xp_desc">{lang === 'ru' ? 'По Total XP (убыв.)' : 'Highest XP'}</option>
+                  <option value="level_desc">{lang === 'ru' ? 'По уровню (убыв.)' : 'Highest Level'}</option>
+                  <option value="games_desc">{lang === 'ru' ? 'По числу игр' : 'Most games'}</option>
+                  <option value="username_asc">{lang === 'ru' ? 'По @username (A–Z)' : 'Username A–Z'}</option>
+                  <option value="registered_asc">{lang === 'ru' ? 'Сначала старые' : 'Oldest first'}</option>
+                </select>
+
+                <div className="relative w-full sm:w-72">
+                  <Search className="w-3.5 h-3.5 text-ash/60 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <input
+                    type="text"
+                    value={userSearch}
+                    onChange={(e) => setUserSearch(e.target.value)}
+                    placeholder={lang === 'ru' ? 'Поиск по имени, @username или email...' : 'Search by name, @username or email...'}
+                    className="w-full pl-9 pr-8 py-2 bg-[#16151a] border border-white/[0.1] rounded-lg text-xs font-mono text-white placeholder:text-ash/40 focus:outline-none focus:border-[#821c2c]"
+                  />
+                  {userSearch && (
+                    <button
+                      type="button"
+                      onClick={() => setUserSearch('')}
+                      className="absolute right-2.5 top-1/2 -translate-y-1/2 text-ash/60 hover:text-white cursor-pointer"
+                      aria-label="Clear search"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
               </div>
             </div>
 
@@ -2699,13 +2865,24 @@ export const AdminView: React.FC = () => {
                           <span>·</span>
                           <span>LVL {u.level || 1} ({u.xp || 0} XP / {u.total_xp ?? u.xp ?? 0} Total)</span>
                           <span>·</span>
-                          <span>{lang === 'ru' ? 'Игр' : 'Games'}: {u.games_played || 0}</span>
+                          <span>
+                            {lang === 'ru' ? 'Игр' : 'Games'}: {u.games_played || 0}
+                            {(u.daily_quiz_played || u.guess_track_played) ? (
+                              <span className="text-ash/45">
+                                {' '}({lang === 'ru' ? 'викт.' : 'quiz'} {u.daily_quiz_played || 0} / {lang === 'ru' ? 'трек' : 'track'} {u.guess_track_played || 0})
+                              </span>
+                            ) : null}
+                          </span>
                           <span>·</span>
                           <span>{lang === 'ru' ? 'Достижений' : 'Ach'}: {u.achievements_count || 0}</span>
                           <span>·</span>
                           <span>{lang === 'ru' ? 'Предметов' : 'Items'}: {u.inventory_count || 0}</span>
                           <span>·</span>
-                          <span>{formatAdminDate(u.registered_at)}</span>
+                          <span>{lang === 'ru' ? 'Рег.' : 'Joined'}: {formatAdminDate(u.registered_at)}</span>
+                          <span>·</span>
+                          <span className="text-[#c49298]">
+                            {lang === 'ru' ? 'Активность' : 'Active'}: {formatAdminDateTime(u.last_active_at || u.registered_at)}
+                          </span>
                         </div>
                       </div>
                     </div>
@@ -2948,6 +3125,79 @@ export const AdminView: React.FC = () => {
             )}
           </div>
 
+          {/* Daily Quiz Pool Overview + Bulk Import Toggle */}
+          <div className="bg-[#100f13] border border-white/[0.08] rounded-xl p-5 space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="space-y-1">
+                <div className="flex flex-wrap items-center gap-2 font-mono text-xs text-white">
+                  <Sparkles className="w-4 h-4 text-[#c49298]" />
+                  <span className="uppercase tracking-wider font-medium">
+                    {lang === 'ru' ? 'Пул ежедневной викторины (5 вопросов/день · автоперемешивание)' : 'Daily Quiz Pool (5/day · shuffled options)'}
+                  </span>
+                </div>
+                <div className="flex flex-wrap items-center gap-2 font-mono text-[11px] text-ash">
+                  <span className="px-2 py-0.5 rounded bg-white/[0.06] border border-white/[0.1] text-white">
+                    {lang === 'ru' ? 'Всего в пуле' : 'Total pool'}: {quizPoolMeta?.total_pool_count ?? quizQuestionsList.length}
+                  </span>
+                  <span className="px-2 py-0.5 rounded bg-[#1a3820]/50 border border-[#388548]/50 text-[#6ee7b7]">
+                    {lang === 'ru' ? 'Авто из дискографии' : 'Auto from discography'}: {quizPoolMeta?.generated_pool_count ?? 0}
+                  </span>
+                  <span className="px-2 py-0.5 rounded bg-[#821c2c]/25 border border-[#821c2c]/50 text-[#f5c6cb]">
+                    {lang === 'ru' ? 'Ручных в БД' : 'Custom in DB'}: {quizPoolMeta?.custom_active_count ?? quizQuestionsList.length}
+                  </span>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setBulkQuizOpen((prev) => !prev)}
+                className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg bg-white/[0.08] hover:bg-white/[0.16] border border-white/[0.14] text-xs font-mono uppercase tracking-wider text-white cursor-pointer shrink-0"
+              >
+                <Upload className="w-3.5 h-3.5" />
+                <span>{lang === 'ru' ? 'Массовый импорт вопросов' : 'Bulk Import Questions'}</span>
+              </button>
+            </div>
+
+            {bulkQuizOpen && (
+              <form onSubmit={handleBulkImportQuiz} className="pt-3 border-t border-white/[0.08] space-y-3">
+                <div className="text-[11px] text-ash font-sans leading-relaxed">
+                  {lang === 'ru'
+                    ? 'Вставьте список вопросов — по одному на строку в формате «Вопрос | Вариант A | Вариант B | Вариант C | Вариант D | Номер правильного (1-4) | Пояснение | Сложность (1-3)» или в формате JSON-массива.'
+                    : 'Paste one question per line as "Question | Option A | Option B | Option C | Option D | Correct (1-4) | Explanation | Difficulty (1-3)" or a JSON array.'}
+                </div>
+                <textarea
+                  rows={5}
+                  value={bulkQuizText}
+                  onChange={(e) => setBulkQuizText(e.target.value)}
+                  placeholder={
+                    lang === 'ru'
+                      ? 'В каком году вышел альбом «deathmarried»? | 2024 | 2025 | 2026 | 2023 | 2 | Альбом вышел в 2025 году | 1'
+                      : 'Which year was deathmarried released? | 2024 | 2025 | 2026 | 2023 | 2 | Released in 2025 | 1'
+                  }
+                  className="w-full px-3 py-2.5 bg-[#16151a] border border-white/[0.12] rounded-lg text-xs font-mono text-white placeholder:text-ash/40 focus:outline-none focus:border-[#821c2c]"
+                />
+                <div className="flex items-center justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setBulkQuizOpen(false)}
+                    className="px-3.5 py-2 rounded-lg bg-white/[0.05] hover:bg-white/[0.1] text-xs font-mono text-ash hover:text-white cursor-pointer"
+                  >
+                    {lang === 'ru' ? 'Отмена' : 'Cancel'}
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={importingBulkQuiz || !bulkQuizText.trim()}
+                    className="px-4 py-2 rounded-lg bg-[#5a1622] hover:bg-[#721b2b] border border-[#821c2c] text-xs font-mono uppercase tracking-wider text-white disabled:opacity-50 cursor-pointer"
+                  >
+                    {importingBulkQuiz
+                      ? lang === 'ru' ? 'Импорт...' : 'Importing...'
+                      : lang === 'ru' ? 'Импортировать в банк' : 'Import Questions'}
+                  </button>
+                </div>
+              </form>
+            )}
+          </div>
+
           {/* Daily Quiz Questions Manager */}
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 pt-2">
             <div className="lg:col-span-5 bg-[#100f13] border border-white/[0.08] rounded-xl p-6 space-y-4">
@@ -3038,38 +3288,69 @@ export const AdminView: React.FC = () => {
             </div>
 
             <div className="lg:col-span-7 bg-[#100f13] border border-white/[0.08] rounded-xl p-6 space-y-4">
-              <h3 className="font-title text-xl text-ivory font-light uppercase tracking-wider">
-                {lang === 'ru' ? 'Банк вопросов викторины' : 'Quiz Question Bank'} ({quizQuestionsList.length})
-              </h3>
-              <div className="divide-y divide-white/[0.05] max-h-[420px] overflow-y-auto pr-1">
-                {quizQuestionsList.map((q) => (
-                  <div key={q.id} className="py-3 flex items-start justify-between gap-3">
-                    <div className="space-y-1 min-w-0">
-                      <div className="text-xs text-white font-sans">{lang === 'ru' ? q.question_ru : q.question_en}</div>
-                      <div className="font-mono text-[10px] text-ash/70">
-                        {t('level')}: {q.difficulty || 1} · {formatAdminDate(q.created_at)}
+              <div className="flex items-center justify-between gap-2">
+                <h3 className="font-title text-xl text-ivory font-light uppercase tracking-wider">
+                  {lang === 'ru' ? 'Ручные вопросы викторины' : 'Custom Quiz Questions'} ({quizQuestionsList.length})
+                </h3>
+                <span className="font-mono text-[10px] text-ash/70">
+                  {lang === 'ru' ? 'Варианты перемешиваются автоматически' : 'Options auto-shuffled daily'}
+                </span>
+              </div>
+              <div className="divide-y divide-white/[0.05] max-h-[460px] overflow-y-auto pr-1">
+                {quizQuestionsList.map((q) => {
+                  let qOpts: string[] = [];
+                  try {
+                    qOpts = Array.isArray(q.options) ? q.options : JSON.parse(q.options_json || '[]');
+                  } catch {
+                    qOpts = [];
+                  }
+                  return (
+                    <div key={q.id} className="py-3 flex items-start justify-between gap-3">
+                      <div className="space-y-1.5 min-w-0 flex-1">
+                        <div className="text-xs text-white font-sans font-medium">
+                          {lang === 'ru' ? q.question_ru : q.question_en}
+                        </div>
+                        {qOpts.length > 0 && (
+                          <div className="flex flex-wrap gap-1.5 font-mono text-[10px]">
+                            {qOpts.map((opt, idx) => (
+                              <span
+                                key={idx}
+                                className={`px-2 py-0.5 rounded border ${
+                                  idx === Number(q.correct_index)
+                                    ? 'bg-[#1a3820]/70 border-[#388548] text-[#6ee7b7]'
+                                    : 'bg-white/[0.03] border-white/[0.08] text-ash/80'
+                                }`}
+                              >
+                                {String.fromCharCode(65 + idx)}: {opt}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                        <div className="font-mono text-[10px] text-ash/65">
+                          {lang === 'ru' ? 'Сложность' : 'Difficulty'}: {q.difficulty || 1} · {formatAdminDate(q.created_at)}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-1 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => handleEditQuizQuestion(q)}
+                          className="p-1.5 rounded hover:bg-white/[0.08] text-ash hover:text-white transition-colors cursor-pointer"
+                          title={t('editBtn')}
+                        >
+                          <Edit2 className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setDeleteModal({ type: 'quiz', id: q.id, name: q.question_ru })}
+                          className="p-1.5 rounded hover:bg-red-950/60 text-ash hover:text-red-400 transition-colors cursor-pointer"
+                          title={t('deleteBtn')}
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
                       </div>
                     </div>
-                    <div className="flex items-center gap-1 shrink-0">
-                      <button
-                        type="button"
-                        onClick={() => handleEditQuizQuestion(q)}
-                        className="p-1.5 rounded hover:bg-white/[0.08] text-ash hover:text-white transition-colors cursor-pointer"
-                        title={t('editBtn')}
-                      >
-                        <Edit2 className="w-3.5 h-3.5" />
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setDeleteModal({ type: 'quiz', id: q.id, name: q.question_ru })}
-                        className="p-1.5 rounded hover:bg-red-950/60 text-ash hover:text-red-400 transition-colors cursor-pointer"
-                        title={t('deleteBtn')}
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           </div>

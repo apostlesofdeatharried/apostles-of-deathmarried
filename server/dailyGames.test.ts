@@ -188,3 +188,129 @@ test('pickDailyQuizSet filters invalid questions, avoids duplicates, and rotates
   const day1Ids = new Set(day1A.map((q) => q.id));
   assert.ok(day2.every((q) => !day1Ids.has(q.id)));
 });
+
+test('Moscow 12-hour cycle helpers split strictly at 00:00 and 12:00 MSK (UTC+3)', async () => {
+  const {
+    getMoscow12hCycle,
+    isValidMoscow12hCycle,
+    getNextMoscow12hResetIso,
+    getPreviousMoscow12hCycle,
+  } = await import('./dailyGames.js');
+
+  // 2026-05-10 21:00:00Z = 2026-05-11 00:00:00 MSK => AM cycle, resets at 12:00 MSK (09:00Z)
+  const mskMidnight = Date.parse('2026-05-10T21:00:00.000Z');
+  const am = getMoscow12hCycle(mskMidnight);
+  assert.equal(am.cycleId, '2026-05-11-AM');
+  assert.equal(am.half, 'AM');
+  assert.equal(am.nextResetAt, '2026-05-11T09:00:00.000Z');
+
+  // 2026-05-11 09:00:00Z = 2026-05-11 12:00:00 MSK => PM cycle, resets at 00:00 MSK next day (21:00Z)
+  const mskNoon = Date.parse('2026-05-11T09:00:00.000Z');
+  const pm = getMoscow12hCycle(mskNoon);
+  assert.equal(pm.cycleId, '2026-05-11-PM');
+  assert.equal(pm.half, 'PM');
+  assert.equal(pm.nextResetAt, '2026-05-11T21:00:00.000Z');
+
+  assert.equal(isValidMoscow12hCycle('2026-05-11-AM'), true);
+  assert.equal(isValidMoscow12hCycle('2026-05-11-PM'), true);
+  assert.equal(isValidMoscow12hCycle('2026-05-11-H0'), false);
+  assert.equal(getNextMoscow12hResetIso('2026-05-11-AM'), '2026-05-11T09:00:00.000Z');
+  assert.equal(getPreviousMoscow12hCycle('2026-05-11-PM'), '2026-05-11-AM');
+  assert.equal(getPreviousMoscow12hCycle('2026-05-11-AM'), '2026-05-10-PM');
+});
+
+test('Guess Lyrics, Reverse Track, and Speed Track generators produce valid non-repeating Fisher-Yates rounds', async () => {
+  const {
+    pickDailyLyricsChallenge,
+    pickDailyReverseTrackChallenge,
+    pickDailySpeedTrackChallenge,
+  } = await import('./dailyGames.js');
+
+  const lyricTracks = [
+    {
+      id: 'trk_a',
+      title: 'twilight',
+      lyrics: '[Куплет 1]\ntwilight hours fade to grey\nshadows stretch across the floor\nwhispers echo at the door',
+      source: 'track' as const,
+    },
+    {
+      id: 'trk_b',
+      title: 'athens',
+      lyrics: 'marble ruins in the rain\nsilence settles on the stone\ncarrying the night alone',
+      source: 'track' as const,
+    },
+    {
+      id: 'trk_c',
+      title: 'midnight rose',
+      lyrics: 'velvet petals black as ink\nfalling slowly through the cold\nstories never to be told',
+      source: 'track' as const,
+    },
+  ];
+
+  const lyr1 = pickDailyLyricsChallenge({
+    cycleId: '2026-06-01-AM',
+    lyricTracks,
+    recentTrackIds: [],
+    secret: TEST_SECRET,
+  });
+  assert.ok(lyr1);
+  assert.equal(lyr1.options.length, 4);
+  assert.ok(lyr1.options.some((o) => o.id === lyr1.correct_option_id));
+  assert.ok(!lyr1.prompt_line.startsWith('['));
+
+  // Avoids repeating the previous track
+  const lyr2 = pickDailyLyricsChallenge({
+    cycleId: '2026-06-01-PM',
+    lyricTracks,
+    recentTrackIds: [lyr1.track.id],
+    secret: TEST_SECRET,
+  });
+  assert.ok(lyr2);
+  assert.notEqual(lyr2.track.id, lyr1.track.id);
+
+  // Check Fisher-Yates distribution across 20 cycles (correct answer does NOT stay stuck at index 0)
+  const correctPositions = new Set<number>();
+  for (let i = 1; i <= 20; i++) {
+    const c = pickDailyLyricsChallenge({
+      cycleId: `2026-07-${String(i).padStart(2, '0')}-AM`,
+      lyricTracks,
+      secret: TEST_SECRET,
+    });
+    if (c) {
+      correctPositions.add(c.options.findIndex((o) => o.id === c.correct_option_id));
+    }
+  }
+  assert.ok(correctPositions.size >= 3, 'Expected Fisher-Yates to distribute correct answer across positions');
+
+  const playable: PlayableTrackCandidate[] = [
+    { id: 'trk_1', title: 'Track One', audio_url: '/audio/crown_of_thorns.wav', duration_seconds: 180, source: 'track' },
+    { id: 'trk_2', title: 'Track Two', audio_url: '/audio/midnight_rose.wav', duration_seconds: 150, source: 'track' },
+    { id: 'trk_3', title: 'Track Three', audio_url: '/audio/cathedral_veil.wav', duration_seconds: 200, source: 'track' },
+    { id: 'trk_4', title: 'Track Four', audio_url: '/audio/crown_of_thorns.wav', duration_seconds: 160, source: 'track' },
+  ];
+  const titles = playable.map((p) => ({ id: p.id, title: p.title }));
+
+  const rev = pickDailyReverseTrackChallenge({
+    cycleId: '2026-06-01-AM',
+    playableTracks: playable,
+    allTitleCandidates: titles,
+    excludeTrackIds: ['trk_1'],
+    secret: TEST_SECRET,
+  });
+  assert.ok(rev);
+  assert.notEqual(rev.track.id, 'trk_1');
+  assert.equal(rev.options.length, 4);
+
+  const spd = pickDailySpeedTrackChallenge({
+    cycleId: '2026-06-01-AM',
+    playableTracks: playable,
+    allTitleCandidates: titles,
+    excludeTrackIds: ['trk_1', rev.track.id],
+    secret: TEST_SECRET,
+  });
+  assert.ok(spd);
+  assert.ok(spd.speed_mode === 0.5 || spd.speed_mode === 2.5);
+  assert.equal(spd.options.length, 4);
+  assert.notEqual(spd.track.id, rev.track.id);
+});
+

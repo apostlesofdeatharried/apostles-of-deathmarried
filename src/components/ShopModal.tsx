@@ -2,32 +2,39 @@ import React, { useState, useEffect } from 'react';
 import { useAuth, authFetch } from '../context/AuthContext.js';
 import { useI18n } from '../context/I18nContext.js';
 import { ShopItem, ShopCategory, ItemRarity } from '../types/index.js';
+import { dispatchAchievementUnlocked } from './AchievementToast.js';
 import { safeJson } from '../utils/logic.js';
 import {
   RARITY_CONFIG,
   CATEGORY_LABELS,
   renderEquippedBadge,
+  renderEquippedTitle,
+  renderProfileBanner,
+  isAnimatedBanner,
   getProfileThemeStyle,
   renderProfileEffectOverlay,
   formatHandle,
 } from '../utils/cosmetics.js';
 import confetti from 'canvas-confetti';
-import { X, Check, ShoppingBag, ShieldCheck, Filter } from 'lucide-react';
+import { X, Check, ShoppingBag, ShieldCheck, Filter, Eye, RotateCcw, Sparkles } from 'lucide-react';
 
 interface ShopModalProps {
   isOpen: boolean;
   onClose: () => void;
 }
 
-const SHOP_CATEGORIES: ShopCategory[] = ['frame', 'banner', 'name_style', 'badge', 'theme', 'effect'];
-const RARITY_FILTERS: Array<'all' | ItemRarity> = ['all', 'common', 'uncommon', 'rare', 'epic', 'legendary'];
+const SHOP_CATEGORIES: ShopCategory[] = ['title', 'banner', 'frame', 'effect', 'name_style', 'badge', 'theme'];
+const RARITY_FILTERS: Array<'all' | ItemRarity> = ['all', 'common', 'uncommon', 'rare', 'epic', 'legendary', 'mythic'];
+
+type PinnedPreviewMap = Partial<Record<ShopCategory, { id: string; value: string; name: string }>>;
+type HoverPreviewMap = Partial<Record<ShopCategory, string>>;
 
 export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
   const { user, refresh, openAuth } = useAuth();
   const { t, lang } = useI18n();
 
   const [items, setItems] = useState<ShopItem[]>([]);
-  const [activeCategory, setActiveCategory] = useState<ShopCategory>('frame');
+  const [activeCategory, setActiveCategory] = useState<ShopCategory>('title');
   const [rarityFilter, setRarityFilter] = useState<'all' | ItemRarity>('all');
   const [ownershipFilter, setOwnershipFilter] = useState<'all' | 'owned' | 'available'>('all');
   const [loading, setLoading] = useState(false);
@@ -35,13 +42,9 @@ export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
 
-  // Live preview override state across all 6 visual layers
-  const [previewFrame, setPreviewFrame] = useState<string | null>(null);
-  const [previewBanner, setPreviewBanner] = useState<string | null>(null);
-  const [previewNameStyle, setPreviewNameStyle] = useState<string | null>(null);
-  const [previewBadge, setPreviewBadge] = useState<string | null>(null);
-  const [previewTheme, setPreviewTheme] = useState<string | null>(null);
-  const [previewEffect, setPreviewEffect] = useState<string | null>(null);
+  // Supports both click-to-pin preview (mobile + desktop multi-layer mixing) and desktop hover preview
+  const [pinnedPreviews, setPinnedPreviews] = useState<PinnedPreviewMap>({});
+  const [hoverPreviews, setHoverPreviews] = useState<HoverPreviewMap>({});
 
   const loadItems = async () => {
     setLoading(true);
@@ -63,6 +66,8 @@ export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
       loadItems();
       setErrorMsg(null);
       setSuccessMsg(null);
+      setPinnedPreviews({});
+      setHoverPreviews({});
       const onKeyDown = (e: KeyboardEvent) => {
         if (e.key === 'Escape') onClose();
       };
@@ -82,6 +87,24 @@ export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
   });
 
   const ownedCount = items.filter((it) => it.is_owned).length;
+  const pinnedList = Object.entries(pinnedPreviews).filter(([, v]) => Boolean(v)) as Array<
+    [ShopCategory, { id: string; value: string; name: string }]
+  >;
+
+  const handleTogglePinPreview = (item: ShopItem) => {
+    const label = lang === 'ru' ? item.name_ru : item.name_en;
+    setPinnedPreviews((prev) => {
+      if (prev[item.category]?.id === item.id) {
+        const next = { ...prev };
+        delete next[item.category];
+        return next;
+      }
+      return {
+        ...prev,
+        [item.category]: { id: item.id, value: item.preview_value, name: label },
+      };
+    });
+  };
 
   const handleBuy = async (item: ShopItem) => {
     if (!user) {
@@ -98,11 +121,14 @@ export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ item_id: item.id }),
       });
-      const data = await safeJson<{ error?: string }>(res, {});
+      const data = await safeJson<{ error?: string; newly_unlocked_achievements?: any[] }>(res, {});
       if (!res.ok) {
         setErrorMsg(data.error || (lang === 'ru' ? 'Не удалось купить предмет.' : 'Failed to purchase item.'));
       } else {
-        confetti({ particleCount: 40, spread: 55, origin: { y: 0.6 } });
+        confetti({ particleCount: 36, spread: 52, origin: { y: 0.6 } });
+        if (data.newly_unlocked_achievements?.length) {
+          dispatchAchievementUnlocked(data.newly_unlocked_achievements);
+        }
         setSuccessMsg(
           lang === 'ru'
             ? `Предмет «${item.name_ru}» добавлен в вашу коллекцию!`
@@ -129,10 +155,13 @@ export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ item_id: item.id, equip: willEquip }),
       });
-      const data = await safeJson<{ error?: string }>(res, {});
+      const data = await safeJson<{ error?: string; newly_unlocked_achievements?: any[] }>(res, {});
       if (!res.ok) {
         setErrorMsg(data.error || (lang === 'ru' ? 'Не удалось обновить оформление.' : 'Failed to update equipment.'));
       } else {
+        if (data.newly_unlocked_achievements?.length) {
+          dispatchAchievementUnlocked(data.newly_unlocked_achievements);
+        }
         setSuccessMsg(
           willEquip
             ? lang === 'ru'
@@ -142,6 +171,12 @@ export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
               ? `Оформление «${item.name_ru}» снято`
               : `Unequipped «${item.name_en}»`
         );
+        // Clear pinned preview for that category so live card mirrors saved equipment
+        setPinnedPreviews((prev) => {
+          const next = { ...prev };
+          delete next[item.category];
+          return next;
+        });
         await refresh();
         await loadItems();
       }
@@ -152,22 +187,18 @@ export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
     }
   };
 
-  const clearPreviews = () => {
-    setPreviewFrame(null);
-    setPreviewBanner(null);
-    setPreviewNameStyle(null);
-    setPreviewBadge(null);
-    setPreviewTheme(null);
-    setPreviewEffect(null);
-  };
-
-  // Combined live preview layers
-  const activeFrame = previewFrame ?? user?.equipped_frame;
-  const activeBanner = previewBanner ?? user?.equipped_banner ?? 'from-[#0e0d12] via-[#16141d] to-[#0c0b0e]';
-  const activeNameStyle = previewNameStyle ?? user?.equipped_name_style;
-  const activeBadge = previewBadge ?? user?.equipped_badge;
-  const activeTheme = previewTheme ?? user?.equipped_theme;
-  const activeEffect = previewEffect ?? user?.equipped_effect;
+  // Combined live preview layers: hover overrides pinned overrides equipped
+  const activeFrame = hoverPreviews.frame ?? pinnedPreviews.frame?.value ?? user?.equipped_frame;
+  const activeBanner =
+    hoverPreviews.banner ??
+    pinnedPreviews.banner?.value ??
+    user?.equipped_banner ??
+    'from-[#0e0d12] via-[#16141d] to-[#0c0b0e]';
+  const activeNameStyle = hoverPreviews.name_style ?? pinnedPreviews.name_style?.value ?? user?.equipped_name_style;
+  const activeBadge = hoverPreviews.badge ?? pinnedPreviews.badge?.value ?? user?.equipped_badge;
+  const activeTitle = hoverPreviews.title ?? pinnedPreviews.title?.value ?? user?.equipped_title;
+  const activeTheme = hoverPreviews.theme ?? pinnedPreviews.theme?.value ?? user?.equipped_theme;
+  const activeEffect = hoverPreviews.effect ?? pinnedPreviews.effect?.value ?? user?.equipped_effect;
   const themeStyle = getProfileThemeStyle(activeTheme);
 
   return (
@@ -190,18 +221,18 @@ export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
               </h2>
               <p className="text-[11px] text-[#8e877e] font-sans">
                 {lang === 'ru'
-                  ? `Каталог кастомизации профиля · ${items.length} предметов · в коллекции: ${ownedCount}`
-                  : `Profile customization catalog · ${items.length} items · owned: ${ownedCount}`}
+                  ? `Кастомизация профиля · ${items.length} предметов · в коллекции: ${ownedCount}`
+                  : `Profile customization · ${items.length} items · owned: ${ownedCount}`}
               </p>
             </div>
           </div>
 
           <div className="flex items-center gap-3">
             {user && (
-              <div className="hidden sm:flex items-center gap-3 px-3 py-1.5 bg-black/55 border border-white/[0.08] rounded-lg text-xs font-mono">
+              <div className="hidden sm:flex items-center gap-3 px-3 py-1.5 bg-black/55 border border-white/[0.08] rounded-lg text-xs font-mono tabular-nums">
                 <span className="text-[#8e877e]">{t('balanceLabel')}:</span>
                 <span className="text-[#f2eee9] font-semibold">{user.xp} XP</span>
-                <span className="text-[#423d38]">|</span>
+                <span className="text-[#423d38]">·</span>
                 <span className="text-[#8e877e]">{t('level')}:</span>
                 <span className="text-[#ded8ce]">{user.level}</span>
               </div>
@@ -217,24 +248,24 @@ export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
           </div>
         </div>
 
-        {/* Informational Alert */}
-        <div className="px-5 sm:px-6 py-2.5 bg-[#15141b] border-b border-white/[0.05] text-[11px] text-[#9e968b] flex items-center justify-between gap-2">
-          <div className="flex items-center gap-2">
+        {/* Informational Bar */}
+        <div className="px-5 sm:px-6 py-2 bg-[#141319] border-b border-white/[0.05] text-[11px] text-[#9e968b] flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2 min-w-0">
             <ShieldCheck className="w-3.5 h-3.5 text-[#a39b8b] shrink-0" />
-            <span>
+            <span className="truncate sm:whitespace-normal">
               {lang === 'ru'
-                ? 'Покупки списывают только доступный баланс XP. Уровень и общий Total XP не уменьшаются. Наведите на предмет для предпросмотра.'
-                : 'Purchases spend available XP only. Lifetime level & Total XP never decrease. Hover any item for live preview.'}
+                ? 'Уровень и Total XP не снижаются. Нажмите «Примерка» или наведите на предмет, чтобы собрать образ.'
+                : 'Lifetime level & Total XP never drop. Click Preview or hover any item to mix and test your look.'}
             </span>
           </div>
           {user && (
-            <span className="sm:hidden text-xs text-[#f2eee9] font-mono font-semibold shrink-0">
+            <span className="sm:hidden text-xs text-[#f2eee9] font-mono font-semibold tabular-nums shrink-0">
               {user.xp} XP
             </span>
           )}
         </div>
 
-        {/* Messages */}
+        {/* Feedback Messages */}
         {errorMsg && (
           <div className="mx-5 sm:mx-6 mt-3 px-4 py-2 rounded-lg bg-[#3d1820] border border-[#8a2a38] text-xs text-white">
             {errorMsg}
@@ -247,19 +278,32 @@ export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
         )}
 
         <div className="flex-1 overflow-y-auto p-5 sm:p-6 space-y-5">
-          {/* Live 6-Layer Profile Card Preview */}
+          {/* Interactive Live 7-Layer Profile Card Preview */}
           <div className={`rounded-xl overflow-hidden border transition-all duration-300 ${themeStyle.cardClass}`}>
-            <div className={`h-24 sm:h-28 w-full bg-gradient-to-r ${activeBanner} relative transition-all duration-500 overflow-hidden`}>
+            <div className="h-24 sm:h-28 w-full relative overflow-hidden bg-[#0c0b0e]">
+              {renderProfileBanner(activeBanner)}
               {renderProfileEffectOverlay(activeEffect)}
 
-              <div className="absolute top-2.5 right-3 z-10 text-[10px] tracking-wider uppercase px-2 py-0.5 rounded bg-black/65 border border-white/10 text-[#a39b8b] font-mono">
-                {lang === 'ru' ? 'Предпросмотр профиля' : 'Live Profile Preview'}
+              <div className="absolute top-2.5 right-3 z-10 flex items-center gap-2">
+                {isAnimatedBanner(activeBanner) && (
+                  <span className="inline-flex items-center gap-1 text-[9px] tracking-wider uppercase px-2 py-0.5 rounded bg-black/65 border border-[#c95b84]/45 text-[#f2b8cb] font-mono">
+                    <Sparkles className="w-2.5 h-2.5" />
+                    {lang === 'ru' ? 'Анимация' : 'Animated'}
+                  </span>
+                )}
+                <span className="text-[10px] tracking-wider uppercase px-2 py-0.5 rounded bg-black/65 border border-white/10 text-[#a39b8b] font-mono">
+                  {lang === 'ru' ? 'Предпросмотр' : 'Live Preview'}
+                </span>
               </div>
             </div>
 
             <div className="px-4 sm:px-5 pb-4 pt-3 flex flex-col sm:flex-row sm:items-end justify-between gap-3">
               <div className="flex items-end gap-4 -mt-12 relative z-10 min-w-0">
-                <div className={`relative w-16 h-16 sm:w-20 sm:h-20 rounded-full overflow-hidden bg-black shrink-0 ${activeFrame || 'border border-white/20'}`}>
+                <div
+                  className={`relative w-16 h-16 sm:w-20 sm:h-20 rounded-full overflow-hidden bg-black shrink-0 ${
+                    activeFrame || 'border border-white/20'
+                  }`}
+                >
                   <img
                     src={user?.avatar_url || '/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg'}
                     alt="Preview"
@@ -272,12 +316,13 @@ export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
                     <span className={`text-base sm:text-lg font-display tracking-wider truncate ${activeNameStyle || 'text-white'}`}>
                       {user?.display_name || user?.nickname || 'Night Apostle'}
                     </span>
+                    {renderEquippedTitle(activeTitle, lang, true)}
                     {renderEquippedBadge(activeBadge, lang, true)}
                   </div>
-                  <div className="text-[11px] text-[#9e968b] font-mono flex items-center gap-2 mt-0.5">
+                  <div className="text-[11px] text-[#9e968b] font-mono flex items-center gap-2 mt-1">
                     <span>{formatHandle(user?.nickname || 'night_apostle')}</span>
                     <span className="text-[#423d38]">·</span>
-                    <span>
+                    <span className="tabular-nums">
                       {t('level')} {user?.level || 1} · {user?.xp || 0} XP
                     </span>
                   </div>
@@ -288,9 +333,34 @@ export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
                 <div className={`h-full w-2/3 ${themeStyle.accentBarClass}`} />
               </div>
             </div>
+
+            {/* Active Pinned Preview Strip */}
+            {pinnedList.length > 0 && (
+              <div className="px-4 sm:px-5 py-2 bg-black/45 border-t border-white/[0.06] flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono">
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[#b8b1a5] min-w-0">
+                  <span className="text-[#8e877e] uppercase text-[10px]">
+                    {lang === 'ru' ? 'Примерка:' : 'Previewing:'}
+                  </span>
+                  {pinnedList.map(([cat, info], idx) => (
+                    <span key={cat} className="text-[#f2eee9]">
+                      {idx > 0 && <span className="text-[#5a534c] mr-2">·</span>}
+                      {info.name}
+                    </span>
+                  ))}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setPinnedPreviews({})}
+                  className="inline-flex items-center gap-1 text-[10px] uppercase tracking-wider text-[#d4a5ac] hover:text-white cursor-pointer shrink-0"
+                >
+                  <RotateCcw className="w-3 h-3" />
+                  <span>{lang === 'ru' ? 'Сбросить' : 'Reset'}</span>
+                </button>
+              </div>
+            )}
           </div>
 
-          {/* 6 Category Tabs */}
+          {/* 7 Category Tabs */}
           <div className="flex flex-wrap items-center gap-1.5 border-b border-white/[0.08] pb-3 font-mono text-[11px]">
             {SHOP_CATEGORIES.map((cat) => {
               const catCount = items.filter((it) => it.category === cat).length;
@@ -306,7 +376,7 @@ export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
                   }`}
                 >
                   <span>{lang === 'ru' ? CATEGORY_LABELS[cat].ru : CATEGORY_LABELS[cat].en}</span>
-                  <span className="text-[10px] opacity-65">({catCount})</span>
+                  <span className="text-[10px] opacity-65 tabular-nums">({catCount})</span>
                 </button>
               );
             })}
@@ -342,11 +412,13 @@ export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
             </div>
 
             <div className="flex items-center gap-1">
-              {([
-                { id: 'all', ru: 'Все', en: 'All' },
-                { id: 'available', ru: 'Доступные', en: 'Unowned' },
-                { id: 'owned', ru: 'Купленные', en: 'Owned' },
-              ] as const).map((f) => (
+              {(
+                [
+                  { id: 'all', ru: 'Все', en: 'All' },
+                  { id: 'available', ru: 'Доступные', en: 'Unowned' },
+                  { id: 'owned', ru: 'Купленные', en: 'Owned' },
+                ] as const
+              ).map((f) => (
                 <button
                   type="button"
                   key={f.id}
@@ -379,118 +451,173 @@ export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
                 const desc = lang === 'ru' ? item.description_ru : item.description_en;
                 const canAfford = user ? user.xp >= item.cost_xp : false;
                 const rarityMeta = RARITY_CONFIG[item.rarity] || RARITY_CONFIG.common;
-
-                const isHovered =
-                  (item.category === 'frame' && previewFrame === item.preview_value) ||
-                  (item.category === 'banner' && previewBanner === item.preview_value) ||
-                  (item.category === 'name_style' && previewNameStyle === item.preview_value) ||
-                  (item.category === 'badge' && previewBadge === item.preview_value) ||
-                  (item.category === 'theme' && previewTheme === item.preview_value) ||
-                  (item.category === 'effect' && previewEffect === item.preview_value);
+                const isPinned = pinnedPreviews[item.category]?.id === item.id;
+                const isHovered = hoverPreviews[item.category] === item.preview_value;
+                const animatedBannerItem = item.category === 'banner' && isAnimatedBanner(item.preview_value);
 
                 return (
                   <div
                     key={item.id}
-                    onMouseEnter={() => {
-                      if (item.category === 'frame') setPreviewFrame(item.preview_value);
-                      else if (item.category === 'banner') setPreviewBanner(item.preview_value);
-                      else if (item.category === 'name_style') setPreviewNameStyle(item.preview_value);
-                      else if (item.category === 'badge') setPreviewBadge(item.preview_value);
-                      else if (item.category === 'theme') setPreviewTheme(item.preview_value);
-                      else if (item.category === 'effect') setPreviewEffect(item.preview_value);
-                    }}
-                    onMouseLeave={clearPreviews}
+                    onMouseEnter={() =>
+                      setHoverPreviews((prev) => ({
+                        ...prev,
+                        [item.category]: item.preview_value,
+                      }))
+                    }
+                    onMouseLeave={() =>
+                      setHoverPreviews((prev) => {
+                        const next = { ...prev };
+                        delete next[item.category];
+                        return next;
+                      })
+                    }
                     className={`p-4 rounded-xl bg-[#111015] border transition-all duration-200 flex flex-col justify-between ${
-                      item.is_equipped
-                        ? 'border-[#c5c8cf]/45 shadow-[0_0_16px_rgba(197,200,207,0.12)]'
-                        : isHovered
-                          ? 'border-white/30 bg-[#16151c]'
-                          : `${rarityMeta.borderClass} hover:border-white/25`
+                      isPinned
+                        ? 'border-[#d49a6a]/75 bg-[#16141b] shadow-[0_0_20px_rgba(212,154,106,0.14)]'
+                        : item.is_equipped
+                          ? 'border-[#c5c8cf]/45 shadow-[0_0_16px_rgba(197,200,207,0.1)]'
+                          : isHovered
+                            ? 'border-white/28 bg-[#15141b] -translate-y-0.5'
+                            : `${rarityMeta.borderClass} hover:border-white/25`
                     }`}
                   >
-                    <div className="space-y-2.5">
+                    <div className="space-y-3">
+                      {/* Header: Title + Unboxed Metadata + Tabular Price */}
                       <div className="flex items-start justify-between gap-2">
                         <div className="min-w-0">
-                          <h3 className="font-display text-sm tracking-wider uppercase text-[#f2eee9] font-medium truncate">
+                          <h3 className="font-display text-[15px] tracking-wide text-[#f2eee9] font-medium truncate">
                             {name}
                           </h3>
-                          <span
-                            className={`inline-block mt-1 text-[9px] tracking-wider uppercase font-mono px-2 py-0.5 rounded border ${rarityMeta.badgeClass}`}
-                          >
-                            {lang === 'ru' ? rarityMeta.labelRu : rarityMeta.labelEn}
-                          </span>
+                          <div className="mt-0.5 flex items-center gap-1.5 text-[10px] font-mono uppercase tracking-wider">
+                            <span className={rarityMeta.textClass}>
+                              {lang === 'ru' ? rarityMeta.labelRu : rarityMeta.labelEn}
+                            </span>
+                            {animatedBannerItem && (
+                              <>
+                                <span className="text-[#4a443e]">·</span>
+                                <span className="text-[#e89fb4]">
+                                  {lang === 'ru' ? 'Анимация' : 'Animated'}
+                                </span>
+                              </>
+                            )}
+                          </div>
                         </div>
                         <div className="text-right shrink-0">
-                          <span className="text-xs font-semibold font-mono text-[#f2eee9] px-2 py-0.5 rounded bg-black/50 border border-white/[0.08]">
+                          <span className="text-xs font-semibold font-mono tabular-nums text-[#f2eee9]">
                             {item.cost_xp} XP
                           </span>
                         </div>
                       </div>
 
-                      <p className="text-[11px] text-[#8e877e] leading-relaxed font-sans min-h-[32px]">
-                        {desc}
-                      </p>
+                      {/* Visual Specimen Showcase */}
+                      {item.category === 'title' && (
+                        <div className="py-2.5 px-3 rounded-lg bg-[#0b0a0e] border border-white/[0.06] flex items-center justify-between gap-2">
+                          <span className="text-xs text-[#ded8ce] font-display truncate">
+                            {user?.display_name || user?.nickname || 'apostle'}
+                          </span>
+                          {renderEquippedTitle(item.preview_value, lang)}
+                        </div>
+                      )}
 
-                      {/* Visual snippet of each cosmetic type */}
+                      {item.category === 'banner' && (
+                        <div className="relative h-14 w-full rounded-lg overflow-hidden border border-white/10 bg-[#0b0a0e]">
+                          {renderProfileBanner(item.preview_value, true)}
+                        </div>
+                      )}
+
                       {item.category === 'frame' && (
-                        <div className="flex items-center gap-2.5 pt-1">
-                          <div className={`w-9 h-9 rounded-full bg-[#1b1922] overflow-hidden ${item.preview_value}`}>
+                        <div className="py-2 px-3 rounded-lg bg-[#0b0a0e] border border-white/[0.06] flex items-center gap-3">
+                          <div className={`w-10 h-10 rounded-full bg-[#1b1922] overflow-hidden shrink-0 ${item.preview_value}`}>
                             <img
                               src={user?.avatar_url || '/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg'}
                               alt=""
-                              className="w-full h-full object-cover opacity-80"
+                              className="w-full h-full object-cover opacity-85"
                             />
                           </div>
-                          <span className="text-[10px] font-mono text-[#736c64]">
-                            {lang === 'ru' ? 'Рамка аватара' : 'Avatar ring'}
+                          <span className="text-[11px] font-mono text-[#8e877e]">
+                            {lang === 'ru' ? 'Окантовка аватара' : 'Avatar frame'}
                           </span>
                         </div>
                       )}
-                      {item.category === 'banner' && (
-                        <div className={`h-8 w-full rounded-lg bg-gradient-to-r ${item.preview_value} border border-white/10`} />
-                      )}
+
                       {item.category === 'name_style' && (
-                        <div className={`text-sm font-display ${item.preview_value} pt-1 truncate`}>
-                          {user?.display_name || user?.nickname || 'Night Apostle'}
+                        <div className="py-2.5 px-3 rounded-lg bg-[#0b0a0e] border border-white/[0.06]">
+                          <div className={`text-base font-display ${item.preview_value} truncate`}>
+                            {user?.display_name || user?.nickname || 'Night Apostle'}
+                          </div>
                         </div>
                       )}
+
                       {item.category === 'badge' && (
-                        <div className="pt-1">{renderEquippedBadge(item.preview_value, lang)}</div>
+                        <div className="py-2.5 px-3 rounded-lg bg-[#0b0a0e] border border-white/[0.06] flex items-center gap-2">
+                          <span className="text-xs text-[#ded8ce] font-display truncate">
+                            {user?.display_name || user?.nickname || 'apostle'}
+                          </span>
+                          {renderEquippedBadge(item.preview_value, lang)}
+                        </div>
                       )}
+
                       {item.category === 'theme' && (() => {
                         const ts = getProfileThemeStyle(item.preview_value);
                         return (
-                          <div className={`p-2 rounded-lg border ${ts.cardClass} space-y-1.5`}>
+                          <div className={`p-2.5 rounded-lg border ${ts.cardClass} space-y-1.5`}>
                             <div className="h-1.5 w-full rounded-full bg-white/[0.06] overflow-hidden">
                               <div className={`h-full w-3/4 ${ts.accentBarClass}`} />
                             </div>
-                            <div className="text-[9px] font-mono text-[#8e877e]">
-                              {lang === 'ru' ? 'Палитра карточки профиля' : 'Profile surface & accent'}
+                            <div className="text-[10px] font-mono text-[#8e877e]">
+                              {lang === 'ru' ? 'Палитра карточки профиля' : 'Profile card surface'}
                             </div>
                           </div>
                         );
                       })()}
+
                       {item.category === 'effect' && (
-                        <div className="relative h-10 w-full rounded-lg overflow-hidden bg-gradient-to-r from-[#0e0d12] via-[#1a1722] to-[#0c0b0e] border border-white/[0.08]">
+                        <div className="relative h-12 w-full rounded-lg overflow-hidden bg-gradient-to-r from-[#0e0d12] via-[#1a1722] to-[#0c0b0e] border border-white/[0.08]">
                           {renderProfileEffectOverlay(item.preview_value)}
                         </div>
                       )}
+
+                      <p className="text-[11px] text-[#8e877e] leading-relaxed font-sans min-h-[32px]">
+                        {desc}
+                      </p>
                     </div>
 
-                    {/* Actions */}
-                    <div className="pt-3 border-t border-white/[0.06] mt-3 flex items-center justify-between gap-2">
+                    {/* Actions: Preview Toggle + Buy/Equip */}
+                    <div className="pt-3 border-t border-white/[0.06] mt-3 flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => handleTogglePinPreview(item)}
+                        title={lang === 'ru' ? 'Примерить в предпросмотре' : 'Pin in live preview'}
+                        className={`px-2.5 py-1.5 rounded-lg border text-[11px] font-mono inline-flex items-center gap-1 transition-colors cursor-pointer shrink-0 ${
+                          isPinned
+                            ? 'bg-[#821c2c]/30 border-[#c95b84]/60 text-[#fce3ef]'
+                            : 'bg-white/[0.03] hover:bg-white/[0.08] border-white/[0.09] text-[#a39b8b] hover:text-white'
+                        }`}
+                      >
+                        <Eye className="w-3.5 h-3.5" />
+                        <span className="hidden sm:inline">
+                          {isPinned
+                            ? lang === 'ru'
+                              ? 'В примере'
+                              : 'Active'
+                            : lang === 'ru'
+                              ? 'Примерка'
+                              : 'Try'}
+                        </span>
+                      </button>
+
                       {item.is_owned ? (
                         item.is_equipped ? (
-                          <div className="flex items-center gap-2 w-full justify-between">
-                            <span className="inline-flex items-center gap-1 text-[11px] text-[#6ee7b7] font-mono">
-                              <Check className="w-3.5 h-3.5" />
-                              {t('shopEquipped')}
+                          <div className="flex items-center gap-2 flex-1 justify-between min-w-0">
+                            <span className="inline-flex items-center gap-1 text-[11px] text-[#6ee7b7] font-mono truncate">
+                              <Check className="w-3.5 h-3.5 shrink-0" />
+                              <span className="truncate">{t('shopEquipped')}</span>
                             </span>
                             <button
                               type="button"
                               onClick={() => handleEquipToggle(item, false)}
                               disabled={actionLoading === item.id}
-                              className="text-[11px] font-mono px-2.5 py-1 rounded bg-white/[0.06] hover:bg-white/[0.12] text-[#ded8ce] transition-colors cursor-pointer"
+                              className="text-[11px] font-mono px-2.5 py-1.5 rounded-lg bg-white/[0.06] hover:bg-white/[0.12] text-[#ded8ce] transition-colors cursor-pointer shrink-0"
                             >
                               {t('shopUnequip')}
                             </button>
@@ -500,7 +627,7 @@ export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
                             type="button"
                             onClick={() => handleEquipToggle(item, true)}
                             disabled={actionLoading === item.id}
-                            className="w-full text-[11px] font-mono uppercase tracking-wider py-1.5 rounded-lg bg-white/[0.08] hover:bg-white/[0.16] border border-white/[0.15] text-white transition-colors cursor-pointer"
+                            className="flex-1 text-[11px] font-mono uppercase tracking-wider py-1.5 rounded-lg bg-white/[0.08] hover:bg-white/[0.16] border border-white/[0.15] text-white transition-colors cursor-pointer"
                           >
                             {t('shopEquip')}
                           </button>
@@ -510,15 +637,15 @@ export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
                           type="button"
                           onClick={() => handleBuy(item)}
                           disabled={(Boolean(user) && !canAfford) || actionLoading === item.id}
-                          className="w-full text-[11px] font-mono uppercase tracking-wider py-1.5 rounded-lg bg-white/[0.1] hover:bg-white/[0.2] border border-white/[0.15] disabled:opacity-40 disabled:cursor-not-allowed text-white transition-colors cursor-pointer"
+                          className="flex-1 text-[11px] font-mono uppercase tracking-wider py-1.5 rounded-lg bg-[#5a1622]/85 hover:bg-[#721b2b] border border-[#821c2c] disabled:bg-white/[0.05] disabled:border-white/[0.08] disabled:opacity-45 disabled:cursor-not-allowed text-white transition-colors cursor-pointer"
                         >
                           {!user
                             ? lang === 'ru'
-                              ? `Войти (${item.cost_xp} XP)`
-                              : `Sign in (${item.cost_xp} XP)`
+                              ? `Войти`
+                              : `Sign in`
                             : canAfford
-                              ? `${t('shopBuy')} (${item.cost_xp} XP)`
-                              : `${t('insufficientXp')} (${item.cost_xp} XP)`}
+                              ? t('shopBuy')
+                              : t('insufficientXp')}
                         </button>
                       )}
                     </div>

@@ -12,13 +12,14 @@ export interface LevelProgress {
 
 export function calculateLevelFromXp(xp: number): LevelProgress {
   const safeXp = Math.max(0, Math.floor(xp));
-  // Base progression: Level 1 = 0 XP, Level 2 = 100 XP, Level 3 = 250 XP, etc.
-  // Formula: XP needed for level L is 50 * (L - 1)^1.6
+  // Smooth, balanced progression curve:
+  // Level 1 -> 2: 100 XP, Level 2 -> 3: 303 XP, Level 3 -> 4: 580 XP, Level 4 -> 5: 919 XP, etc.
+  // Formula: cumulative XP threshold for completing level L is floor(100 * L^1.6).
   let level = 1;
   while (true) {
-    const nextThreshold = Math.floor(75 * Math.pow(level, 1.5));
+    const nextThreshold = Math.floor(100 * Math.pow(level, 1.6));
     if (safeXp < nextThreshold) {
-      const prevThreshold = level === 1 ? 0 : Math.floor(75 * Math.pow(level - 1, 1.5));
+      const prevThreshold = level === 1 ? 0 : Math.floor(100 * Math.pow(level - 1, 1.6));
       const neededForNext = nextThreshold - prevThreshold;
       const progressInLevel = safeXp - prevThreshold;
       const progressPercent = Math.min(100, Math.max(0, Math.round((progressInLevel / neededForNext) * 100)));
@@ -41,7 +42,41 @@ export function calculateLevelFromXp(xp: number): LevelProgress {
   }
 }
 
-export function calculateQuizScore(totalQuestions: number, correctAnswers: number, timeSpentSeconds: number): {
+/**
+ * Returns balanced XP per Daily Quiz question based on difficulty:
+ * 1 (easy) = 10 XP, 2 (medium) = 15 XP, 3 (hard) = 25 XP.
+ */
+export function getQuizQuestionXp(difficulty?: number): number {
+  const d = Math.round(Number(difficulty) || 2);
+  if (d <= 1) return 10;
+  if (d >= 3) return 25;
+  return 15;
+}
+
+export function calculateQuizScoreByDifficulty(
+  items: Array<{ isCorrect: boolean; difficulty?: number }>
+): {
+  baseScore: number;
+  speedBonus: number;
+  totalXp: number;
+} {
+  if (!Array.isArray(items) || items.length === 0) {
+    return { baseScore: 0, speedBonus: 0, totalXp: 0 };
+  }
+  let totalXp = 0;
+  for (const item of items) {
+    if (item.isCorrect) {
+      totalXp += getQuizQuestionXp(item.difficulty);
+    }
+  }
+  return {
+    baseScore: totalXp,
+    speedBonus: 0,
+    totalXp,
+  };
+}
+
+export function calculateQuizScore(totalQuestions: number, correctAnswers: number, _timeSpentSeconds: number = 30): {
   baseScore: number;
   speedBonus: number;
   totalXp: number;
@@ -49,17 +84,23 @@ export function calculateQuizScore(totalQuestions: number, correctAnswers: numbe
   if (totalQuestions <= 0 || correctAnswers <= 0) {
     return { baseScore: 0, speedBonus: 0, totalXp: 0 };
   }
-  const accuracyRatio = Math.min(1, Math.max(0, correctAnswers / totalQuestions));
-  const baseScore = Math.round(correctAnswers * 25);
-  // Speed bonus if answered in under 30 seconds
-  const speedBonus = timeSpentSeconds < 30 ? Math.round((30 - timeSpentSeconds) * 2 * accuracyRatio) : 0;
-  const totalXp = baseScore + speedBonus;
-
+  const safeCorrect = Math.min(totalQuestions, Math.max(0, Math.floor(correctAnswers)));
+  const baseScore = safeCorrect * 15;
   return {
     baseScore,
-    speedBonus,
-    totalXp,
+    speedBonus: 0,
+    totalXp: baseScore,
   };
+}
+
+/**
+ * Balanced mini-game XP reward (Guess Track, future Lyrics / Reverse / Speed modes):
+ * 15–20 XP for a successful round (15 base + up to 5 streak bonus), 5 XP for participation.
+ */
+export function calculateMiniGameXp(isCorrect: boolean, currentStreak: number = 0): number {
+  if (!isCorrect) return 5;
+  const streakBonus = Math.min(5, Math.max(0, Math.floor(currentStreak || 0)));
+  return 15 + streakBonus;
 }
 
 export function validateNickname(nickname: string): { valid: boolean; error?: string } {
@@ -418,3 +459,376 @@ export function buildSafeAsciiFilename(
   const safeRand = String(randomSuffix).toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 12) || 'rnd';
   return `${timestamp}_${safeBase}_${safeRand}${safeExt}`;
 }
+
+// ============================================================================
+// STAGE 3: MOSCOW TIME STREAKS, STREAK XP MULTIPLIER, PRIVACY & XP HISTORY I18N
+// ============================================================================
+
+const MOSCOW_OFFSET_MS = 3 * 60 * 60 * 1000; // UTC+3 (MSK, no DST)
+
+/**
+ * Returns the current calendar date string (YYYY-MM-DD) in Moscow time (UTC+3).
+ */
+export function getMoscowDateString(nowMs: number = Date.now()): string {
+  return new Date(nowMs + MOSCOW_OFFSET_MS).toISOString().slice(0, 10);
+}
+
+/**
+ * Checks whether the given timestamp falls within 00:00–00:15 Moscow time (UTC+3).
+ */
+export function isMoscowMidnightWindow(nowMs: number = Date.now()): boolean {
+  const msk = new Date(nowMs + MOSCOW_OFFSET_MS);
+  return msk.getUTCHours() === 0 && msk.getUTCMinutes() <= 15;
+}
+
+/**
+ * Balanced daily streak bonus percent: +5% per active streak day, capped at +50% (10+ days).
+ */
+export function getStreakBonusPercent(streak: number): number {
+  const safeDays = Math.max(0, Math.floor(Number(streak) || 0));
+  return Math.min(50, safeDays * 5);
+}
+
+/**
+ * Applies the daily streak bonus (+5%/day, max +50%) to a game XP base reward.
+ */
+export function applyStreakBonusXp(
+  baseXp: number,
+  streak: number
+): { totalXp: number; bonusXp: number; bonusPercent: number } {
+  const safeBase = Math.max(0, Math.round(Number(baseXp) || 0));
+  const bonusPercent = getStreakBonusPercent(streak);
+  if (safeBase === 0 || bonusPercent === 0) {
+    return { totalXp: safeBase, bonusXp: 0, bonusPercent };
+  }
+  const totalXp = Math.round(safeBase * (1 + bonusPercent / 100));
+  return {
+    totalXp,
+    bonusXp: Math.max(0, totalXp - safeBase),
+    bonusPercent,
+  };
+}
+
+export interface PrivacySettings {
+  hide_community: boolean;
+  hide_streak: boolean;
+  hide_xp_history: boolean;
+  hide_game_stats: boolean;
+}
+
+export const DEFAULT_PRIVACY_SETTINGS: PrivacySettings = {
+  hide_community: false,
+  hide_streak: false,
+  hide_xp_history: true, // Hidden from other users by default
+  hide_game_stats: false,
+};
+
+export function parsePrivacySettings(raw: unknown): PrivacySettings {
+  let obj: Record<string, unknown> | null = null;
+  if (typeof raw === 'string' && raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        obj = parsed as Record<string, unknown>;
+      }
+    } catch {
+      obj = null;
+    }
+  } else if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    obj = raw as Record<string, unknown>;
+  }
+
+  return {
+    hide_community: obj && typeof obj.hide_community === 'boolean' ? obj.hide_community : DEFAULT_PRIVACY_SETTINGS.hide_community,
+    hide_streak: obj && typeof obj.hide_streak === 'boolean' ? obj.hide_streak : DEFAULT_PRIVACY_SETTINGS.hide_streak,
+    hide_xp_history: obj && typeof obj.hide_xp_history === 'boolean' ? obj.hide_xp_history : DEFAULT_PRIVACY_SETTINGS.hide_xp_history,
+    hide_game_stats: obj && typeof obj.hide_game_stats === 'boolean' ? obj.hide_game_stats : DEFAULT_PRIVACY_SETTINGS.hide_game_stats,
+  };
+}
+
+const XP_SOURCE_LABELS_RU: Record<string, string> = {
+  daily_quiz: 'Ежедневная викторина',
+  quiz_complete: 'Ежедневная викторина',
+  quiz: 'Ежедневная викторина',
+  guess_track: 'Угадай трек',
+  daily_track: 'Угадай трек',
+  guess_lyrics: 'Угадай строчку',
+  reverse_track: 'Задом наперёд',
+  speed_track: 'Трек 0.5x / 2.5x',
+  daily_login: 'Ежедневный вход',
+  shop_purchase: 'Покупка в магазине',
+  shop: 'Покупка в магазине',
+  promo_code: 'Промокод',
+  achievement: 'Достижение',
+  admin_adjust: 'Корректировка администратором',
+  admin_grant: 'Начисление от администрации',
+  community_post: 'Новая тема в сообществе',
+  post_create: 'Создание темы',
+  comment: 'Комментарий',
+  comment_create: 'Комментарий в сообществе',
+  creation_upload: 'Публикация работы',
+  registration: 'Регистрация',
+};
+
+const XP_SOURCE_LABELS_EN: Record<string, string> = {
+  daily_quiz: 'Daily Quiz',
+  quiz_complete: 'Daily Quiz',
+  quiz: 'Daily Quiz',
+  guess_track: 'Guess The Track',
+  daily_track: 'Guess The Track',
+  guess_lyrics: 'Guess The Lyric',
+  reverse_track: 'Reverse Track',
+  speed_track: '0.5x / 2.5x Track',
+  daily_login: 'Daily Login',
+  shop_purchase: 'Shop Purchase',
+  shop: 'Shop Purchase',
+  promo_code: 'Promo Code',
+  achievement: 'Achievement',
+  admin_adjust: 'Admin Adjustment',
+  admin_grant: 'Admin Reward',
+  community_post: 'Community Topic',
+  post_create: 'Forum Topic',
+  comment: 'Comment',
+  comment_create: 'Community Comment',
+  creation_upload: 'Creation Published',
+  registration: 'Registration',
+};
+
+const MOSCOW_12H_CYCLE_REGEX = /^\d{4}-\d{2}-\d{2}-(AM|PM)$/;
+const TWELVE_HOURS_MS = 12 * 60 * 60 * 1000;
+
+/**
+ * Returns the active 12-hour Moscow Time (UTC+3) game cycle:
+ * - YYYY-MM-DD-AM for 00:00:00–11:59:59 MSK (resets at 12:00:00 MSK)
+ * - YYYY-MM-DD-PM for 12:00:00–23:59:59 MSK (resets at 00:00:00 MSK next day)
+ */
+export function getMoscow12hCycle(nowMs: number = Date.now()): {
+  cycleId: string;
+  dateStr: string;
+  half: 'AM' | 'PM';
+  nextResetAt: string;
+} {
+  const mskDate = new Date(nowMs + MOSCOW_OFFSET_MS);
+  const dateStr = mskDate.toISOString().slice(0, 10);
+  const mskHour = mskDate.getUTCHours();
+  const half: 'AM' | 'PM' = mskHour < 12 ? 'AM' : 'PM';
+  const cycleId = `${dateStr}-${half}`;
+  const nextResetAt = getNextMoscow12hResetIso(cycleId);
+  return { cycleId, dateStr, half, nextResetAt };
+}
+
+export function isValidMoscow12hCycle(value: unknown): value is string {
+  if (typeof value !== 'string' || !MOSCOW_12H_CYCLE_REGEX.test(value)) {
+    return false;
+  }
+  const datePart = value.slice(0, 10);
+  const parsed = Date.parse(`${datePart}T00:00:00.000Z`);
+  if (Number.isNaN(parsed)) return false;
+  return new Date(parsed).toISOString().slice(0, 10) === datePart;
+}
+
+/**
+ * Returns the exact UTC ISO timestamp of the next 00:00 or 12:00 MSK boundary
+ * after the given YYYY-MM-DD-AM / YYYY-MM-DD-PM cycle.
+ */
+export function getNextMoscow12hResetIso(cycleId: string): string {
+  if (!isValidMoscow12hCycle(cycleId)) {
+    return getMoscow12hCycle().nextResetAt;
+  }
+  const datePart = cycleId.slice(0, 10);
+  const isPm = cycleId.endsWith('-PM');
+  // 00:00:00 MSK on datePart in UTC ms = UTC midnight - 3h
+  const mskDayStartUtcMs = Date.parse(`${datePart}T00:00:00.000Z`) - MOSCOW_OFFSET_MS;
+  const cycleStartUtcMs = mskDayStartUtcMs + (isPm ? TWELVE_HOURS_MS : 0);
+  return new Date(cycleStartUtcMs + TWELVE_HOURS_MS).toISOString();
+}
+
+/**
+ * Returns the immediately preceding 12-hour Moscow cycle ID.
+ */
+export function getPreviousMoscow12hCycle(cycleId: string): string {
+  if (!isValidMoscow12hCycle(cycleId)) {
+    return getPreviousMoscow12hCycle(getMoscow12hCycle().cycleId);
+  }
+  const datePart = cycleId.slice(0, 10);
+  const isPm = cycleId.endsWith('-PM');
+  const mskDayStartUtcMs = Date.parse(`${datePart}T00:00:00.000Z`) - MOSCOW_OFFSET_MS;
+  const prevCycleMidUtcMs = mskDayStartUtcMs + (isPm ? 6 * 3600 * 1000 : -6 * 3600 * 1000);
+  return getMoscow12hCycle(prevCycleMidUtcMs).cycleId;
+}
+
+/**
+ * Fisher-Yates unbiased shuffle (never mutates input array).
+ */
+export function fisherYatesShuffle<T>(items: readonly T[], rng: () => number = Math.random): T[] {
+  const copy = [...items];
+  for (let i = copy.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    const tmp = copy[i];
+    copy[i] = copy[j];
+    copy[j] = tmp;
+  }
+  return copy;
+}
+
+/**
+ * Cleans track lyrics and extracts consecutive meaningful (prompt -> nextLine) pairs
+ * for the "Угадай строчку" mini-game.
+ */
+export function extractLyricPairs(lyrics: string | null | undefined): Array<{ prompt: string; answer: string }> {
+  if (!lyrics || typeof lyrics !== 'string') return [];
+
+  let rawLines = lyrics
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  // Also support compact slash-separated lyrics (e.g. "line 1 / line 2")
+  if (rawLines.length < 2 && lyrics.includes('/')) {
+    rawLines = lyrics
+      .split(/\s*\/\s*/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+  } else {
+    // Expand inline slash-separated lines if a single line contains " / "
+    const expanded: string[] = [];
+    for (const line of rawLines) {
+      if (line.includes(' / ')) {
+        expanded.push(
+          ...line
+            .split(/\s+\/\s+/)
+            .map((s) => s.trim())
+            .filter(Boolean)
+        );
+      } else {
+        expanded.push(line);
+      }
+    }
+    rawLines = expanded;
+  }
+
+  const meaningful = rawLines
+    .map((line) =>
+      line
+        .replace(/^\[[^\]]+\]\s*/g, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+    )
+    .filter((line) => {
+      if (line.length < 5 || line.length > 160) return false;
+      if (/^\[.*\]$/.test(line)) return false;
+      if (/^\(?\s*(?:куплет|припев|бридж|интро|аутро|verse|chorus|bridge|intro|outro|hook|pre-chorus)\b/i.test(line)) {
+        return false;
+      }
+      // Require at least 2 letter characters
+      const letterCount = (line.match(/[a-zA-Zа-яА-ЯёЁ]/g) || []).length;
+      return letterCount >= 4;
+    });
+
+  const pairs: Array<{ prompt: string; answer: string }> = [];
+  const seen = new Set<string>();
+
+  for (let i = 0; i < meaningful.length - 1; i++) {
+    const prompt = meaningful[i];
+    const answer = meaningful[i + 1];
+    const normPrompt = prompt.toLowerCase();
+    const normAnswer = answer.toLowerCase();
+    if (normPrompt === normAnswer) continue;
+    const key = `${normPrompt}||${normAnswer}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    pairs.push({ prompt, answer });
+  }
+
+  return pairs;
+}
+
+/**
+ * Translates current and legacy English XP transaction sources/details into clean Russian (or English).
+ */
+export function formatXpTransactionLabel(
+  source: string | null | undefined,
+  details: string | null | undefined,
+  lang: 'ru' | 'en' = 'ru'
+): { title: string; subtitle: string | null } {
+  const srcKey = String(source || '').trim().toLowerCase();
+  const rawDetails = String(details || '').trim();
+
+  if (lang === 'en') {
+    const title = XP_SOURCE_LABELS_EN[srcKey] || (srcKey ? srcKey.replace(/_/g, ' ') : 'XP Transaction');
+    return { title, subtitle: rawDetails || null };
+  }
+
+  const baseTitle = XP_SOURCE_LABELS_RU[srcKey] || 'Операция с XP';
+  if (!rawDetails) {
+    return { title: baseTitle, subtitle: null };
+  }
+
+  // Legacy "Guess Track (2026-04-01-H0): Correct" / "Participation"
+  const guessMatch = rawDetails.match(/^Guess Track\s*\(([^)]+)\)\s*:\s*(.+)$/i);
+  if (guessMatch) {
+    const outcomeRaw = guessMatch[2].trim().toLowerCase();
+    const outcomeRu = outcomeRaw.includes('correct')
+      ? 'Верный ответ'
+      : outcomeRaw.includes('particip')
+        ? 'Участие в раунде'
+        : guessMatch[2].trim();
+    return { title: 'Угадай трек', subtitle: outcomeRu };
+  }
+
+  // Legacy "Daily Quiz (2026-04-01): 4/5" or "Daily Quiz (2026-04-01): 4/5 (+10%)"
+  const quizMatch = rawDetails.match(/^Daily Quiz\s*\(([^)]+)\)\s*:\s*(.+)$/i);
+  if (quizMatch) {
+    return { title: 'Ежедневная викторина', subtitle: `Результат: ${quizMatch[2].trim()}` };
+  }
+
+  // Legacy "Created post: ..."
+  const postMatch = rawDetails.match(/^Created\s+post\s*:\s*(.+)$/i);
+  if (postMatch) {
+    return { title: 'Новая тема в сообществе', subtitle: postMatch[1].trim() };
+  }
+
+  // Legacy "Uploaded work: ..."
+  const workMatch = rawDetails.match(/^Uploaded\s+work\s*:\s*(.+)$/i);
+  if (workMatch) {
+    return { title: 'Публикация работы', subtitle: workMatch[1].trim() };
+  }
+
+  // Legacy comments
+  if (/^Posted\s+a\s+comment$/i.test(rawDetails)) {
+    return { title: 'Комментарий в сообществе', subtitle: 'Ответ в обсуждении' };
+  }
+  if (/^Commented\s+on\s+gallery\s+creation$/i.test(rawDetails)) {
+    return { title: 'Комментарий в галерее', subtitle: 'Отзыв к творческой работе' };
+  }
+
+  // Legacy "Purchased ..." / "Bought ..."
+  const purchaseMatch = rawDetails.match(/^(?:Purchased|Bought)\s+(.+)$/i);
+  if (purchaseMatch) {
+    return { title: 'Покупка в магазине', subtitle: purchaseMatch[1].trim() };
+  }
+
+  // Legacy "Admin adjusted XP..." / "Admin grant..."
+  if (/^Admin\b/i.test(rawDetails)) {
+    const cleaned = rawDetails
+      .replace(/^Admin\s+(?:adjusted|grant(?:ed)?|set)\s*:?\s*/i, '')
+      .trim();
+    return { title: 'Начисление от администрации', subtitle: cleaned || null };
+  }
+
+  // Legacy "Unlocked achievement: ..."
+  const achMatch = rawDetails.match(/^(?:Unlocked\s+achievement|Achievement)\s*:\s*(.+)$/i);
+  if (achMatch) {
+    return { title: 'Достижение', subtitle: achMatch[1].trim() };
+  }
+
+  // Legacy "Daily login bonus"
+  if (/daily\s*login/i.test(rawDetails)) {
+    return { title: 'Ежедневный вход', subtitle: 'Бонус за активность' };
+  }
+
+  // Already clean Russian or readable custom subtitle
+  return { title: baseTitle, subtitle: rawDetails };
+}
+

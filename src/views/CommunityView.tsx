@@ -1,12 +1,12 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useI18n } from '../context/I18nContext.js';
 import { useAuth, authFetch } from '../context/AuthContext.js';
 import { Post, PostCategory, Comment } from '../types/index.js';
 import { safeJson } from '../utils/logic.js';
-import { formatHandle, renderEquippedBadge } from '../utils/cosmetics.js';
+import { formatHandle, renderEquippedBadge, renderEquippedTitle } from '../utils/cosmetics.js';
+import { RulesModal, hasAcceptedRules } from '../components/RulesModal.js';
 import {
   MessageSquare,
-  Flame,
   Clock,
   Search,
   Plus,
@@ -18,6 +18,7 @@ import {
   CheckCircle2,
   XCircle,
   Shield,
+  ShieldAlert,
   CornerDownRight,
   Reply,
   Upload,
@@ -85,7 +86,24 @@ export const CommunityView: React.FC = () => {
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
 
+  // Rules Modal
+  const [rulesModalMode, setRulesModalMode] = useState<'accept' | 'view' | null>(null);
+  const pendingRulesActionRef = useRef<(() => void) | null>(null);
+
   const isStaff = Boolean(user && (user.role_id === 'admin' || user.role_id === 'moderator'));
+
+  const requireRulesThen = (action: () => void) => {
+    if (!user) {
+      openAuth('login');
+      return;
+    }
+    if (!hasAcceptedRules(user)) {
+      pendingRulesActionRef.current = action;
+      setRulesModalMode('accept');
+      return;
+    }
+    action();
+  };
 
   const goToProfile = (nickname?: string) => {
     if (!nickname) return;
@@ -162,6 +180,21 @@ export const CommunityView: React.FC = () => {
     fetchPosts();
   }, [selectedCategory, sort, search, user?.id]);
 
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const initialPostId = params.get('post');
+    if (initialPostId) {
+      loadPostThread(initialPostId);
+    }
+    const handleOpenPostEvent = (e: CustomEvent<string>) => {
+      if (e.detail) loadPostThread(e.detail);
+    };
+    window.addEventListener('open-community-post', handleOpenPostEvent as EventListener);
+    return () => {
+      window.removeEventListener('open-community-post', handleOpenPostEvent as EventListener);
+    };
+  }, []);
+
   const loadPostThread = async (postId: string) => {
     setLoadingThread(true);
     try {
@@ -182,15 +215,13 @@ export const CommunityView: React.FC = () => {
   };
 
   const handleOpenCreateModal = () => {
-    if (!user) {
-      openAuth('login');
-      return;
-    }
-    setCreateError(null);
-    if (!newPostCategory || (!isStaff && categories.find((c) => c.id === newPostCategory)?.is_official)) {
-      setNewPostCategory(getDefaultCategoryId(categories));
-    }
-    setCreateModalOpen(true);
+    requireRulesThen(() => {
+      setCreateError(null);
+      if (!newPostCategory || (!isStaff && categories.find((c) => c.id === newPostCategory)?.is_official)) {
+        setNewPostCategory(getDefaultCategoryId(categories));
+      }
+      setCreateModalOpen(true);
+    });
   };
 
   const handleUploadPostMedia = async (file: File) => {
@@ -376,13 +407,8 @@ export const CommunityView: React.FC = () => {
     }
   };
 
-  const handleAddComment = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!user) {
-      openAuth('login');
-      return;
-    }
-    if (!activePost || !newComment.trim()) return;
+  const submitCommentNow = async () => {
+    if (!user || !activePost || !newComment.trim()) return;
 
     setSubmittingComment(true);
     try {
@@ -411,28 +437,95 @@ export const CommunityView: React.FC = () => {
     }
   };
 
-  const handleToggleReaction = async (reactionType: 'rose' | 'skull' | 'flame' | 'heart') => {
+  const handleAddComment = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!activePost || !newComment.trim()) return;
+    requireRulesThen(() => {
+      submitCommentNow();
+    });
+  };
+
+  const handleToggleReaction = async (reactionType: 'rose' | 'skull') => {
     if (!user) {
       openAuth('login');
       return;
     }
     if (!activePost) return;
 
+    const prevPost = activePost;
+    const prevReaction = userReaction;
+    const prevPosts = posts;
+
+    const nextReaction = prevReaction === reactionType ? null : reactionType;
+    let nextRose = Number(prevPost.rose_count ?? 0);
+    let nextSkull = Number(prevPost.skull_count ?? 0);
+
+    if (prevReaction === 'rose') nextRose = Math.max(0, nextRose - 1);
+    if (prevReaction === 'skull') nextSkull = Math.max(0, nextSkull - 1);
+    if (nextReaction === 'rose') nextRose += 1;
+    if (nextReaction === 'skull') nextSkull += 1;
+    const nextTotal = nextRose + nextSkull;
+
+    // Optimistic UI update
+    setUserReaction(nextReaction);
+    setActivePost({
+      ...prevPost,
+      rose_count: nextRose,
+      skull_count: nextSkull,
+      reactions_count: nextTotal,
+      user_reaction: nextReaction,
+    });
+    setPosts((curr) =>
+      curr.map((p) =>
+        p.id === prevPost.id
+          ? { ...p, rose_count: nextRose, skull_count: nextSkull, reactions_count: nextTotal, user_reaction: nextReaction }
+          : p
+      )
+    );
+
     try {
-      const res = await authFetch(`/api/community/posts/${activePost.id}/react`, {
+      const res = await authFetch(`/api/community/posts/${prevPost.id}/react`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ reaction_type: reactionType }),
       });
-      const data = await safeJson<{ reacted: boolean; reaction_type: string | null; error?: string }>(res, { reacted: false, reaction_type: null });
+      const data = await safeJson<{
+        reacted?: boolean;
+        reaction_type?: 'rose' | 'skull' | null;
+        rose_count?: number;
+        skull_count?: number;
+        reactions_count?: number;
+        error?: string;
+      }>(res, {});
       if (res.ok) {
-        setUserReaction(data.reacted ? data.reaction_type : null);
-        loadPostThread(activePost.id);
+        const syncedReaction = data.reacted ? (data.reaction_type ?? null) : null;
+        const syncedRose = typeof data.rose_count === 'number' ? data.rose_count : nextRose;
+        const syncedSkull = typeof data.skull_count === 'number' ? data.skull_count : nextSkull;
+        const syncedTotal = typeof data.reactions_count === 'number' ? data.reactions_count : syncedRose + syncedSkull;
+        setUserReaction(syncedReaction);
+        setActivePost((curr) =>
+          curr && curr.id === prevPost.id
+            ? { ...curr, rose_count: syncedRose, skull_count: syncedSkull, reactions_count: syncedTotal, user_reaction: syncedReaction }
+            : curr
+        );
+        setPosts((curr) =>
+          curr.map((p) =>
+            p.id === prevPost.id
+              ? { ...p, rose_count: syncedRose, skull_count: syncedSkull, reactions_count: syncedTotal, user_reaction: syncedReaction }
+              : p
+          )
+        );
       } else {
-        showError(data?.error || 'Failed to update reaction');
+        setUserReaction(prevReaction);
+        setActivePost(prevPost);
+        setPosts(prevPosts);
+        showError(data?.error || 'Не удалось обновить реакцию');
       }
     } catch (e: any) {
-      showError(e?.message || 'Reaction error');
+      setUserReaction(prevReaction);
+      setActivePost(prevPost);
+      setPosts(prevPosts);
+      showError(e?.message || 'Ошибка реакции');
     }
   };
 
@@ -588,6 +681,7 @@ export const CommunityView: React.FC = () => {
                     <span className="font-mono text-[10px] text-[#8e877e] px-1.5 py-0.5 rounded bg-white/[0.04]">
                       L{activePost.author_level}
                     </span>
+                    {renderEquippedTitle(activePost.author_title, lang, true)}
                     {renderEquippedBadge(activePost.author_badge, lang, true)}
                   </div>
                   <div className="font-mono text-xs text-[#736c64] mt-0.5 flex flex-wrap items-center gap-1.5">
@@ -721,38 +815,33 @@ export const CommunityView: React.FC = () => {
               )}
             </div>
 
-            {/* Reactions Bar */}
-            <div className="flex items-center gap-3 pt-4 border-t border-white/[0.06] font-mono text-xs">
+            {/* Reactions Bar — Strictly 2 reactions: Rose & Skull */}
+            <div className="flex items-center gap-2.5 pt-4 border-t border-white/[0.06] font-mono text-xs">
               <button
+                type="button"
                 onClick={() => handleToggleReaction('rose')}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border transition-all cursor-pointer ${
+                title="Роза"
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border transition-all cursor-pointer tabular-nums ${
                   userReaction === 'rose'
-                    ? 'bg-[#821c2c]/30 border-[#821c2c] text-white'
-                    : 'bg-white/[0.04] border-white/[0.08] text-[#8e877e] hover:text-white'
+                    ? 'bg-[#821c2c]/30 border-[#a4283c] text-white'
+                    : 'bg-white/[0.04] border-white/[0.08] text-[#8e877e] hover:text-white hover:border-white/20'
                 }`}
               >
                 <span>🌹</span>
-                <span>{activePost.reactions_count || 0}</span>
+                <span>{activePost.rose_count ?? 0}</span>
               </button>
               <button
-                onClick={() => handleToggleReaction('flame')}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border transition-all cursor-pointer ${
-                  userReaction === 'flame'
-                    ? 'bg-amber-900/30 border-amber-600 text-white'
-                    : 'bg-white/[0.04] border-white/[0.08] text-[#8e877e] hover:text-white'
-                }`}
-              >
-                <Flame className="w-3.5 h-3.5" />
-              </button>
-              <button
+                type="button"
                 onClick={() => handleToggleReaction('skull')}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border transition-all cursor-pointer ${
+                title="Череп"
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border transition-all cursor-pointer tabular-nums ${
                   userReaction === 'skull'
-                    ? 'bg-white/20 border-white text-white'
-                    : 'bg-white/[0.04] border-white/[0.08] text-[#8e877e] hover:text-white'
+                    ? 'bg-white/[0.16] border-white/40 text-white'
+                    : 'bg-white/[0.04] border-white/[0.08] text-[#8e877e] hover:text-white hover:border-white/20'
                 }`}
               >
                 <span>💀</span>
+                <span>{activePost.skull_count ?? 0}</span>
               </button>
             </div>
           </div>
@@ -858,6 +947,7 @@ export const CommunityView: React.FC = () => {
                             <span className="font-mono text-[10px] text-[#8e877e]">
                               L{cm.author_level}
                             </span>
+                            {renderEquippedTitle(cm.author_title, lang, true)}
                             {renderEquippedBadge(cm.author_badge, lang, true)}
                           </div>
                           <div className="flex items-center gap-2 shrink-0">
@@ -1123,14 +1213,18 @@ export const CommunityView: React.FC = () => {
                       </p>
                     </div>
 
-                    <div className="flex items-center gap-3 shrink-0 font-mono text-xs text-[#736c64] pt-1">
+                    <div className="flex items-center gap-3 shrink-0 font-mono text-xs text-[#736c64] pt-1 tabular-nums">
                       <div className="flex items-center gap-1">
                         <MessageSquare className="w-3.5 h-3.5" />
                         <span>{post.comments_count || 0}</span>
                       </div>
-                      <div className="flex items-center gap-1">
-                        <Flame className="w-3.5 h-3.5" />
-                        <span>{post.reactions_count || 0}</span>
+                      <div className="flex items-center gap-1 text-[#c49298]" title="Роза">
+                        <span>🌹</span>
+                        <span>{post.rose_count ?? 0}</span>
+                      </div>
+                      <div className="flex items-center gap-1 text-[#9b948b]" title="Череп">
+                        <span>💀</span>
+                        <span>{post.skull_count ?? 0}</span>
                       </div>
                       {user && (user.id === post.user_id || isStaff) && (
                         <button
@@ -1504,6 +1598,37 @@ export const CommunityView: React.FC = () => {
           </div>
         </div>
       )}
+
+      {/* Subtle Forum Rules Footer Link */}
+      <div className="pt-4 border-t border-white/[0.05] flex items-center justify-between text-[11px] font-mono text-[#736c64]">
+        <span>Обсуждения сообщества Apostles of deathmarried</span>
+        <button
+          type="button"
+          onClick={() => setRulesModalMode('view')}
+          className="inline-flex items-center gap-1.5 text-[#8e877e] hover:text-[#f2eee9] transition-colors cursor-pointer"
+        >
+          <ShieldAlert className="w-3.5 h-3.5 text-[#821c2c]" />
+          <span>Правила</span>
+        </button>
+      </div>
+
+      {/* Rules Modal */}
+      <RulesModal
+        isOpen={rulesModalMode !== null}
+        mode={rulesModalMode || 'view'}
+        userId={user?.id}
+        onClose={() => {
+          setRulesModalMode(null);
+          pendingRulesActionRef.current = null;
+        }}
+        onAccepted={() => {
+          setRulesModalMode(null);
+          refresh();
+          const nextAction = pendingRulesActionRef.current;
+          pendingRulesActionRef.current = null;
+          nextAction?.();
+        }}
+      />
     </div>
   );
 };
