@@ -641,6 +641,10 @@ describe('All 5 mini-games HTTP flow (tracks + singles, FK safety) and chunked R
       assert.equal(g2Json.completed, true, `${game.id} F5 completed must be true`);
       assert.equal(g2Json.already_completed, true, `${game.id} F5 already_completed must be true`);
       assert.ok(g2Json.previous_attempt, `${game.id} F5 must return previous_attempt`);
+      if (game.id === 'daily-quiz') {
+        assert.equal(typeof g2Json.previous_attempt.correct_count, 'number', 'daily-quiz F5 must return previous_attempt.correct_count');
+        assert.ok(Number(g2Json.previous_attempt.total) > 0, 'daily-quiz F5 must return previous_attempt.total');
+      }
 
       // 4) Second POST (repeat farm attempt): HTTP 409 & zero extra XP
       const p2 = await fetch(`${baseUrl}${game.postPath}`, {
@@ -733,6 +737,37 @@ describe('All 5 mini-games HTTP flow (tracks + singles, FK safety) and chunked R
       assert.equal(gAfterJson.alreadyPlayed, false, `${game.id} should be unlocked after scopes.games reset`);
       assert.equal(gAfterJson.completed, false);
     }
+
+    // Step 6C: Loss / 0-correct attempt ALSO locks daily-quiz cleanly until next 12h MSK cycle (F5 persists)
+    const quizAfterResetRes = await fetch(`${baseUrl}/api/games/quiz/daily`, { headers: u1Headers });
+    const quizAfterReset = (await quizAfterResetRes.json()) as any;
+    assert.equal(quizAfterReset.alreadyPlayed, false);
+    const wrongQuizAnswers: Record<string, number> = {};
+    for (const q of quizAfterReset.questions || []) {
+      wrongQuizAnswers[q.id] = 99; // invalid option index -> guaranteed 0 correct answers & 0 XP
+    }
+    const wrongQuizPost = await fetch(`${baseUrl}/api/games/quiz/submit`, {
+      method: 'POST',
+      headers: u1Headers,
+      body: JSON.stringify({ answers: wrongQuizAnswers, challenge_date: quizAfterReset.challenge_date }),
+    });
+    assert.equal(wrongQuizPost.status, 200);
+    const wrongQuizPostJson = (await wrongQuizPost.json()) as any;
+    assert.equal(wrongQuizPostJson.correct_count, 0);
+    assert.equal(wrongQuizPostJson.alreadyPlayed, true);
+
+    const quizF5AfterLoss = await fetch(`${baseUrl}/api/games/quiz/daily`, { headers: u1Headers });
+    const quizF5LossJson = (await quizF5AfterLoss.json()) as any;
+    assert.equal(quizF5LossJson.alreadyPlayed, true, 'Quiz must remain locked after F5 even on 0/5 loss');
+    assert.equal(quizF5LossJson.previous_attempt.correct_count, 0);
+    assert.equal(quizF5LossJson.previous_attempt.total, (quizAfterReset.questions || []).length);
+
+    const retryAfterLoss = await fetch(`${baseUrl}/api/games/quiz/submit`, {
+      method: 'POST',
+      headers: u1Headers,
+      body: JSON.stringify({ answers: wrongQuizAnswers, challenge_date: quizAfterReset.challenge_date }),
+    });
+    assert.equal(retryAfterLoss.status, 409, 'Quiz retry after loss must return 409');
   });
 });
 

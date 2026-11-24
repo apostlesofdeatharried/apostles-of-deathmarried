@@ -10,13 +10,18 @@ function resolveWritableDbPath(): string {
   if (process.env.NODE_ENV === 'test' && process.env.APOSTLES_DB_PATH) {
     return process.env.APOSTLES_DB_PATH;
   }
+  const hasSupabase = Boolean(
+    process.env.SUPABASE_URL?.trim() && process.env.SUPABASE_SERVICE_ROLE_KEY?.trim()
+  );
+  const allowBundledCopy = !hasSupabase || process.env.NODE_ENV === 'test';
+
   if (isVercel) {
     const tmpDir = '/tmp';
     if (!fs.existsSync(tmpDir)) {
       fs.mkdirSync(tmpDir, { recursive: true });
     }
     const tmpDbPath = path.join(tmpDir, 'apostles.db');
-    if (!fs.existsSync(tmpDbPath) && fs.existsSync(bundledDbPath)) {
+    if (allowBundledCopy && !fs.existsSync(tmpDbPath) && fs.existsSync(bundledDbPath)) {
       try {
         fs.copyFileSync(bundledDbPath, tmpDbPath);
       } catch (err) {
@@ -34,7 +39,7 @@ function resolveWritableDbPath(): string {
     // Fallback to /tmp if current directory is read-only
     const tmpDbPath = path.join('/tmp', 'apostles.db');
     fs.mkdirSync(path.dirname(tmpDbPath), { recursive: true });
-    if (!fs.existsSync(tmpDbPath) && fs.existsSync(bundledDbPath)) {
+    if (allowBundledCopy && !fs.existsSync(tmpDbPath) && fs.existsSync(bundledDbPath)) {
       try {
         fs.copyFileSync(bundledDbPath, tmpDbPath);
       } catch {}

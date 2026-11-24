@@ -1,12 +1,12 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useI18n } from '../context/I18nContext.js';
-import { useAuth, authFetch } from '../context/AuthContext.js';
+import { useAuth, authFetch, getStoredToken } from '../context/AuthContext.js';
 import { QuizQuestion, LeaderboardEntry } from '../types/index.js';
 import { ShopModal } from '../components/ShopModal.js';
 import { ShareCardModal } from '../components/ShareCardModal.js';
 import type { ShareCardContext } from '../utils/shareCardGenerator.js';
 import { dispatchAchievementUnlocked } from '../components/AchievementToast.js';
-import { safeJson, getStreakBonusPercent } from '../utils/logic.js';
+import { safeJson, getStreakBonusPercent, getMoscow12hCycle } from '../utils/logic.js';
 import { formatHandle, renderEquippedBadge, renderEquippedTitle } from '../utils/cosmetics.js';
 import {
   unlockAudioContextWithResume,
@@ -98,6 +98,29 @@ interface DailyLyricsRound {
   previous_attempt?: LyricsResultState | null;
 }
 
+type CachedGameId = 'guess-track' | 'daily-quiz' | 'guess-lyrics' | 'reverse-track' | 'speed-track';
+
+interface CachedGameDoneRecord {
+  completed: true;
+  gameId: CachedGameId;
+  cycleKey: string;
+  userId: string;
+  selected?: string;
+  correct?: boolean;
+  xp_earned?: number;
+  score?: number;
+  correct_count?: number | null;
+  total?: number;
+  track_title?: string;
+  correct_line?: string;
+  speed_mode?: 0.5 | 2.5;
+  streak_bonus_percent?: number;
+  result?: any;
+  saved_at: string;
+}
+
+const LAST_AUTH_USER_ID_KEY = 'apostle_cached_user_id';
+
 const GUEST_STORAGE_KEYS = {
   guess: 'apostles_guest_daily_track_v2',
   quiz: 'apostles_guest_daily_quiz_v1',
@@ -105,6 +128,70 @@ const GUEST_STORAGE_KEYS = {
   reverse: 'apostles_guest_daily_reverse_v1',
   speed: 'apostles_guest_daily_speed_v1',
 } as const;
+
+function buildGameDoneKey(userId: string, gameId: CachedGameId, cycleKey: string): string {
+  return `game_done:${userId}:${gameId}:${cycleKey}`;
+}
+
+function readCachedAuthUserId(): string | null {
+  try {
+    const val = localStorage.getItem(LAST_AUTH_USER_ID_KEY);
+    return val && val.trim() ? val.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeCachedAuthUserId(userId: string | null) {
+  try {
+    if (userId) {
+      localStorage.setItem(LAST_AUTH_USER_ID_KEY, userId);
+    } else {
+      localStorage.removeItem(LAST_AUTH_USER_ID_KEY);
+    }
+  } catch {}
+}
+
+function readGameDoneCache(userId: string, gameId: CachedGameId, cycleKey: string): CachedGameDoneRecord | null {
+  if (!userId || !cycleKey) return null;
+  try {
+    const raw = localStorage.getItem(buildGameDoneKey(userId, gameId, cycleKey));
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && parsed.completed === true && parsed.cycleKey === cycleKey) {
+        return parsed as CachedGameDoneRecord;
+      }
+    }
+  } catch {}
+  return null;
+}
+
+function writeGameDoneCache(
+  userId: string,
+  gameId: CachedGameId,
+  cycleKey: string,
+  payload: Omit<CachedGameDoneRecord, 'completed' | 'gameId' | 'cycleKey' | 'userId' | 'saved_at'>
+) {
+  if (!userId || !cycleKey) return;
+  try {
+    const record: CachedGameDoneRecord = {
+      completed: true,
+      gameId,
+      cycleKey,
+      userId,
+      saved_at: new Date().toISOString(),
+      ...payload,
+    };
+    localStorage.setItem(buildGameDoneKey(userId, gameId, cycleKey), JSON.stringify(record));
+  } catch {}
+}
+
+function removeGameDoneCache(userId: string, gameId: CachedGameId, cycleKey: string) {
+  if (!userId || !cycleKey) return;
+  try {
+    localStorage.removeItem(buildGameDoneKey(userId, gameId, cycleKey));
+  } catch {}
+}
 
 function formatCountdown(nextResetIso: string | null, nowMs: number): string {
   if (!nextResetIso) return '--:--:--';
@@ -213,6 +300,9 @@ export const GamesView: React.FC = () => {
   const [alreadyCompletedDaily, setAlreadyCompletedDaily] = useState(false);
   const [previousScore, setPreviousScore] = useState(0);
   const [previousXp, setPreviousXp] = useState(0);
+  const [previousCorrectCount, setPreviousCorrectCount] = useState<number | null>(null);
+  const [previousTotalQuestions, setPreviousTotalQuestions] = useState<number>(0);
+  const [, setCacheRev] = useState(0);
   const [quizResult, setQuizResult] = useState<{
     total: number;
     correct_count: number;
@@ -296,11 +386,18 @@ export const GamesView: React.FC = () => {
   const [leaderboardGame, setLeaderboardGame] = useState<LeaderboardGameFilter>('all');
   const [leadersLoading, setLeadersLoading] = useState(false);
 
-  // Live 1s clock for MSK countdown
+  // Live 1s clock for MSK countdown & sync cached auth user id for 0ms lock
   useEffect(() => {
     const id = window.setInterval(() => setNowMs(Date.now()), 1000);
     return () => window.clearInterval(id);
   }, []);
+
+  useEffect(() => {
+    if (!authLoading) {
+      writeCachedAuthUserId(user?.id || null);
+      setCacheRev((v) => v + 1);
+    }
+  }, [authLoading, user?.id]);
 
   const abortReverseFetch = useCallback(() => {
     if (reverseAbortRef.current) {
@@ -395,6 +492,7 @@ export const GamesView: React.FC = () => {
     const reqId = ++guessLoadSeqRef.current;
     setGuessLoading(true);
     setGuessError(null);
+    setGuessRound(null);
     setGuessResult(null);
     setGuessCompleted(false);
     setSelectedGuessOption(null);
@@ -415,18 +513,51 @@ export const GamesView: React.FC = () => {
         setGuessRound(data);
         setGuessStartTime(Date.now());
 
-        if (data.alreadyPlayed || data.completed || data.already_completed) {
+        const cycleId = data.challenge_date || getMoscow12hCycle().cycleId;
+        const effectiveUid = user?.id || 'guest';
+        const serverCompleted = Boolean(data.alreadyPlayed || data.completed || data.already_completed);
+
+        if (serverCompleted) {
           setGuessCompleted(true);
           if (data.previous_attempt) {
             setGuessResult(data.previous_attempt);
             setSelectedGuessOption(data.previous_attempt.selected_track_id || null);
+            writeGameDoneCache(effectiveUid, 'guess-track', cycleId, {
+              selected: data.previous_attempt.selected_track_id || '',
+              correct: Boolean(data.previous_attempt.correct),
+              xp_earned: Number(data.previous_attempt.xp_earned) || 0,
+              score: Number(data.previous_attempt.score) || 0,
+              track_title: data.previous_attempt.track?.title || undefined,
+              result: data.previous_attempt,
+            });
+          } else {
+            writeGameDoneCache(effectiveUid, 'guess-track', cycleId, {});
           }
-        } else if (!user && data.challenge_date) {
-          const guestSaved = readGuestAttempt<GuessResultState>(GUEST_STORAGE_KEYS.guess, data.challenge_date);
-          if (guestSaved) {
+          setCacheRev((v) => v + 1);
+        } else if (user) {
+          removeGameDoneCache(user.id, 'guess-track', cycleId);
+          setCacheRev((v) => v + 1);
+        } else if (data.challenge_date) {
+          const cachedGuest = readGameDoneCache('guest', 'guess-track', data.challenge_date);
+          const legacyGuest = !cachedGuest
+            ? readGuestAttempt<GuessResultState>(GUEST_STORAGE_KEYS.guess, data.challenge_date)
+            : null;
+          if (cachedGuest?.result || legacyGuest?.result) {
+            const restored = (cachedGuest?.result || legacyGuest?.result) as GuessResultState;
+            const sel = cachedGuest?.selected || legacyGuest?.selected || null;
             setGuessCompleted(true);
-            setGuessResult(guestSaved.result);
-            setSelectedGuessOption(guestSaved.selected || null);
+            setGuessResult(restored);
+            setSelectedGuessOption(sel);
+            if (!cachedGuest && legacyGuest) {
+              writeGameDoneCache('guest', 'guess-track', data.challenge_date, {
+                selected: legacyGuest.selected,
+                correct: Boolean(restored.correct),
+                xp_earned: Number(restored.xp_earned) || 0,
+                track_title: restored.track?.title || undefined,
+                result: restored,
+              });
+              setCacheRev((v) => v + 1);
+            }
           }
         }
       } else {
@@ -450,9 +581,14 @@ export const GamesView: React.FC = () => {
     setQuizError(null);
     setQuizDisabled(false);
     setQuizDisabledMessage('');
+    setQuizQuestions([]);
     setQuizSubmitted(false);
     setQuizResult(null);
     setAlreadyCompletedDaily(false);
+    setPreviousScore(0);
+    setPreviousXp(0);
+    setPreviousCorrectCount(null);
+    setPreviousTotalQuestions(0);
     setQuizAnswers({});
     try {
       const res = await authFetch('/api/games/quiz/daily', { cache: 'no-store' });
@@ -460,37 +596,79 @@ export const GamesView: React.FC = () => {
       if (reqId !== quizLoadSeqRef.current) return;
 
       if (res.ok && data) {
-        setQuizChallengeDate(data.challenge_date || '');
+        const cycleId = data.challenge_date || getMoscow12hCycle().cycleId;
+        setQuizChallengeDate(cycleId);
         setQuizNextResetAt(data.next_reset_at || null);
         if (data.disabled) {
           setQuizDisabled(true);
           setQuizDisabledMessage(data.message || 'Зайдите позже, добавляются новые вопросы');
           setQuizQuestions([]);
         } else {
-          setQuizQuestions(data.questions || []);
+          const qs = Array.isArray(data.questions) ? data.questions : [];
+          setQuizQuestions(qs);
           const serverCompleted = Boolean(data.alreadyPlayed || data.completed || data.already_completed);
+          const totalQ = Number(data.previous_attempt?.total ?? data.previous_total ?? qs.length) || qs.length;
+          const corrCount =
+            typeof data.previous_attempt?.correct_count === 'number'
+              ? data.previous_attempt.correct_count
+              : typeof data.previous_correct_count === 'number'
+                ? data.previous_correct_count
+                : null;
+          const prevSc = Number(data.previous_attempt?.score ?? data.previous_score) || 0;
+          const prevXp = Number(data.previous_attempt?.xp_earned ?? data.previous_xp) || 0;
+
           if (serverCompleted) {
             setAlreadyCompletedDaily(true);
-            setPreviousScore(data.previous_score || 0);
-            setPreviousXp(data.previous_xp || 0);
-          } else if (!user && data.challenge_date) {
-            const guestSaved = readGuestAttempt<{ score: number; total_xp: number }>(
-              GUEST_STORAGE_KEYS.quiz,
-              data.challenge_date
-            );
-            if (guestSaved) {
+            setPreviousScore(prevSc);
+            setPreviousXp(prevXp);
+            setPreviousCorrectCount(corrCount);
+            setPreviousTotalQuestions(totalQ);
+            writeGameDoneCache(user?.id || 'guest', 'daily-quiz', cycleId, {
+              score: prevSc,
+              xp_earned: prevXp,
+              correct_count: corrCount,
+              total: totalQ,
+            });
+            setCacheRev((v) => v + 1);
+          } else if (user) {
+            removeGameDoneCache(user.id, 'daily-quiz', cycleId);
+            setAlreadyCompletedDaily(false);
+            setCacheRev((v) => v + 1);
+          } else if (data.challenge_date) {
+            const cachedGuest = readGameDoneCache('guest', 'daily-quiz', data.challenge_date);
+            const legacyGuest = !cachedGuest
+              ? readGuestAttempt<{ score: number; total_xp: number; correct_count?: number; total?: number }>(
+                  GUEST_STORAGE_KEYS.quiz,
+                  data.challenge_date
+                )
+              : null;
+            if (cachedGuest) {
               setAlreadyCompletedDaily(true);
-              setPreviousScore(Number(guestSaved.result?.score) || 0);
-              setPreviousXp(Number(guestSaved.result?.total_xp) || 0);
+              setPreviousScore(Number(cachedGuest.score) || 0);
+              setPreviousXp(Number(cachedGuest.xp_earned) || 0);
+              setPreviousCorrectCount(
+                typeof cachedGuest.correct_count === 'number' ? cachedGuest.correct_count : null
+              );
+              setPreviousTotalQuestions(Number(cachedGuest.total) || qs.length);
+            } else if (legacyGuest) {
+              setAlreadyCompletedDaily(true);
+              setPreviousScore(Number(legacyGuest.result?.score) || 0);
+              setPreviousXp(Number(legacyGuest.result?.total_xp) || 0);
+              setPreviousCorrectCount(
+                typeof legacyGuest.result?.correct_count === 'number' ? legacyGuest.result.correct_count : null
+              );
+              setPreviousTotalQuestions(Number(legacyGuest.result?.total) || qs.length);
+              writeGameDoneCache('guest', 'daily-quiz', data.challenge_date, {
+                score: Number(legacyGuest.result?.score) || 0,
+                xp_earned: Number(legacyGuest.result?.total_xp) || 0,
+                correct_count:
+                  typeof legacyGuest.result?.correct_count === 'number' ? legacyGuest.result.correct_count : null,
+                total: Number(legacyGuest.result?.total) || qs.length,
+              });
+              setCacheRev((v) => v + 1);
             } else {
               setAlreadyCompletedDaily(false);
-              setPreviousScore(0);
-              setPreviousXp(0);
             }
-          } else {
-            setAlreadyCompletedDaily(false);
-            setPreviousScore(data.previous_score || 0);
-            setPreviousXp(data.previous_xp || 0);
           }
           setQuizStartTime(Date.now());
         }
@@ -511,6 +689,7 @@ export const GamesView: React.FC = () => {
     const reqId = ++lyricsLoadSeqRef.current;
     setLyricsLoading(true);
     setLyricsError(null);
+    setLyricsRound(null);
     setLyricsResult(null);
     setLyricsCompleted(false);
     setSelectedLyricOption(null);
@@ -522,18 +701,52 @@ export const GamesView: React.FC = () => {
 
       if (res.ok && data) {
         setLyricsRound(data);
-        if (data.alreadyPlayed || data.completed || data.already_completed) {
+        const cycleId = data.challenge_date || getMoscow12hCycle().cycleId;
+        const effectiveUid = user?.id || 'guest';
+        const serverCompleted = Boolean(data.alreadyPlayed || data.completed || data.already_completed);
+
+        if (serverCompleted) {
           setLyricsCompleted(true);
           if (data.previous_attempt) {
             setLyricsResult(data.previous_attempt);
             setSelectedLyricOption(data.previous_attempt.selected_option_id || null);
+            writeGameDoneCache(effectiveUid, 'guess-lyrics', cycleId, {
+              selected: data.previous_attempt.selected_option_id || '',
+              correct: Boolean(data.previous_attempt.correct),
+              xp_earned: Number(data.previous_attempt.xp_earned) || 0,
+              track_title: data.previous_attempt.track?.title || undefined,
+              correct_line: data.previous_attempt.correct_line || undefined,
+              result: data.previous_attempt,
+            });
+          } else {
+            writeGameDoneCache(effectiveUid, 'guess-lyrics', cycleId, {});
           }
-        } else if (!user && data.challenge_date) {
-          const guestSaved = readGuestAttempt<LyricsResultState>(GUEST_STORAGE_KEYS.lyrics, data.challenge_date);
-          if (guestSaved) {
+          setCacheRev((v) => v + 1);
+        } else if (user) {
+          removeGameDoneCache(user.id, 'guess-lyrics', cycleId);
+          setCacheRev((v) => v + 1);
+        } else if (data.challenge_date) {
+          const cachedGuest = readGameDoneCache('guest', 'guess-lyrics', data.challenge_date);
+          const legacyGuest = !cachedGuest
+            ? readGuestAttempt<LyricsResultState>(GUEST_STORAGE_KEYS.lyrics, data.challenge_date)
+            : null;
+          if (cachedGuest?.result || legacyGuest?.result) {
+            const restored = (cachedGuest?.result || legacyGuest?.result) as LyricsResultState;
+            const sel = cachedGuest?.selected || legacyGuest?.selected || null;
             setLyricsCompleted(true);
-            setLyricsResult(guestSaved.result);
-            setSelectedLyricOption(guestSaved.selected || null);
+            setLyricsResult(restored);
+            setSelectedLyricOption(sel);
+            if (!cachedGuest && legacyGuest) {
+              writeGameDoneCache('guest', 'guess-lyrics', data.challenge_date, {
+                selected: legacyGuest.selected,
+                correct: Boolean(restored.correct),
+                xp_earned: Number(restored.xp_earned) || 0,
+                track_title: restored.track?.title || undefined,
+                correct_line: restored.correct_line || undefined,
+                result: restored,
+              });
+              setCacheRev((v) => v + 1);
+            }
           }
         }
       } else {
@@ -555,6 +768,7 @@ export const GamesView: React.FC = () => {
     const reqId = ++reverseLoadSeqRef.current;
     setReverseLoading(true);
     setReverseError(null);
+    setReverseRound(null);
     setReverseResult(null);
     setReverseCompleted(false);
     setSelectedReverseOption(null);
@@ -569,18 +783,50 @@ export const GamesView: React.FC = () => {
       if (res.ok && data) {
         setReverseRound(data);
         setReverseDuration(Math.min(5, Math.max(1, Number(data.snippet_duration) || 5)));
-        if (data.alreadyPlayed || data.completed || data.already_completed) {
+        const cycleId = data.challenge_date || getMoscow12hCycle().cycleId;
+        const effectiveUid = user?.id || 'guest';
+        const serverCompleted = Boolean(data.alreadyPlayed || data.completed || data.already_completed);
+
+        if (serverCompleted) {
           setReverseCompleted(true);
           if (data.previous_attempt) {
             setReverseResult(data.previous_attempt);
             setSelectedReverseOption(data.previous_attempt.selected_track_id || null);
+            writeGameDoneCache(effectiveUid, 'reverse-track', cycleId, {
+              selected: data.previous_attempt.selected_track_id || '',
+              correct: Boolean(data.previous_attempt.correct),
+              xp_earned: Number(data.previous_attempt.xp_earned) || 0,
+              track_title: data.previous_attempt.track?.title || undefined,
+              result: data.previous_attempt,
+            });
+          } else {
+            writeGameDoneCache(effectiveUid, 'reverse-track', cycleId, {});
           }
-        } else if (!user && data.challenge_date) {
-          const guestSaved = readGuestAttempt<GuessResultState>(GUEST_STORAGE_KEYS.reverse, data.challenge_date);
-          if (guestSaved) {
+          setCacheRev((v) => v + 1);
+        } else if (user) {
+          removeGameDoneCache(user.id, 'reverse-track', cycleId);
+          setCacheRev((v) => v + 1);
+        } else if (data.challenge_date) {
+          const cachedGuest = readGameDoneCache('guest', 'reverse-track', data.challenge_date);
+          const legacyGuest = !cachedGuest
+            ? readGuestAttempt<GuessResultState>(GUEST_STORAGE_KEYS.reverse, data.challenge_date)
+            : null;
+          if (cachedGuest?.result || legacyGuest?.result) {
+            const restored = (cachedGuest?.result || legacyGuest?.result) as GuessResultState;
+            const sel = cachedGuest?.selected || legacyGuest?.selected || null;
             setReverseCompleted(true);
-            setReverseResult(guestSaved.result);
-            setSelectedReverseOption(guestSaved.selected || null);
+            setReverseResult(restored);
+            setSelectedReverseOption(sel);
+            if (!cachedGuest && legacyGuest) {
+              writeGameDoneCache('guest', 'reverse-track', data.challenge_date, {
+                selected: legacyGuest.selected,
+                correct: Boolean(restored.correct),
+                xp_earned: Number(restored.xp_earned) || 0,
+                track_title: restored.track?.title || undefined,
+                result: restored,
+              });
+              setCacheRev((v) => v + 1);
+            }
           }
         }
       } else {
@@ -602,6 +848,7 @@ export const GamesView: React.FC = () => {
     const reqId = ++speedLoadSeqRef.current;
     setSpeedLoading(true);
     setSpeedError(null);
+    setSpeedRound(null);
     setSpeedResult(null);
     setSpeedCompleted(false);
     setSelectedSpeedOption(null);
@@ -623,18 +870,52 @@ export const GamesView: React.FC = () => {
         };
         setSpeedRound(data);
         setSpeedDuration(listenDur);
-        if (data.alreadyPlayed || data.completed || data.already_completed) {
+        const cycleId = data.challenge_date || getMoscow12hCycle().cycleId;
+        const effectiveUid = user?.id || 'guest';
+        const serverCompleted = Boolean(data.alreadyPlayed || data.completed || data.already_completed);
+
+        if (serverCompleted) {
           setSpeedCompleted(true);
           if (data.previous_attempt) {
             setSpeedResult(data.previous_attempt);
             setSelectedSpeedOption(data.previous_attempt.selected_track_id || null);
+            writeGameDoneCache(effectiveUid, 'speed-track', cycleId, {
+              selected: data.previous_attempt.selected_track_id || '',
+              correct: Boolean(data.previous_attempt.correct),
+              xp_earned: Number(data.previous_attempt.xp_earned) || 0,
+              speed_mode: data.speed_mode || data.previous_attempt.speed_mode,
+              track_title: data.previous_attempt.track?.title || undefined,
+              result: data.previous_attempt,
+            });
+          } else {
+            writeGameDoneCache(effectiveUid, 'speed-track', cycleId, {});
           }
-        } else if (!user && data.challenge_date) {
-          const guestSaved = readGuestAttempt<GuessResultState>(GUEST_STORAGE_KEYS.speed, data.challenge_date);
-          if (guestSaved) {
+          setCacheRev((v) => v + 1);
+        } else if (user) {
+          removeGameDoneCache(user.id, 'speed-track', cycleId);
+          setCacheRev((v) => v + 1);
+        } else if (data.challenge_date) {
+          const cachedGuest = readGameDoneCache('guest', 'speed-track', data.challenge_date);
+          const legacyGuest = !cachedGuest
+            ? readGuestAttempt<GuessResultState>(GUEST_STORAGE_KEYS.speed, data.challenge_date)
+            : null;
+          if (cachedGuest?.result || legacyGuest?.result) {
+            const restored = (cachedGuest?.result || legacyGuest?.result) as GuessResultState;
+            const sel = cachedGuest?.selected || legacyGuest?.selected || null;
             setSpeedCompleted(true);
-            setSpeedResult(guestSaved.result);
-            setSelectedSpeedOption(guestSaved.selected || null);
+            setSpeedResult(restored);
+            setSelectedSpeedOption(sel);
+            if (!cachedGuest && legacyGuest) {
+              writeGameDoneCache('guest', 'speed-track', data.challenge_date, {
+                selected: legacyGuest.selected,
+                correct: Boolean(restored.correct),
+                xp_earned: Number(restored.xp_earned) || 0,
+                speed_mode: restored.speed_mode || rate,
+                track_title: restored.track?.title || undefined,
+                result: restored,
+              });
+              setCacheRev((v) => v + 1);
+            }
           }
         }
       } else {
@@ -1099,6 +1380,17 @@ export const GamesView: React.FC = () => {
         };
         setGuessResult(resultObj);
         setGuessCompleted(true);
+        const cycleKey = data.challenge_date || guessRound.challenge_date || getMoscow12hCycle().cycleId;
+        writeGameDoneCache(user?.id || 'guest', 'guess-track', cycleKey, {
+          selected: selectedId,
+          correct: resultObj.correct,
+          xp_earned: resultObj.xp_earned,
+          score: Number(resultObj.score) || 0,
+          track_title: resultObj.track?.title || undefined,
+          streak_bonus_percent: resultObj.streak_bonus_percent,
+          result: resultObj,
+        });
+        setCacheRev((v) => v + 1);
         if (!user && guessRound.challenge_date) {
           saveGuestAttempt(GUEST_STORAGE_KEYS.guess, guessRound.challenge_date, selectedId, resultObj);
         }
@@ -1110,6 +1402,11 @@ export const GamesView: React.FC = () => {
         setGuessError(data?.error || 'Не удалось проверить ответ.');
         if (res.status === 409 || data?.alreadyPlayed || data?.already_completed) {
           setGuessCompleted(true);
+          const cycleKey = guessRound.challenge_date || getMoscow12hCycle().cycleId;
+          if (!readGameDoneCache(user?.id || 'guest', 'guess-track', cycleKey)) {
+            writeGameDoneCache(user?.id || 'guest', 'guess-track', cycleKey, {});
+            setCacheRev((v) => v + 1);
+          }
           await loadGuessRound();
         }
       }
@@ -1147,10 +1444,20 @@ export const GamesView: React.FC = () => {
         setQuizResult(data);
         setQuizSubmitted(true);
         setAlreadyCompletedDaily(true);
+        const cycleKey = data.challenge_date || quizChallengeDate || getMoscow12hCycle().cycleId;
+        writeGameDoneCache(user?.id || 'guest', 'daily-quiz', cycleKey, {
+          score: Number(data.base_score) || 0,
+          xp_earned: Number(data.total_xp) || 0,
+          correct_count: Number(data.correct_count) || 0,
+          total: Number(data.total) || quizQuestions.length,
+        });
+        setCacheRev((v) => v + 1);
         if (!user && quizChallengeDate) {
           saveGuestAttempt(GUEST_STORAGE_KEYS.quiz, quizChallengeDate, 'submitted', {
             score: Number(data.base_score) || Number(data.correct_count) || 0,
             total_xp: Number(data.total_xp) || 0,
+            correct_count: Number(data.correct_count) || 0,
+            total: Number(data.total) || quizQuestions.length,
           });
         }
         if (data.correct_count === data.total) confetti({ particleCount: 60, spread: 70, origin: { y: 0.6 } });
@@ -1160,6 +1467,11 @@ export const GamesView: React.FC = () => {
         setQuizError(data?.error || 'Не удалось отправить ответы.');
         if (res.status === 409 || data?.alreadyPlayed || data?.already_completed) {
           setAlreadyCompletedDaily(true);
+          const cycleKey = quizChallengeDate || getMoscow12hCycle().cycleId;
+          if (!readGameDoneCache(user?.id || 'guest', 'daily-quiz', cycleKey)) {
+            writeGameDoneCache(user?.id || 'guest', 'daily-quiz', cycleKey, {});
+            setCacheRev((v) => v + 1);
+          }
           await loadDailyQuiz();
         }
       }
@@ -1206,6 +1518,17 @@ export const GamesView: React.FC = () => {
         };
         setLyricsResult(resObj);
         setLyricsCompleted(true);
+        const cycleKey = data.challenge_date || lyricsRound.challenge_date || getMoscow12hCycle().cycleId;
+        writeGameDoneCache(user?.id || 'guest', 'guess-lyrics', cycleKey, {
+          selected: optionId,
+          correct: resObj.correct,
+          xp_earned: resObj.xp_earned,
+          track_title: resObj.track?.title || undefined,
+          correct_line: resObj.correct_line || undefined,
+          streak_bonus_percent: resObj.streak_bonus_percent,
+          result: resObj,
+        });
+        setCacheRev((v) => v + 1);
         if (!user && lyricsRound.challenge_date) {
           saveGuestAttempt(GUEST_STORAGE_KEYS.lyrics, lyricsRound.challenge_date, optionId, resObj);
         }
@@ -1217,6 +1540,11 @@ export const GamesView: React.FC = () => {
         setLyricsError(data?.error || 'Не удалось проверить ответ.');
         if (res.status === 409 || data?.alreadyPlayed || data?.already_completed) {
           setLyricsCompleted(true);
+          const cycleKey = lyricsRound.challenge_date || getMoscow12hCycle().cycleId;
+          if (!readGameDoneCache(user?.id || 'guest', 'guess-lyrics', cycleKey)) {
+            writeGameDoneCache(user?.id || 'guest', 'guess-lyrics', cycleKey, {});
+            setCacheRev((v) => v + 1);
+          }
           await loadLyricsRound();
         }
       }
@@ -1264,6 +1592,16 @@ export const GamesView: React.FC = () => {
         };
         setReverseResult(resObj);
         setReverseCompleted(true);
+        const cycleKey = data.challenge_date || reverseRound.challenge_date || getMoscow12hCycle().cycleId;
+        writeGameDoneCache(user?.id || 'guest', 'reverse-track', cycleKey, {
+          selected: selectedId,
+          correct: resObj.correct,
+          xp_earned: resObj.xp_earned,
+          track_title: resObj.track?.title || undefined,
+          streak_bonus_percent: resObj.streak_bonus_percent,
+          result: resObj,
+        });
+        setCacheRev((v) => v + 1);
         if (!user && reverseRound.challenge_date) {
           saveGuestAttempt(GUEST_STORAGE_KEYS.reverse, reverseRound.challenge_date, selectedId, resObj);
         }
@@ -1275,6 +1613,11 @@ export const GamesView: React.FC = () => {
         setReverseError(data?.error || 'Не удалось проверить ответ.');
         if (res.status === 409 || data?.alreadyPlayed || data?.already_completed) {
           setReverseCompleted(true);
+          const cycleKey = reverseRound.challenge_date || getMoscow12hCycle().cycleId;
+          if (!readGameDoneCache(user?.id || 'guest', 'reverse-track', cycleKey)) {
+            writeGameDoneCache(user?.id || 'guest', 'reverse-track', cycleKey, {});
+            setCacheRev((v) => v + 1);
+          }
           await loadReverseRound();
         }
       }
@@ -1323,6 +1666,17 @@ export const GamesView: React.FC = () => {
         };
         setSpeedResult(resObj);
         setSpeedCompleted(true);
+        const cycleKey = data.challenge_date || speedRound.challenge_date || getMoscow12hCycle().cycleId;
+        writeGameDoneCache(user?.id || 'guest', 'speed-track', cycleKey, {
+          selected: selectedId,
+          correct: resObj.correct,
+          xp_earned: resObj.xp_earned,
+          speed_mode: resObj.speed_mode,
+          track_title: resObj.track?.title || undefined,
+          streak_bonus_percent: resObj.streak_bonus_percent,
+          result: resObj,
+        });
+        setCacheRev((v) => v + 1);
         if (!user && speedRound.challenge_date) {
           saveGuestAttempt(GUEST_STORAGE_KEYS.speed, speedRound.challenge_date, selectedId, resObj);
         }
@@ -1334,6 +1688,11 @@ export const GamesView: React.FC = () => {
         setSpeedError(data?.error || 'Не удалось проверить ответ.');
         if (res.status === 409 || data?.alreadyPlayed || data?.already_completed) {
           setSpeedCompleted(true);
+          const cycleKey = speedRound.challenge_date || getMoscow12hCycle().cycleId;
+          if (!readGameDoneCache(user?.id || 'guest', 'speed-track', cycleKey)) {
+            writeGameDoneCache(user?.id || 'guest', 'speed-track', cycleKey, {});
+            setCacheRev((v) => v + 1);
+          }
           await loadSpeedRound();
         }
       }
@@ -1354,11 +1713,30 @@ export const GamesView: React.FC = () => {
   const speedPercent =
     speedDuration > 0 ? Math.min(100, Math.max(0, (speedElapsed / speedDuration) * 100)) : 0;
 
-  const guessCountdown = formatCountdown(guessRound?.next_reset_at || null, nowMs);
-  const quizCountdown = formatCountdown(quizNextResetAt, nowMs);
-  const lyricsCountdown = formatCountdown(lyricsRound?.next_reset_at || null, nowMs);
-  const reverseCountdown = formatCountdown(reverseRound?.next_reset_at || null, nowMs);
-  const speedCountdown = formatCountdown(speedRound?.next_reset_at || null, nowMs);
+  const activeCycleInfo = getMoscow12hCycle(nowMs);
+  const effectiveUiUserId = user?.id || (authLoading && getStoredToken() ? readCachedAuthUserId() : 'guest');
+
+  const guessCachedDone = effectiveUiUserId
+    ? readGameDoneCache(effectiveUiUserId, 'guess-track', guessRound?.challenge_date || activeCycleInfo.cycleId)
+    : null;
+  const quizCachedDone = effectiveUiUserId
+    ? readGameDoneCache(effectiveUiUserId, 'daily-quiz', quizChallengeDate || activeCycleInfo.cycleId)
+    : null;
+  const lyricsCachedDone = effectiveUiUserId
+    ? readGameDoneCache(effectiveUiUserId, 'guess-lyrics', lyricsRound?.challenge_date || activeCycleInfo.cycleId)
+    : null;
+  const reverseCachedDone = effectiveUiUserId
+    ? readGameDoneCache(effectiveUiUserId, 'reverse-track', reverseRound?.challenge_date || activeCycleInfo.cycleId)
+    : null;
+  const speedCachedDone = effectiveUiUserId
+    ? readGameDoneCache(effectiveUiUserId, 'speed-track', speedRound?.challenge_date || activeCycleInfo.cycleId)
+    : null;
+
+  const guessCountdown = formatCountdown(guessRound?.next_reset_at || activeCycleInfo.nextResetAt, nowMs);
+  const quizCountdown = formatCountdown(quizNextResetAt || activeCycleInfo.nextResetAt, nowMs);
+  const lyricsCountdown = formatCountdown(lyricsRound?.next_reset_at || activeCycleInfo.nextResetAt, nowMs);
+  const reverseCountdown = formatCountdown(reverseRound?.next_reset_at || activeCycleInfo.nextResetAt, nowMs);
+  const speedCountdown = formatCountdown(speedRound?.next_reset_at || activeCycleInfo.nextResetAt, nowMs);
 
   const tabs: Array<{ id: GameTabId; label: string; icon: React.ReactNode }> = [
     { id: 'guess', label: 'Угадай трек', icon: <Music className="w-3.5 h-3.5" /> },
@@ -1376,7 +1754,7 @@ export const GamesView: React.FC = () => {
         <span>{title} · 00:00 / 12:00 МСК</span>
       </div>
       <div className="flex items-center gap-2 text-[11px] text-[#8e877e]">
-        <span>{formatMskCycleLabel(cycleId)}</span>
+        <span>{formatMskCycleLabel(cycleId || activeCycleInfo.cycleId)}</span>
         <span className="text-[#423d38]">·</span>
         <span className="inline-flex items-center gap-1 text-[#ded8ce] tabular-nums">
           <Clock className="w-3 h-3 text-[#821c2c]" />
@@ -1385,6 +1763,95 @@ export const GamesView: React.FC = () => {
       </div>
     </div>
   );
+
+  const renderGameSkeleton = (label: string, rows: number = 4) => (
+    <div className="space-y-5 py-2 animate-pulse" aria-busy="true" aria-label={label}>
+      <div className="mx-auto w-16 h-16 rounded-full bg-white/[0.05] border border-white/[0.08]" />
+      <div className="mx-auto h-2.5 w-40 rounded bg-white/[0.06]" />
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2">
+        {Array.from({ length: rows }).map((_, i) => (
+          <div key={i} className="h-14 rounded-lg bg-[#151419] border border-white/[0.06]" />
+        ))}
+      </div>
+      <div className="font-mono text-[11px] text-[#8e877e] text-center">{label}</div>
+    </div>
+  );
+
+  const renderInstantLockedCard = (
+    cached: CachedGameDoneRecord,
+    countdown: string,
+    nextTab: GameTabId,
+    nextLabel: string
+  ) => {
+    const isQuiz = cached.gameId === 'daily-quiz';
+    const hasVerdict = typeof cached.correct === 'boolean';
+    const xpText =
+      typeof cached.xp_earned === 'number'
+        ? cached.xp_earned > 0
+          ? `+${cached.xp_earned} XP`
+          : '0 XP'
+        : null;
+
+    return (
+      <div className="p-5 rounded-xl bg-[#16151a] border border-white/[0.08] space-y-3 font-mono text-center animate-fadeIn">
+        <div className="w-11 h-11 rounded-full bg-white/[0.04] border border-white/10 flex items-center justify-center mx-auto text-[#48bb78]">
+          {hasVerdict && !cached.correct ? (
+            <XCircle className="w-5 h-5 text-[#e53e3e]" />
+          ) : (
+            <CheckCircle2 className="w-5 h-5 text-[#48bb78]" />
+          )}
+        </div>
+        <div className="space-y-1">
+          <div className="text-xs font-semibold uppercase tracking-wider text-[#f2eee9]">
+            Игра уже пройдена в этом 12-часовом цикле
+          </div>
+          {isQuiz ? (
+            <div className="text-xs text-[#c7c0b6] flex flex-wrap items-center justify-center gap-2 pt-1">
+              {typeof cached.correct_count === 'number' && cached.total ? (
+                <span>
+                  Верно: <strong className="text-white">{cached.correct_count}/{cached.total}</strong>
+                </span>
+              ) : cached.score ? (
+                <span>
+                  Счёт: <strong className="text-white">{cached.score}</strong>
+                </span>
+              ) : (
+                <span>Попытка использована</span>
+              )}
+              {xpText && <strong className="text-[#6ee7b7]">{xpText}</strong>}
+            </div>
+          ) : hasVerdict ? (
+            <div className="text-xs flex flex-wrap items-center justify-center gap-2 pt-1">
+              <span className={cached.correct ? 'text-[#48bb78]' : 'text-[#e53e3e]'}>
+                {cached.correct ? 'Верно' : 'Неверно'}
+              </span>
+              {xpText && <span className="text-[#ded8ce]">{xpText}</span>}
+            </div>
+          ) : (
+            <div className="text-xs text-[#c7c0b6] pt-1">Попытка использована</div>
+          )}
+          {cached.track_title && (
+            <div className="text-xs text-[#8e877e] pt-1">
+              Трек раунда: <span className="text-[#f2eee9]">{cached.track_title}</span>
+            </div>
+          )}
+        </div>
+        <div className="text-[11px] text-[#8e877e]">
+          Следующий раунд через {countdown} (00:00 / 12:00 МСК)
+        </div>
+        <div className="pt-2 flex justify-center">
+          <button
+            type="button"
+            onClick={() => setActiveTab(nextTab)}
+            className="inline-flex items-center gap-2 px-5 py-2.5 rounded-lg bg-white/[0.08] hover:bg-white/[0.14] border border-white/[0.12] text-xs text-white uppercase tracking-wider transition-colors cursor-pointer"
+          >
+            <span>{nextLabel}</span>
+            <ArrowRight className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      </div>
+    );
+  };
 
   return (
     <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-10 space-y-8 animate-fadeIn">
@@ -1504,13 +1971,17 @@ export const GamesView: React.FC = () => {
               </div>
             )}
 
-            {guessRound ? (
+            {guessCachedDone && !guessResult && (!guessRound || guessCompleted || guessLoading || authLoading) ? (
+              renderInstantLockedCard(guessCachedDone, guessCountdown, 'lyrics', 'Угадай строчку')
+            ) : guessLoading || authLoading ? (
+              renderGameSkeleton('Загрузка аудиофрагмента...')
+            ) : guessRound ? (
               <div className="space-y-6">
                 <div className="flex flex-col items-center">
                   <button
                     type="button"
                     onClick={toggleSnippetAudio}
-                    disabled={guessAudioLoading}
+                    disabled={guessAudioLoading || guessCompleted || !!guessResult}
                     className="w-16 h-16 rounded-full bg-white/[0.06] hover:bg-white/[0.14] border border-white/[0.15] text-white flex items-center justify-center transition-all cursor-pointer hover:scale-105 shadow-lg disabled:opacity-60"
                     aria-label={isSnippetPlaying ? 'Пауза' : 'Слушать 5-секундный фрагмент'}
                   >
@@ -1678,8 +2149,6 @@ export const GamesView: React.FC = () => {
                   </div>
                 )}
               </div>
-            ) : guessLoading || authLoading ? (
-              <div className="py-12 font-mono text-xs text-[#8e877e]">Загрузка аудиофрагмента...</div>
             ) : null}
           </div>
         </div>
@@ -1729,6 +2198,10 @@ export const GamesView: React.FC = () => {
                 </button>
               </div>
             </div>
+          ) : !quizResult && !alreadyCompletedDaily && quizCachedDone && (quizLoading || authLoading || quizQuestions.length === 0) ? (
+            <div className="bg-[#100f13] border border-white/[0.08] rounded-xl p-6">
+              {renderInstantLockedCard(quizCachedDone, quizCountdown, 'guess', 'Угадай трек')}
+            </div>
           ) : alreadyCompletedDaily && !quizResult ? (
             <div className="bg-[#100f13] border border-white/[0.08] rounded-xl p-8 text-center space-y-4 font-mono">
               <div className="w-12 h-12 rounded-full bg-white/[0.04] border border-white/10 flex items-center justify-center mx-auto text-[#48bb78]">
@@ -1736,24 +2209,32 @@ export const GamesView: React.FC = () => {
               </div>
               <div>
                 <h3 className="font-display text-lg uppercase text-[#f2eee9] font-medium">
-                  Викторина пройдена
+                  Игра уже пройдена в этом 12-часовом цикле
                 </h3>
                 <p className="text-xs text-[#8e877e] mt-1 font-sans">
                   Следующий набор вопросов откроется через {quizCountdown} (00:00 / 12:00 МСК)
                 </p>
               </div>
 
-              {previousXp > 0 && (
-                <div className="inline-flex items-center gap-4 px-4 py-2 rounded bg-black/40 border border-white/[0.06] text-xs">
+              <div className="inline-flex items-center gap-4 px-4 py-2 rounded bg-black/40 border border-white/[0.06] text-xs">
+                {previousCorrectCount !== null && previousTotalQuestions > 0 ? (
+                  <span>
+                    Верно: <strong className="text-white">{previousCorrectCount}/{previousTotalQuestions}</strong>
+                  </span>
+                ) : previousScore > 0 ? (
                   <span>
                     Счёт: <strong className="text-white">{previousScore}</strong>
                   </span>
-                  <span className="text-[#423d38]">|</span>
-                  <span>
-                    <strong className="text-[#6ee7b7]">+{previousXp} XP</strong>
-                  </span>
-                </div>
-              )}
+                ) : (
+                  <span>Попытка использована</span>
+                )}
+                <span className="text-[#423d38]">|</span>
+                <span>
+                  <strong className="text-[#6ee7b7]">
+                    {previousXp > 0 ? `+${previousXp} XP` : '0 XP'}
+                  </strong>
+                </span>
+              </div>
 
               <div className="pt-2 flex flex-wrap items-center justify-center gap-2">
                 <button
@@ -1762,7 +2243,12 @@ export const GamesView: React.FC = () => {
                     setShareContext({
                       type: 'game',
                       gameTitle: 'Викторина',
-                      resultPrimary: previousScore > 0 ? `${previousScore}` : 'Пройдено',
+                      resultPrimary:
+                        previousCorrectCount !== null && previousTotalQuestions > 0
+                          ? `${previousCorrectCount}/${previousTotalQuestions}`
+                          : previousScore > 0
+                            ? `${previousScore}`
+                            : 'Пройдено',
                       statusLine: 'Раунд завершён',
                       xpEarned: previousXp,
                       username: user?.nickname || null,
@@ -1785,8 +2271,8 @@ export const GamesView: React.FC = () => {
               </div>
             </div>
           ) : quizLoading || authLoading ? (
-            <div className="py-12 text-center font-mono text-xs text-[#8e877e]">
-              Загрузка вопросов викторины...
+            <div className="bg-[#100f13] border border-white/[0.08] rounded-xl p-6">
+              {renderGameSkeleton('Загрузка вопросов викторины...', 4)}
             </div>
           ) : quizQuestions.length > 0 ? (
             <div className="space-y-5">
@@ -1955,7 +2441,11 @@ export const GamesView: React.FC = () => {
               </div>
             )}
 
-            {lyricsRound ? (
+            {lyricsCachedDone && !lyricsResult && (!lyricsRound || lyricsCompleted || lyricsLoading || authLoading) ? (
+              renderInstantLockedCard(lyricsCachedDone, lyricsCountdown, 'reverse', 'Задом наперёд')
+            ) : lyricsLoading || authLoading ? (
+              renderGameSkeleton('Загрузка строчки...')
+            ) : lyricsRound ? (
               <div className="space-y-5">
                 {/* Prompt Lyric Card */}
                 <div className="rounded-xl bg-[#15141b] border border-white/[0.09] px-5 py-6 text-center space-y-2">
@@ -2074,8 +2564,6 @@ export const GamesView: React.FC = () => {
                   </div>
                 )}
               </div>
-            ) : lyricsLoading || authLoading ? (
-              <div className="py-12 text-center font-mono text-xs text-[#8e877e]">Загрузка строчки...</div>
             ) : null}
           </div>
         </div>
@@ -2111,12 +2599,16 @@ export const GamesView: React.FC = () => {
               </div>
             )}
 
-            {reverseRound ? (
+            {reverseCachedDone && !reverseResult && (!reverseRound || reverseCompleted || reverseLoading || authLoading) ? (
+              renderInstantLockedCard(reverseCachedDone, reverseCountdown, 'speed', '0.5x / 2.5x')
+            ) : reverseLoading || authLoading ? (
+              renderGameSkeleton('Загрузка реверс-раунда...')
+            ) : reverseRound ? (
               <div className="space-y-6">
                 <div className="flex flex-col items-center">
                   <button
                     type="button"
-                    disabled={reverseAudioDecoding}
+                    disabled={reverseAudioDecoding || reverseCompleted || !!reverseResult}
                     onClick={toggleReverseAudio}
                     className="w-16 h-16 rounded-full bg-[#241018] hover:bg-[#341520] border border-[#962337]/60 text-white flex items-center justify-center transition-all cursor-pointer hover:scale-105 shadow-lg disabled:opacity-60"
                     aria-label={reversePlaying ? 'Остановить реверс' : 'Слушать трек задом наперёд'}
@@ -2272,8 +2764,6 @@ export const GamesView: React.FC = () => {
                   </div>
                 )}
               </div>
-            ) : reverseLoading || authLoading ? (
-              <div className="py-12 font-mono text-xs text-[#8e877e]">Загрузка реверс-раунда...</div>
             ) : null}
           </div>
         </div>
@@ -2314,12 +2804,16 @@ export const GamesView: React.FC = () => {
               </div>
             )}
 
-            {speedRound ? (
+            {speedCachedDone && !speedResult && (!speedRound || speedCompleted || speedLoading || authLoading) ? (
+              renderInstantLockedCard(speedCachedDone, speedCountdown, 'leaderboard', 'Рейтинг')
+            ) : speedLoading || authLoading ? (
+              renderGameSkeleton('Загрузка раунда...')
+            ) : speedRound ? (
               <div className="space-y-6">
                 <div className="flex flex-col items-center">
                   <button
                     type="button"
-                    disabled={speedAudioDecoding}
+                    disabled={speedAudioDecoding || speedCompleted || !!speedResult}
                     onClick={toggleSpeedAudio}
                     className="w-16 h-16 rounded-full bg-[#1a1524] hover:bg-[#251d33] border border-white/[0.18] text-white flex items-center justify-center transition-all cursor-pointer hover:scale-105 shadow-lg disabled:opacity-60"
                     aria-label={speedPlaying ? 'Остановить' : 'Слушать 5-секундный фрагмент'}
@@ -2478,8 +2972,6 @@ export const GamesView: React.FC = () => {
                   </div>
                 )}
               </div>
-            ) : speedLoading || authLoading ? (
-              <div className="py-12 font-mono text-xs text-[#8e877e]">Загрузка раунда...</div>
             ) : null}
           </div>
         </div>

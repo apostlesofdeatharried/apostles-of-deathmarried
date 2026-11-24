@@ -218,6 +218,13 @@ app.use(async (req: Request, res: Response, next: NextFunction) => {
       await ensureCloudDatabaseRestored();
 
       const isApiRoute = req.path.startsWith('/api') && req.path !== '/api/health';
+      if (isApiRoute && getCloudSyncStatus().cloudRestoreStatus === 'failed') {
+        res.status(503).json({
+          error: 'База данных временно недоступна (ошибка восстановления из облачного хранилища). Повторите попытку через пару секунд.',
+          cloud_sync_error: getCloudSyncStatus().cloudRestoreError || 'cloud restore failed',
+        });
+        return;
+      }
       const isMutation =
         MUTATING_HTTP_METHODS.has(req.method) && !STATELESS_POST_PATHS.has(req.path);
 
@@ -232,7 +239,7 @@ app.use(async (req: Request, res: Response, next: NextFunction) => {
         }
         res.locals.cloudSyncPreChecked = true;
       } else if (isApiRoute && (req.method === 'GET' || req.method === 'HEAD')) {
-        await syncIfCloudNewer({ minIntervalMs: 2500 });
+        await syncIfCloudNewer({ minIntervalMs: 0 });
         res.locals.cloudSyncPreChecked = true;
       }
 
@@ -1462,6 +1469,29 @@ function canEarnDiscussionXp(userId: string, content: string): boolean {
     SELECT COUNT(*) as cnt FROM xp_transactions
     WHERE user_id = ?
       AND source IN ('community_post', 'comment')
+      AND amount > 0
+      AND datetime(created_at) >= datetime(?)
+  `).get(userId, dayStartUtc) as { cnt?: number } | undefined;
+
+  return Number(dailyRow?.cnt || 0) < 3;
+}
+
+function canEarnCreationXp(userId: string): boolean {
+  const recentReward = db.prepare(`
+    SELECT 1 FROM xp_transactions
+    WHERE user_id = ?
+      AND source IN ('creation_upload', 'meme_upload')
+      AND amount > 0
+      AND datetime(created_at) > datetime('now', '-60 seconds')
+    LIMIT 1
+  `).get(userId);
+  if (recentReward) return false;
+
+  const dayStartUtc = getMoscowDayStartSqliteUtc();
+  const dailyRow = db.prepare(`
+    SELECT COUNT(*) as cnt FROM xp_transactions
+    WHERE user_id = ?
+      AND source IN ('creation_upload', 'meme_upload')
       AND amount > 0
       AND datetime(created_at) >= datetime(?)
   `).get(userId, dayStartUtc) as { cnt?: number } | undefined;
@@ -3049,7 +3079,14 @@ async function syncLatestCloudDbBeforeGame(res: Response, isMutation = false): P
     return true;
   }
   await ensureCloudDatabaseRestored();
-  const pullRes = await syncIfCloudNewer({ force: isMutation, minIntervalMs: isMutation ? 0 : 2500 });
+  if (getCloudSyncStatus().cloudRestoreStatus === 'failed') {
+    res.status(503).json({
+      error: 'База данных временно недоступна (ошибка восстановления из облачного хранилища). Повторите попытку через пару секунд.',
+      cloud_sync_error: getCloudSyncStatus().cloudRestoreError || 'cloud restore failed',
+    });
+    return false;
+  }
+  const pullRes = await syncIfCloudNewer({ force: isMutation, minIntervalMs: 0 });
   if (isMutation && pullRes.error) {
     res.status(503).json({
       error: 'Не удалось синхронизировать актуальное состояние базы данных. Повторите попытку через пару секунд.',
@@ -3403,21 +3440,6 @@ app.get('/api/games/quiz/daily', async (req: Request, res: Response) => {
     return;
   }
 
-  let alreadyCompleted = false;
-  let previousScore = 0;
-  let previousXp = 0;
-  let previousAttempt: { score: number; xp_earned: number } | null = null;
-
-  if (user) {
-    const { completed, completion, attempt } = getGameCycleLockStatus(user.id, 'daily-quiz', cycleId);
-    if (completed) {
-      alreadyCompleted = true;
-      previousScore = Number(attempt?.score ?? completion?.score) || 0;
-      previousXp = Number(attempt?.xp_earned ?? completion?.xp_earned) || 0;
-      previousAttempt = { score: previousScore, xp_earned: previousXp };
-    }
-  }
-
   const questions = getOrCreateDailyQuizChallenge(cycleId).map((q) =>
     shuffleQuizQuestionOptions(q, cycleId, quizSecret)
   );
@@ -3429,6 +3451,55 @@ app.get('/api/games/quiz/daily', async (req: Request, res: Response) => {
     difficulty: q.difficulty,
   }));
 
+  let alreadyCompleted = false;
+  let previousScore = 0;
+  let previousXp = 0;
+  let previousCorrectCount: number | null = null;
+  let previousTotal: number | null = null;
+  let previousAttempt: {
+    score: number;
+    xp_earned: number;
+    correct_count: number | null;
+    total: number;
+  } | null = null;
+
+  if (user) {
+    const { completed, completion, attempt } = getGameCycleLockStatus(user.id, 'daily-quiz', cycleId);
+    if (completed) {
+      alreadyCompleted = true;
+      previousScore = Number(attempt?.score ?? completion?.score) || 0;
+      previousXp = Number(attempt?.xp_earned ?? completion?.xp_earned) || 0;
+      previousTotal = sanitized.length || 5;
+
+      const quizAttemptsRows = db
+        .prepare("SELECT details_json FROM game_attempts WHERE user_id = ? AND game_id = 'daily-quiz' ORDER BY created_at DESC LIMIT 12")
+        .all(user.id) as Array<{ details_json?: string | null }>;
+      for (const gaRow of quizAttemptsRows) {
+        try {
+          const parsed = JSON.parse(gaRow?.details_json || '{}');
+          if (parsed?.challengeDate === cycleId) {
+            if (typeof parsed.correctCount === 'number') {
+              previousCorrectCount = parsed.correctCount;
+            }
+            if (typeof parsed.total === 'number' && parsed.total > 0) {
+              previousTotal = parsed.total;
+            }
+            break;
+          }
+        } catch {}
+      }
+
+      const resolvedTotal = previousTotal ?? (sanitized.length || 5);
+      previousTotal = resolvedTotal;
+      previousAttempt = {
+        score: previousScore,
+        xp_earned: previousXp,
+        correct_count: previousCorrectCount,
+        total: resolvedTotal,
+      };
+    }
+  }
+
   res.json({
     disabled: false,
     questions: sanitized,
@@ -3437,6 +3508,8 @@ app.get('/api/games/quiz/daily', async (req: Request, res: Response) => {
     already_completed: alreadyCompleted,
     previous_score: previousScore,
     previous_xp: previousXp,
+    previous_correct_count: previousCorrectCount,
+    previous_total: previousTotal,
     previous_attempt: previousAttempt,
     challenge_date: cycleId,
     next_reset_at: nextResetAt,
@@ -4624,13 +4697,18 @@ app.post('/api/achievements/track-complete', requireAuth, async (req: AuthReques
         | undefined)
     : undefined;
 
+  if (!trackRow && !singleRow) {
+    res.status(404).json({ error: 'Track not found.' });
+    return;
+  }
+
   const dbDuration = Number(trackRow?.duration_seconds || singleRow?.duration_seconds || 0);
   const dbAudioUrl = String(trackRow?.audio_url || singleRow?.audio_url || '');
   const resolvedDbDuration = dbAudioUrl ? resolveEffectiveTrackDuration(dbAudioUrl, dbDuration) : dbDuration;
   const effectiveDuration =
     resolvedDbDuration > 0
       ? resolvedDbDuration
-      : (Number.isFinite(clientDurationSeconds) && clientDurationSeconds > 0 ? clientDurationSeconds : 0);
+      : (Number.isFinite(clientDurationSeconds) && clientDurationSeconds >= 10 ? clientDurationSeconds : 20);
 
   if (!Number.isFinite(listenedSeconds) || listenedSeconds < 8) {
     res.json({ ok: false, counted: false, reason: 'threshold_not_met', required_ratio: 0.75 });
@@ -4641,10 +4719,26 @@ app.post('/api/achievements/track-complete', requireAuth, async (req: AuthReques
     return;
   }
 
-  let completions = 1;
+  const cooldownSec = Math.max(8, Math.min(30, Math.floor((effectiveDuration > 0 ? effectiveDuration : 20) * 0.5)));
+  let completions = 0;
+  let counted = false;
   let newlyUnlocked: UnlockedAchievementInfo[] = [];
 
   db.transaction(() => {
+    const existingPlay = db
+      .prepare(
+        `SELECT completions, (strftime('%s', 'now') - strftime('%s', updated_at)) AS elapsed_sec
+         FROM user_track_plays
+         WHERE user_id = ? AND track_id = ?`
+      )
+      .get(userId, rawTrackId) as { completions?: number; elapsed_sec?: number | null } | undefined;
+
+    if (existingPlay && Number(existingPlay.elapsed_sec ?? 0) < cooldownSec) {
+      completions = Number(existingPlay.completions || 0);
+      counted = false;
+      return;
+    }
+
     db.prepare(`
       INSERT INTO user_track_plays (user_id, track_id, completions, updated_at)
       VALUES (?, ?, 1, datetime('now'))
@@ -4657,8 +4751,20 @@ app.post('/api/achievements/track-complete', requireAuth, async (req: AuthReques
       .prepare('SELECT completions FROM user_track_plays WHERE user_id = ? AND track_id = ?')
       .get(userId, rawTrackId) as { completions?: number } | undefined;
     completions = Number(row?.completions || 1);
+    counted = true;
     newlyUnlocked = evaluateUserAchievements(userId);
-  })();
+  }).immediate();
+
+  if (!counted) {
+    res.json({
+      ok: false,
+      counted: false,
+      reason: 'cooldown_active',
+      track_id: rawTrackId,
+      completions,
+    });
+    return;
+  }
 
   await flushCloudBackupAndRespond(res, {
     ok: true,
@@ -4835,43 +4941,9 @@ app.post('/api/promo/redeem', requireAuth, promoRateLimit, async (req: AuthReque
     return;
   }
 
-  const promo = db
-    .prepare('SELECT id, code, xp_reward, is_active, max_uses, expires_at FROM promo_codes WHERE LOWER(TRIM(code)) = ? LIMIT 1')
-    .get(normalizedCode) as
-    | { id: string; code: string; xp_reward: number; is_active: number; max_uses?: number | null; expires_at?: string | null }
-    | undefined;
-
-  if (!promo || !promo.is_active) {
-    res.status(404).json({ error: 'Неверный промокод.' });
-    return;
-  }
-
-  if (promo.expires_at) {
-    const expMs = Date.parse(promo.expires_at);
-    if (!Number.isNaN(expMs) && expMs <= Date.now()) {
-      res.status(410).json({ error: 'Срок действия промокода истёк.' });
-      return;
-    }
-  }
-
-  if (promo.max_uses !== null && promo.max_uses !== undefined && Number(promo.max_uses) > 0) {
-    const useCountRow = db
-      .prepare('SELECT COUNT(*) as cnt FROM promo_code_uses WHERE promo_code_id = ?')
-      .get(promo.id) as { cnt?: number } | undefined;
-    if (Number(useCountRow?.cnt || 0) >= Number(promo.max_uses)) {
-      res.status(410).json({ error: 'Лимит активаций этого промокода исчерпан.' });
-      return;
-    }
-  }
-
-  const alreadyUsed = db
-    .prepare('SELECT id FROM promo_code_uses WHERE promo_code_id = ? AND user_id = ? LIMIT 1')
-    .get(promo.id, req.user.id);
-  if (alreadyUsed) {
-    res.status(409).json({ error: 'Вы уже использовали этот промокод.' });
-    return;
-  }
-
+  let promoError: { status: number; message: string } | null = null;
+  let redeemedCode = '';
+  let redeemedXpReward = 0;
   let updatedXp = 0;
   let updatedTotalXp = 0;
   let updatedLevel = 1;
@@ -4879,6 +4951,46 @@ app.post('/api/promo/redeem', requireAuth, promoRateLimit, async (req: AuthReque
 
   try {
     db.transaction(() => {
+      const promo = db
+        .prepare('SELECT id, code, xp_reward, is_active, max_uses, expires_at FROM promo_codes WHERE LOWER(TRIM(code)) = ? LIMIT 1')
+        .get(normalizedCode) as
+        | { id: string; code: string; xp_reward: number; is_active: number; max_uses?: number | null; expires_at?: string | null }
+        | undefined;
+
+      if (!promo || !promo.is_active) {
+        promoError = { status: 404, message: 'Неверный промокод.' };
+        return;
+      }
+
+      if (promo.expires_at) {
+        const expMs = Date.parse(promo.expires_at);
+        if (!Number.isNaN(expMs) && expMs <= Date.now()) {
+          promoError = { status: 410, message: 'Срок действия промокода истёк.' };
+          return;
+        }
+      }
+
+      const alreadyUsed = db
+        .prepare('SELECT id FROM promo_code_uses WHERE promo_code_id = ? AND user_id = ? LIMIT 1')
+        .get(promo.id, req.user!.id);
+      if (alreadyUsed) {
+        promoError = { status: 409, message: 'Вы уже использовали этот промокод.' };
+        return;
+      }
+
+      if (promo.max_uses !== null && promo.max_uses !== undefined && Number(promo.max_uses) > 0) {
+        const useCountRow = db
+          .prepare('SELECT COUNT(*) as cnt FROM promo_code_uses WHERE promo_code_id = ?')
+          .get(promo.id) as { cnt?: number } | undefined;
+        if (Number(useCountRow?.cnt || 0) >= Number(promo.max_uses)) {
+          promoError = { status: 410, message: 'Лимит активаций этого промокода исчерпан.' };
+          return;
+        }
+      }
+
+      redeemedCode = promo.code;
+      redeemedXpReward = promo.xp_reward;
+
       db.prepare(`
         INSERT INTO promo_code_uses (id, promo_code_id, user_id, xp_awarded)
         VALUES (?, ?, ?, ?)
@@ -4906,7 +5018,7 @@ app.post('/api/promo/redeem', requireAuth, promoRateLimit, async (req: AuthReque
           updatedLevel = Number(afterAch.level || updatedLevel);
         }
       }
-    })();
+    }).immediate();
   } catch (err: any) {
     if (String(err?.message || '').includes('UNIQUE')) {
       res.status(409).json({ error: 'Вы уже использовали этот промокод.' });
@@ -4915,10 +5027,16 @@ app.post('/api/promo/redeem', requireAuth, promoRateLimit, async (req: AuthReque
     throw err;
   }
 
+  if (promoError) {
+    const errObj = promoError as { status: number; message: string };
+    res.status(errObj.status).json({ error: errObj.message });
+    return;
+  }
+
   await flushCloudBackupAndRespond(res, {
     ok: true,
-    code: promo.code,
-    xp_reward: promo.xp_reward,
+    code: redeemedCode,
+    xp_reward: redeemedXpReward,
     xp: updatedXp,
     total_xp: updatedTotalXp,
     level: updatedLevel,
@@ -4987,64 +5105,74 @@ app.post('/api/shop/buy', requireAuth, async (req: AuthRequest, res: Response) =
   let purchaseError: { status: number; message: string } | null = null;
   let purchasedItem: any = null;
   let purchasedCostXp = 0;
+  let newlyUnlocked: UnlockedAchievementInfo[] = [];
 
-  db.transaction(() => {
-    const item = db.prepare('SELECT * FROM shop_items WHERE id = ? AND is_active = 1').get(item_id) as any;
-    if (!item) {
-      purchaseError = { status: 404, message: 'Предмет не найден в каталоге магазина.' };
+  try {
+    db.transaction(() => {
+      const item = db.prepare('SELECT * FROM shop_items WHERE id = ? AND is_active = 1').get(item_id) as any;
+      if (!item) {
+        purchaseError = { status: 404, message: 'Предмет не найден в каталоге магазина.' };
+        return;
+      }
+
+      const costXp = Math.max(0, Math.floor(Number(item.cost_xp) || 0));
+      purchasedItem = item;
+      purchasedCostXp = costXp;
+
+      const alreadyOwned = db
+        .prepare('SELECT id FROM user_inventory WHERE user_id = ? AND item_id = ?')
+        .get(userId, item_id);
+      if (alreadyOwned) {
+        purchaseError = { status: 400, message: 'Этот предмет уже есть в вашей коллекции.' };
+        return;
+      }
+
+      const currentProfile = db
+        .prepare('SELECT xp, total_xp FROM profiles WHERE user_id = ?')
+        .get(userId) as any;
+      if (!currentProfile || Number(currentProfile.xp || 0) < costXp) {
+        purchaseError = {
+          status: 400,
+          message: `Недостаточно XP. Требуется: ${costXp} XP, доступно: ${currentProfile?.xp ?? 0} XP.`,
+        };
+        return;
+      }
+
+      // Atomic conditional deduction of spendable XP only (total_xp & level never decrease!)
+      const updateRes = db
+        .prepare("UPDATE profiles SET xp = xp - ?, updated_at = datetime('now') WHERE user_id = ? AND xp >= ?")
+        .run(costXp, userId, costXp);
+      if (updateRes.changes === 0) {
+        purchaseError = { status: 400, message: 'Недостаточно XP для покупки.' };
+        return;
+      }
+
+      const invId = 'inv_' + crypto.randomUUID().slice(0, 8);
+      db.prepare(`
+        INSERT INTO user_inventory (id, user_id, item_id, is_equipped)
+        VALUES (?, ?, ?, 0)
+      `).run(invId, userId, item_id);
+
+      db.prepare(`
+        INSERT INTO xp_transactions (id, user_id, amount, source, details, reference_key)
+        VALUES (?, ?, ?, 'shop_purchase', ?, ?)
+      `).run('xpt_' + crypto.randomUUID().slice(0, 8), userId, -costXp, `Покупка: ${item.name_ru}`, `shop:${userId}:${item_id}:${invId}`);
+
+      newlyUnlocked = evaluateUserAchievements(userId);
+    }).immediate();
+  } catch (err: any) {
+    if (String(err?.message || '').includes('UNIQUE')) {
+      res.status(400).json({ error: 'Этот предмет уже есть в вашей коллекции.' });
       return;
     }
-
-    const costXp = Math.max(0, Math.floor(Number(item.cost_xp) || 0));
-    purchasedItem = item;
-    purchasedCostXp = costXp;
-
-    const alreadyOwned = db
-      .prepare('SELECT id FROM user_inventory WHERE user_id = ? AND item_id = ?')
-      .get(userId, item_id);
-    if (alreadyOwned) {
-      purchaseError = { status: 400, message: 'Этот предмет уже есть в вашей коллекции.' };
-      return;
-    }
-
-    const currentProfile = db
-      .prepare('SELECT xp, total_xp FROM profiles WHERE user_id = ?')
-      .get(userId) as any;
-    if (!currentProfile || Number(currentProfile.xp || 0) < costXp) {
-      purchaseError = {
-        status: 400,
-        message: `Недостаточно XP. Требуется: ${costXp} XP, доступно: ${currentProfile?.xp ?? 0} XP.`,
-      };
-      return;
-    }
-
-    // Atomic conditional deduction of spendable XP only (total_xp & level never decrease!)
-    const updateRes = db
-      .prepare("UPDATE profiles SET xp = xp - ?, updated_at = datetime('now') WHERE user_id = ? AND xp >= ?")
-      .run(costXp, userId, costXp);
-    if (updateRes.changes === 0) {
-      purchaseError = { status: 400, message: 'Недостаточно XP для покупки.' };
-      return;
-    }
-
-    db.prepare(`
-      INSERT INTO user_inventory (id, user_id, item_id, is_equipped)
-      VALUES (?, ?, ?, 0)
-    `).run('inv_' + crypto.randomUUID().slice(0, 8), userId, item_id);
-
-    db.prepare(`
-      INSERT INTO xp_transactions (id, user_id, amount, source, details)
-      VALUES (?, ?, ?, 'shop_purchase', ?)
-    `).run('xpt_' + crypto.randomUUID().slice(0, 8), userId, -costXp, `Покупка: ${item.name_ru}`);
-  }).immediate();
+    throw err;
+  }
 
   if (purchaseError) {
     const errObj = purchaseError as { status: number; message: string };
     res.status(errObj.status).json({ error: errObj.message });
     return;
   }
-
-  const newlyUnlocked = evaluateUserAchievements(userId);
 
   const updatedProfile = db.prepare('SELECT xp, total_xp, level FROM profiles WHERE user_id = ?').get(userId) as any;
   await flushCloudBackupAndRespond(res, {
@@ -6114,18 +6242,20 @@ app.post('/api/creations', requireAuth, async (req: AuthRequest, res: Response) 
     `).run(id, req.user!.id, cleanTitle, cleanCategory, cleanDesc, String(media_url).trim(), media_type || 'image', status, status === 'approved' ? 1 : 0);
 
     if (status === 'approved') {
-      const rewardAmount = cleanCategory === 'meme' ? 5 : 15;
-      const source = cleanCategory === 'meme' ? 'meme_upload' : 'creation_upload';
-      const grant = awardXpWithRef({
-        userId: req.user!.id,
-        amount: rewardAmount,
-        source,
-        details: cleanCategory === 'meme' ? `Мем: «${cleanTitle.slice(0, 35)}»` : `Работа: «${cleanTitle.slice(0, 35)}»`,
-        referenceKey: `award:creation:${id}`,
-      });
-      if (grant.awarded) {
-        awardedXp = grant.amount;
-        db.prepare('UPDATE creations SET xp_awarded = 1, xp_awarded_amount = ? WHERE id = ?').run(grant.amount, id);
+      if (canEarnCreationXp(req.user!.id)) {
+        const rewardAmount = cleanCategory === 'meme' ? 5 : 15;
+        const source = cleanCategory === 'meme' ? 'meme_upload' : 'creation_upload';
+        const grant = awardXpWithRef({
+          userId: req.user!.id,
+          amount: rewardAmount,
+          source,
+          details: cleanCategory === 'meme' ? `Мем: «${cleanTitle.slice(0, 35)}»` : `Работа: «${cleanTitle.slice(0, 35)}»`,
+          referenceKey: `award:creation:${id}`,
+        });
+        if (grant.awarded) {
+          awardedXp = grant.amount;
+          db.prepare('UPDATE creations SET xp_awarded = 1, xp_awarded_amount = ? WHERE id = ?').run(grant.amount, id);
+        }
       }
 
       evaluateUserAchievements(req.user!.id);
@@ -6223,7 +6353,7 @@ app.post('/api/admin/creations/:id/moderate', requireAdminOrMod, async (req: Aut
     `).run(status, status === 'approved' ? 1 : 0, rejection_reason || null, nextCategory, existing.id);
 
     if (status === 'approved') {
-      if (!existing.xp_awarded) {
+      if (!existing.xp_awarded && canEarnCreationXp(existing.user_id)) {
         const rewardAmount = nextCategory === 'meme' ? 5 : 15;
         const source = nextCategory === 'meme' ? 'meme_upload' : 'creation_upload';
         const grant = awardXpWithRef({
@@ -6253,12 +6383,14 @@ app.post('/api/admin/creations/:id/moderate', requireAdminOrMod, async (req: Aut
           });
         }
       }
-    } else if (status === 'rejected' && existing.xp_awarded && Number(existing.xp_awarded_amount) > 0) {
+    } else if ((status === 'rejected' || status === 'pending') && existing.xp_awarded && Number(existing.xp_awarded_amount) > 0) {
       revokeXpWithRef({
         userId: existing.user_id,
         amount: Number(existing.xp_awarded_amount),
         source: 'xp_rollback',
-        details: `Откат XP: отклонена публикация «${String(existing.title || '').slice(0, 35)}»`,
+        details: status === 'rejected'
+          ? `Откат XP: отклонена публикация «${String(existing.title || '').slice(0, 35)}»`
+          : `Откат XP: публикация возвращена на модерацию «${String(existing.title || '').slice(0, 35)}»`,
         referenceKey: `rollback:creation:${existing.id}`,
       });
       db.prepare('UPDATE creations SET xp_awarded = 0, xp_awarded_amount = 0 WHERE id = ?').run(existing.id);

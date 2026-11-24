@@ -156,7 +156,7 @@ export const CommunityView: React.FC = () => {
 
   const fetchCategories = async () => {
     try {
-      const res = await fetch('/api/community/categories');
+      const res = await fetch('/api/community/categories', { cache: 'no-store' });
       const data = await safeJson<{ categories?: PostCategory[] }>(res, { categories: [] });
       const cats = data.categories || [];
       setCategories(cats);

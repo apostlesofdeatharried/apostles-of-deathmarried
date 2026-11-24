@@ -106,7 +106,7 @@ test('CloudSync pulls with ?t= cache-buster + no-store (never If-None-Match), ne
     assert.equal(replaceCount, 1);
     assert.match(seenGetUrls.at(-1)!, /\?t=\d+$/);
     assert.equal(seenCacheModes.at(-1), 'no-store');
-    assert.equal(seenGetHeaders.at(-1)!.cacheControl, 'no-cache, no-store');
+    assert.equal(seenGetHeaders.at(-1)!.cacheControl, 'no-cache, no-store, max-age=0');
     assert.equal(seenGetHeaders.at(-1)!.pragma, 'no-cache');
     assert.equal(seenGetHeaders.at(-1)!.ifNoneMatch, null);
 
@@ -402,6 +402,9 @@ test('syncIfCloudNewer tracks ETag, returns 304 without replacing DB, throttles 
     let replaceCalls = 0;
     let networkGetCalls = 0;
     const seenIfNoneMatch: Array<string | null> = [];
+    const seenUrls: string[] = [];
+    const seenCacheControl: Array<string | null> = [];
+    const seenCacheModes: Array<RequestCache | undefined> = [];
 
     const mockFetch: typeof fetch = async (input, init) => {
       const url = String(input);
@@ -409,6 +412,9 @@ test('syncIfCloudNewer tracks ETag, returns 304 without replacing DB, throttles 
       const headers = new Headers(init?.headers || {});
       if (url.includes('/storage/v1/object/') && method === 'GET') {
         networkGetCalls += 1;
+        seenUrls.push(url);
+        seenCacheControl.push(headers.get('cache-control'));
+        seenCacheModes.push(init?.cache);
         const inm = headers.get('if-none-match');
         seenIfNoneMatch.push(inm);
         if (inm && inm === remoteEtag) {
@@ -439,15 +445,18 @@ test('syncIfCloudNewer tracks ETag, returns 304 without replacing DB, throttles 
     assert.equal(getCloudSyncStatus().last_synced_etag, '"etag-v1"');
     assert.equal((containerBDb!.prepare('SELECT level FROM profiles WHERE user_id = ?').get('u_1') as any).level, 1);
 
-    // 2. Read check within minIntervalMs is throttled -> 0 network calls
+    // 2. Read check with explicit minIntervalMs is throttled -> 0 network calls
     const throttledRes = await syncIfCloudNewer({ minIntervalMs: 60000 });
     assert.equal(throttledRes.notModified, true);
     assert.equal(networkGetCalls, 1);
 
-    // 3. Forced check sends If-None-Match: "etag-v1" -> receives 304 -> 0 DB swaps
+    // 3. Forced check sends ?t=, max-age=0, no-store, and If-None-Match: "etag-v1" -> receives 304 -> 0 DB swaps
     const notModifiedRes = await syncIfCloudNewer({ force: true });
     assert.equal(notModifiedRes.updated, false);
     assert.equal(notModifiedRes.notModified, true);
+    assert.match(seenUrls.at(-1)!, /\?t=\d+$/);
+    assert.equal(seenCacheControl.at(-1), 'no-cache, no-store, max-age=0');
+    assert.equal(seenCacheModes.at(-1), 'no-store');
     assert.equal(seenIfNoneMatch.at(-1), '"etag-v1"');
     assert.equal(replaceCalls, 1);
     assert.equal(networkGetCalls, 2);
@@ -460,10 +469,12 @@ test('syncIfCloudNewer tracks ETag, returns 304 without replacing DB, throttles 
     remoteBuf = dbContainerA.serialize();
     remoteEtag = '"etag-v2"';
 
-    // 5. Container B runs pre-write/unthrottled freshness check -> sees ETag mismatch -> hot-swaps!
-    const updatedRes = await syncIfCloudNewer({ minIntervalMs: 0 });
+    // 5. Container B calls syncIfCloudNewer() with default args (minIntervalMs defaults to 0) -> immediately detects ETag mismatch & hot-swaps!
+    const updatedRes = await syncIfCloudNewer();
     assert.equal(updatedRes.updated, true);
     assert.equal(replaceCalls, 2);
+    assert.match(seenUrls.at(-1)!, /\?t=\d+$/);
+    assert.equal(seenCacheControl.at(-1), 'no-cache, no-store, max-age=0');
     assert.equal(getCloudSyncStatus().last_synced_etag, '"etag-v2"');
     assert.equal((containerBDb!.prepare('SELECT level FROM profiles WHERE user_id = ?').get('u_1') as any).level, 2);
     const achCount = (

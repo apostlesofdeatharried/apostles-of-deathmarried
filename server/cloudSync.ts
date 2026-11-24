@@ -319,7 +319,7 @@ async function pullDatabaseFromSupabaseInternal(options: {
       method: 'GET',
       headers: {
         ...getSupabaseHeaders(),
-        'Cache-Control': 'no-cache, no-store',
+        'Cache-Control': 'no-cache, no-store, max-age=0',
         Pragma: 'no-cache',
       },
       cache: 'no-store',
@@ -409,8 +409,8 @@ async function pullDatabaseFromSupabaseInternal(options: {
 
 /**
  * Lightweight multi-container freshness check for warm serverless instances.
- * - Uses conditional GET (`If-None-Match: <lastSyncedEtag>` / `If-Modified-Since`) so unchanged remote DB returns HTTP 304 with 0 downloaded bytes.
- * - Throttled on read requests (`minIntervalMs`, default 2500ms) and mandatory (`force: true`) before write requests.
+ * - Uses conditional GET (`If-None-Match: <lastSyncedEtag>` / `If-Modified-Since`) with `?t=` cache-buster so unchanged remote DB returns HTTP 304 with 0 downloaded bytes.
+ * - Defaults `minIntervalMs` to `0` so every request verifies cloud freshness across containers unless throttled explicitly.
  * - Whenever a newer remote snapshot is detected, atomically swaps `/tmp/apostles.db` and runs `ensureSchemaAndMigrations(getDb())`.
  */
 async function syncIfCloudNewerInternal(options: {
@@ -428,18 +428,18 @@ async function syncIfCloudNewerInternal(options: {
     return pullDatabaseFromSupabaseInternal({ force: true });
   }
 
-  const minInterval = options.minIntervalMs ?? 2500;
+  const minInterval = options.minIntervalMs ?? 0;
   if (!options.force && minInterval > 0 && Date.now() - lastCloudFreshCheckAt < minInterval) {
     return { updated: false, notModified: true };
   }
 
   const baseUrl = getSupabaseBaseUrl();
   const bucketName = getBucketName();
-  const objectUrl = `${baseUrl}/storage/v1/object/${encodeURIComponent(bucketName)}/${encodeObjectPath(DB_OBJECT_PATH)}`;
+  const objectUrl = `${baseUrl}/storage/v1/object/${encodeURIComponent(bucketName)}/${encodeObjectPath(DB_OBJECT_PATH)}?t=${Date.now()}`;
 
   const headers: Record<string, string> = {
     ...getSupabaseHeaders(),
-    'Cache-Control': 'no-cache, no-store, must-revalidate',
+    'Cache-Control': 'no-cache, no-store, max-age=0',
     Pragma: 'no-cache',
   };
   if (lastSyncedEtag) {

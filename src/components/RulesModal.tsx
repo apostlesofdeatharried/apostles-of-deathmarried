@@ -83,7 +83,7 @@ export const RulesModal: React.FC<RulesModalProps> = ({
   useEffect(() => {
     if (!isOpen) return;
     let active = true;
-    fetch('/api/rules')
+    fetch('/api/rules', { cache: 'no-store' })
       .then((res) => safeJson<{ rules?: CommunityRulesPayload }>(res, {}))
       .then((data) => {
         if (active && data?.rules && Array.isArray(data.rules.items) && data.rules.items.length > 0) {

@@ -528,4 +528,132 @@ describe('Production fixes: profile email verification, notifications, fast reve
     assert.equal(v2Data.alreadyPlayed, true);
     assert.equal(v2Data.xp_earned, 0);
   });
+
+  it('6. Site-wide anti-farm: promo max_uses race, track-complete burst cooldown & 404, creation approve->pending rollback, and 5-way concurrent shop/buy', async () => {
+    // 6A. Promo double-redeem + max_uses=1 atomic race
+    dbMod.db.prepare(`
+      INSERT OR REPLACE INTO promo_codes (id, code, xp_reward, is_active, max_uses)
+      VALUES ('promo_once_test', 'ONCEONLY2026', 50, 1, 1)
+    `).run();
+
+    const [pA, pB] = await Promise.all([
+      fetch(`${baseUrl}/api/promo/redeem`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userAToken}` },
+        body: JSON.stringify({ code: 'ONCEONLY2026' }),
+      }),
+      fetch(`${baseUrl}/api/promo/redeem`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userBToken}` },
+        body: JSON.stringify({ code: 'ONCEONLY2026' }),
+      }),
+    ]);
+    const promoStatuses = [pA.status, pB.status].sort((a, b) => a - b);
+    assert.equal(promoStatuses[0], 200, `Expected one winner 200, got ${promoStatuses}`);
+    assert.ok([409, 410].includes(promoStatuses[1]), `Expected second request rejected (409/410), got ${promoStatuses[1]}`);
+
+    const totalPromoUses = (
+      dbMod.db.prepare("SELECT COUNT(*) as c FROM promo_code_uses WHERE promo_code_id = 'promo_once_test'").get() as { c: number }
+    ).c;
+    assert.equal(totalPromoUses, 1, 'max_uses=1 promo must have strictly 1 redemption');
+
+    // 6B. track-complete rejects nonexistent tracks (404) & blocks rapid replay bursts
+    const fakeTrackRes = await fetch(`${baseUrl}/api/achievements/track-complete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userAToken}` },
+      body: JSON.stringify({ track_id: 'nonexistent_track_999', listened_seconds: 999, duration_seconds: 1 }),
+    });
+    assert.equal(fakeTrackRes.status, 404);
+
+    const existingTrack = dbMod.db.prepare('SELECT id FROM tracks LIMIT 1').get() as { id?: string } | undefined;
+    assert.ok(existingTrack?.id, 'Expected at least 1 track in seeded DB');
+
+    const tc1 = await fetch(`${baseUrl}/api/achievements/track-complete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userAToken}` },
+      body: JSON.stringify({ track_id: existingTrack!.id, listened_seconds: 600, duration_seconds: 200 }),
+    });
+    assert.equal(tc1.status, 200);
+    const tc1Json = (await tc1.json()) as any;
+    assert.equal(tc1Json.counted, true);
+    assert.equal(tc1Json.completions, 1);
+
+    // Immediate burst spam must hit cooldown_active and NOT increment completions
+    const tcBurst = await fetch(`${baseUrl}/api/achievements/track-complete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userAToken}` },
+      body: JSON.stringify({ track_id: existingTrack!.id, listened_seconds: 600, duration_seconds: 200 }),
+    });
+    assert.equal(tcBurst.status, 200);
+    const tcBurstJson = (await tcBurst.json()) as any;
+    assert.equal(tcBurstJson.counted, false);
+    assert.equal(tcBurstJson.reason, 'cooldown_active');
+    assert.equal(tcBurstJson.completions, 1);
+
+    // 6C. Creation moderation XP rollback on approved -> pending
+    const createRes = await fetch(`${baseUrl}/api/creations`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userAToken}` },
+      body: JSON.stringify({
+        title: 'Anti-Farm Test Art',
+        category: 'art',
+        description: 'Testing approve and pending rollback',
+        media_url: '/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg',
+        media_type: 'image',
+      }),
+    });
+    assert.equal(createRes.status, 200);
+    const created = (await createRes.json()) as any;
+    const xpBeforeApprove = (dbMod.db.prepare('SELECT xp, total_xp FROM profiles WHERE user_id = ?').get('usr_a_test') as any);
+
+    const modApprove = await fetch(`${baseUrl}/api/admin/creations/${created.id}/moderate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({ status: 'approved' }),
+    });
+    assert.equal(modApprove.status, 200);
+    const xpAfterApprove = (dbMod.db.prepare('SELECT xp, total_xp FROM profiles WHERE user_id = ?').get('usr_a_test') as any);
+    assert.ok(xpAfterApprove.total_xp >= xpBeforeApprove.total_xp + 15);
+
+    const modPending = await fetch(`${baseUrl}/api/admin/creations/${created.id}/moderate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({ status: 'pending' }),
+    });
+    assert.equal(modPending.status, 200);
+    const xpAfterPending = (dbMod.db.prepare('SELECT xp, total_xp FROM profiles WHERE user_id = ?').get('usr_a_test') as any);
+    assert.equal(xpAfterPending.xp, xpAfterApprove.xp - 15, 'Moving creation to pending must revoke awarded XP');
+
+    // 6D. 5-way concurrent POST /api/shop/buy race -> only 1 succeeds, balance never negative
+    const targetShopItem = dbMod.db
+      .prepare("SELECT id, cost_xp FROM shop_items WHERE is_active = 1 AND cost_xp > 0 AND id != 'effect_midnight_ash' ORDER BY cost_xp ASC LIMIT 1")
+      .get() as { id: string; cost_xp: number };
+    assert.ok(targetShopItem?.id);
+
+    dbMod.db
+      .prepare('UPDATE profiles SET xp = ?, total_xp = ? WHERE user_id = ?')
+      .run(targetShopItem.cost_xp, Math.max(targetShopItem.cost_xp, 500), 'usr_a_test');
+
+    const buyBurst = await Promise.all(
+      Array.from({ length: 5 }).map(() =>
+        fetch(`${baseUrl}/api/shop/buy`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userAToken}` },
+          body: JSON.stringify({ item_id: targetShopItem.id }),
+        })
+      )
+    );
+    const buyStatuses = buyBurst.map((r) => r.status).sort((a, b) => a - b);
+    assert.deepEqual(buyStatuses, [200, 400, 400, 400, 400], `Expected strictly one 200 and four 400s, got ${buyStatuses}`);
+
+    const finalProfile = dbMod.db.prepare('SELECT xp FROM profiles WHERE user_id = ?').get('usr_a_test') as { xp: number };
+    assert.ok(finalProfile.xp >= 0, 'Spendable XP must never drop below zero');
+
+    const invCount = (
+      dbMod.db
+        .prepare('SELECT COUNT(*) as c FROM user_inventory WHERE user_id = ? AND item_id = ?')
+        .get('usr_a_test', targetShopItem.id) as { c: number }
+    ).c;
+    assert.equal(invCount, 1, 'Concurrent buy must insert strictly 1 inventory row');
+  });
 });
