@@ -232,6 +232,11 @@ export const NotificationCenter: React.FC = () => {
       }).catch(() => {});
     }
 
+    const hasNewsNavLink = Boolean(n.target_link && n.target_link.trim() && n.target_link.trim() !== 'none');
+    if (n.target_type === 'news' && !hasNewsNavLink) {
+      return;
+    }
+
     window.dispatchEvent(
       new CustomEvent('navigate-notification', {
         detail: {

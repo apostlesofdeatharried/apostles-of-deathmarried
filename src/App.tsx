@@ -124,7 +124,13 @@ function MainApp() {
       if (!detail) return;
       const targetType = detail.targetType;
       const targetId = detail.targetId;
-      const tab: AppTab =
+      const rawLink = typeof detail.targetLink === 'string' ? detail.targetLink.trim() : '';
+
+      if (targetType === 'news' && (!rawLink || rawLink === 'none')) {
+        return;
+      }
+
+      const fallbackTab: AppTab =
         targetType === 'post'
           ? 'community'
           : targetType === 'creation'
@@ -133,30 +139,58 @@ function MainApp() {
               ? 'archive'
               : 'home';
 
-      const targetUrl =
-        detail.targetLink && detail.targetLink.startsWith('/')
-          ? detail.targetLink
-          : buildPath(tab);
+      let tab: AppTab = fallbackTab;
+      let profileNickname: string | undefined;
+      let targetUrl = buildPath(fallbackTab);
+      let searchParams = new URLSearchParams();
 
-      window.history.pushState({ tab }, '', targetUrl);
-      setRoute({ tab });
+      if (rawLink.startsWith('/')) {
+        try {
+          const parsedUrl = new URL(rawLink, window.location.origin);
+          const parsedRoute = parseRoute(parsedUrl.pathname);
+          if (!parsedRoute.notFound) {
+            tab = parsedRoute.tab === 'admin' && !isAdminOrMod ? 'home' : parsedRoute.tab;
+            profileNickname = parsedRoute.profileNickname;
+            targetUrl = `${buildPath(tab, profileNickname)}${parsedUrl.search}`;
+            searchParams = parsedUrl.searchParams;
+          }
+        } catch {
+          targetUrl = buildPath(fallbackTab);
+        }
+      }
+
+      window.history.pushState({ tab, profileNickname }, '', targetUrl);
+      setRoute({ tab, profileNickname });
       window.scrollTo({ top: 0, behavior: 'smooth' });
 
-      if (targetId) {
-        window.setTimeout(() => {
-          if (targetType === 'post') {
-            window.dispatchEvent(new CustomEvent('open-community-post', { detail: targetId }));
-          } else if (targetType === 'creation') {
-            window.dispatchEvent(new CustomEvent('open-creation', { detail: targetId }));
-          } else if (targetType === 'album' || targetType === 'single') {
-            window.dispatchEvent(
-              new CustomEvent('open-archive-release', {
-                detail: { releaseType: targetType, releaseId: targetId },
-              })
-            );
-          }
-        }, 80);
-      }
+      const subTab = searchParams.get('tab');
+      const openShop = searchParams.get('shop') === '1';
+      const postId = searchParams.get('post') || (targetType === 'post' ? targetId : '');
+      const creationId = searchParams.get('creation') || (targetType === 'creation' ? targetId : '');
+      const albumId = searchParams.get('album') || (targetType === 'album' ? targetId : '');
+      const singleId = searchParams.get('single') || (targetType === 'single' ? targetId : '');
+
+      window.setTimeout(() => {
+        if (tab === 'games' && subTab) {
+          window.dispatchEvent(new CustomEvent('open-games-tab', { detail: subTab }));
+        } else if (tab === 'profile' && (subTab || openShop)) {
+          window.dispatchEvent(new CustomEvent('open-profile-section', { detail: { tab: subTab, shop: openShop } }));
+        }
+        if (tab === 'community' && postId) {
+          window.dispatchEvent(new CustomEvent('open-community-post', { detail: postId }));
+        } else if (tab === 'creations' && creationId) {
+          window.dispatchEvent(new CustomEvent('open-creation', { detail: creationId }));
+        } else if (tab === 'archive' && (albumId || singleId)) {
+          window.dispatchEvent(
+            new CustomEvent('open-archive-release', {
+              detail: {
+                releaseType: singleId ? 'single' : 'album',
+                releaseId: singleId || albumId,
+              },
+            })
+          );
+        }
+      }, 80);
     };
     window.addEventListener('popstate', handlePopState);
     window.addEventListener('navigate-tab', handleNavTab as EventListener);

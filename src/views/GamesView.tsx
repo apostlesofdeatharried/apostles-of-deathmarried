@@ -162,7 +162,15 @@ export const GamesView: React.FC = () => {
   const { t, lang } = useI18n();
   const { user, refresh, openAuth } = useAuth();
 
-  const [activeTab, setActiveTab] = useState<GameTabId>('guess');
+  const [activeTab, setActiveTab] = useState<GameTabId>(() => {
+    try {
+      const p = new URLSearchParams(window.location.search).get('tab');
+      if (p === 'guess' || p === 'quiz' || p === 'lyrics' || p === 'reverse' || p === 'speed' || p === 'leaderboard') {
+        return p;
+      }
+    } catch {}
+    return 'guess';
+  });
   const [isShopOpen, setIsShopOpen] = useState(false);
   const [shareContext, setShareContext] = useState<ShareCardContext | null>(null);
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
@@ -559,7 +567,15 @@ export const GamesView: React.FC = () => {
   }, [timeframe, leaderboardGame, activeTab, loadLeaderboard]);
 
   useEffect(() => {
+    const handleOpenGamesTab = (ev: Event) => {
+      const next = (ev as CustomEvent<string>).detail;
+      if (next === 'guess' || next === 'quiz' || next === 'lyrics' || next === 'reverse' || next === 'speed' || next === 'leaderboard') {
+        setActiveTab(next);
+      }
+    };
+    window.addEventListener('open-games-tab', handleOpenGamesTab);
     return () => {
+      window.removeEventListener('open-games-tab', handleOpenGamesTab);
       destroySnippetAudio();
       stopWebAudioPlayback();
     };

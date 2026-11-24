@@ -81,8 +81,22 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
   const [profile, setProfile] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<ProfileTab>('overview');
-  const [isShopOpen, setIsShopOpen] = useState(false);
+  const [activeTab, setActiveTab] = useState<ProfileTab>(() => {
+    try {
+      const p = new URLSearchParams(window.location.search).get('tab');
+      if (p === 'overview' || p === 'achievements' || p === 'community' || p === 'history' || p === 'inventory' || p === 'settings') {
+        return p;
+      }
+    } catch {}
+    return 'overview';
+  });
+  const [isShopOpen, setIsShopOpen] = useState<boolean>(() => {
+    try {
+      return new URLSearchParams(window.location.search).get('shop') === '1';
+    } catch {
+      return false;
+    }
+  });
 
   // History state
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -181,6 +195,29 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
   useEffect(() => {
     fetchProfile();
   }, [fetchProfile]);
+
+  // Listen for notification / external profile subtab deep links
+  useEffect(() => {
+    const handleOpenSection = (ev: Event) => {
+      const detail = (ev as CustomEvent<{ tab?: string | null; shop?: boolean }>).detail || {};
+      const nextTab = detail.tab;
+      if (
+        nextTab === 'overview' ||
+        nextTab === 'achievements' ||
+        nextTab === 'community' ||
+        nextTab === 'history' ||
+        nextTab === 'inventory' ||
+        nextTab === 'settings'
+      ) {
+        setActiveTab(nextTab);
+      }
+      if (detail.shop) {
+        setIsShopOpen(true);
+      }
+    };
+    window.addEventListener('open-profile-section', handleOpenSection);
+    return () => window.removeEventListener('open-profile-section', handleOpenSection);
+  }, []);
 
   // Reset owner-only tabs when viewing another user's profile
   useEffect(() => {
@@ -865,7 +902,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
       {/* CLEAN PROFILE TABS BAR */}
       <nav
         aria-label="Profile sections"
-        className="flex items-center gap-1.5 overflow-x-auto pb-1 border-b border-white/[0.07]"
+        className="flex items-center gap-1 sm:gap-1.5 overflow-x-auto pb-1 border-b border-white/[0.07]"
       >
         {visibleTabs.map((tab) => {
           const isActive = activeTab === tab.id;
@@ -874,7 +911,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
               key={tab.id}
               type="button"
               onClick={() => setActiveTab(tab.id)}
-              className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-md font-mono text-xs whitespace-nowrap transition-colors cursor-pointer shrink-0 ${
+              className={`inline-flex items-center gap-1.5 px-2.5 lg:px-3 py-2 rounded-md font-mono text-[11px] sm:text-xs whitespace-nowrap transition-colors cursor-pointer shrink-0 ${
                 isActive
                   ? 'bg-white/[0.09] text-[#f2eee9] border border-white/[0.14]'
                   : 'text-[#8e877e] hover:text-[#ded8ce] hover:bg-white/[0.03] border border-transparent'

@@ -21,14 +21,48 @@ interface CommonProps {
   onError: (msg: string) => void;
 }
 
+const NEWS_ROUTE_PRESETS = [
+  { value: '', labelRu: 'Без перехода (просто прочитать)', labelEn: 'No navigation (read only)' },
+  { value: '/', labelRu: 'Главная', labelEn: 'Home' },
+  { value: '/archive', labelRu: 'Архив / Релизы', labelEn: 'Archive / Releases' },
+  { value: '/games', labelRu: 'Игры и Викторина', labelEn: 'Games & Quiz' },
+  { value: '/creations', labelRu: 'Творчество и Мемы', labelEn: 'Creations & Memes' },
+  { value: '/community', labelRu: 'Форум / Сообщество', labelEn: 'Forum / Community' },
+  { value: '/games?tab=leaderboard', labelRu: 'Рейтинг', labelEn: 'Leaderboard' },
+  { value: '/profile?tab=inventory', labelRu: 'Профиль / Магазин', labelEn: 'Profile / Shop' },
+  { value: '__custom__', labelRu: 'Свой путь вручную', labelEn: 'Custom path' },
+] as const;
+
+function formatNewsLinkLabel(linkValue: string | null | undefined, lang: 'ru' | 'en'): string {
+  const clean = (linkValue || '').trim();
+  if (!clean) {
+    return lang === 'ru' ? 'Без перехода (просто прочитать)' : 'No navigation (read only)';
+  }
+  const preset = NEWS_ROUTE_PRESETS.find((p) => p.value !== '__custom__' && p.value === clean);
+  if (preset) {
+    return `${lang === 'ru' ? preset.labelRu : preset.labelEn} (${clean})`;
+  }
+  return clean;
+}
+
 export const AdminNewsTab: React.FC<CommonProps> = ({ lang, onNotify, onError }) => {
   const [newsList, setNewsList] = useState<any[]>([]);
   const [subscribersCount, setSubscribersCount] = useState<number>(0);
   const [loading, setLoading] = useState(true);
   const [title, setTitle] = useState('');
   const [message, setMessage] = useState('');
-  const [link, setLink] = useState('/');
+  const [routePreset, setRoutePreset] = useState<string>('');
+  const [customPath, setCustomPath] = useState<string>('');
   const [sending, setSending] = useState(false);
+
+  const resolvedLink =
+    routePreset === '__custom__'
+      ? customPath.trim()
+        ? customPath.trim().startsWith('/')
+          ? customPath.trim()
+          : `/${customPath.trim()}`
+        : ''
+      : routePreset;
 
   const loadNews = async () => {
     setLoading(true);
@@ -55,6 +89,14 @@ export const AdminNewsTab: React.FC<CommonProps> = ({ lang, onNotify, onError })
   const handleBroadcast = async (e: React.FormEvent) => {
     e.preventDefault();
     if (sending || !title.trim() || !message.trim()) return;
+    if (routePreset === '__custom__' && !customPath.trim()) {
+      onError(
+        lang === 'ru'
+          ? 'Укажите путь вручную или выберите раздел из списка.'
+          : 'Enter a custom path or choose a preset destination.'
+      );
+      return;
+    }
     setSending(true);
     try {
       const res = await authFetch('/api/admin/news/broadcast', {
@@ -63,7 +105,7 @@ export const AdminNewsTab: React.FC<CommonProps> = ({ lang, onNotify, onError })
         body: JSON.stringify({
           title: title.trim(),
           message: message.trim(),
-          link: link.trim() || '/',
+          link: resolvedLink,
         }),
       });
       const data = await safeJson<{ ok?: boolean; sent_count?: number; error?: string }>(res, {});
@@ -75,7 +117,8 @@ export const AdminNewsTab: React.FC<CommonProps> = ({ lang, onNotify, onError })
         );
         setTitle('');
         setMessage('');
-        setLink('/');
+        setRoutePreset('');
+        setCustomPath('');
         await loadNews();
       } else {
         onError(data.error || 'Failed to broadcast news');
@@ -143,17 +186,38 @@ export const AdminNewsTab: React.FC<CommonProps> = ({ lang, onNotify, onError })
               className="w-full px-3.5 py-2.5 bg-[#16151a] border border-white/[0.1] rounded-lg text-white focus:outline-none focus:border-white/30 resize-none"
             />
           </div>
-          <div>
-            <label className="block font-mono text-[10px] uppercase tracking-wider text-ash mb-1">
-              {lang === 'ru' ? 'Маршрут при клике' : 'Target Route'}
+          <div className="space-y-2.5">
+            <label className="block font-mono text-[10px] uppercase tracking-wider text-ash">
+              {lang === 'ru' ? 'Куда перекинет при клике' : 'Click Destination'}
             </label>
-            <input
-              type="text"
-              value={link}
-              onChange={(e) => setLink(e.target.value)}
-              placeholder="/archive"
-              className="w-full px-3.5 py-2.5 bg-[#16151a] border border-white/[0.1] rounded-lg text-white font-mono focus:outline-none focus:border-white/30"
-            />
+            <select
+              value={routePreset}
+              onChange={(e) => setRoutePreset(e.target.value)}
+              className="w-full px-3.5 py-2.5 bg-[#16151a] border border-white/[0.1] rounded-lg text-white focus:outline-none focus:border-white/30 cursor-pointer"
+            >
+              {NEWS_ROUTE_PRESETS.map((opt) => (
+                <option key={opt.value || '__none__'} value={opt.value} className="bg-[#16151a] text-white">
+                  {lang === 'ru' ? opt.labelRu : opt.labelEn}
+                </option>
+              ))}
+            </select>
+
+            {routePreset === '__custom__' && (
+              <div className="space-y-1.5 pt-1">
+                <input
+                  type="text"
+                  value={customPath}
+                  onChange={(e) => setCustomPath(e.target.value)}
+                  placeholder="/archive?album=alb_nightmortan"
+                  className="w-full px-3.5 py-2.5 bg-[#16151a] border border-white/[0.1] rounded-lg text-white font-mono focus:outline-none focus:border-white/30"
+                />
+                <p className="text-[11px] text-ash/75 leading-snug">
+                  {lang === 'ru'
+                    ? 'Например: /archive, /games?tab=leaderboard или /community?post=ID'
+                    : 'Example: /archive, /games?tab=leaderboard, or /community?post=ID'}
+                </p>
+              </div>
+            )}
           </div>
 
           <button
@@ -191,7 +255,7 @@ export const AdminNewsTab: React.FC<CommonProps> = ({ lang, onNotify, onError })
                 </div>
                 <p className="text-xs text-ash leading-relaxed">{n.message}</p>
                 <div className="font-mono text-[10px] text-ash/60 flex flex-wrap gap-2">
-                  <span>{n.link || '/'}</span>
+                  <span>{formatNewsLinkLabel(n.link, lang)}</span>
                   <span>·</span>
                   <span>@{n.author_nickname || 'admin'}</span>
                   <span>·</span>

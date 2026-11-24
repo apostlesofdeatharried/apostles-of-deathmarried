@@ -1,3 +1,4 @@
+import { Resend } from 'resend';
 import type { EmailVerificationPurpose } from './accountSecurity.js';
 
 export interface SendVerificationEmailResult {
@@ -10,7 +11,7 @@ export interface SendVerificationEmailResult {
 const DEFAULT_FROM_EMAIL = 'noreply@apostlesofdeathmarried.ru';
 
 /**
- * Sends a 6-digit email verification code via Resend REST API.
+ * Sends a 6-digit email verification code via the official Resend SDK.
  * Uses process.env.RESEND_API_KEY and process.env.RESEND_FROM_EMAIL.
  * Never crashes the server when RESEND_API_KEY is unset.
  */
@@ -82,24 +83,17 @@ export async function sendVerificationCodeEmail(params: {
   ].join('\n');
 
   try {
-    const response = await fetch('https://api.resend.com/emails', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        from: fromEmail.includes('<') ? fromEmail : `apostles of deathmarried <${fromEmail}>`,
-        to: [params.to],
-        subject,
-        html,
-        text,
-      }),
+    const resend = new Resend(apiKey);
+    const { data, error } = await resend.emails.send({
+      from: fromEmail.includes('<') ? fromEmail : `apostles of deathmarried <${fromEmail}>`,
+      to: [params.to],
+      subject,
+      html,
+      text,
     });
 
-    const data = (await response.json().catch(() => ({}))) as { id?: string; message?: string; name?: string };
-    if (!response.ok) {
-      console.error('[EmailService] Resend API error:', response.status, data?.message || data);
+    if (error || !data?.id) {
+      console.error('[EmailService] Resend SDK error:', error);
       return {
         ok: false,
         configured: true,

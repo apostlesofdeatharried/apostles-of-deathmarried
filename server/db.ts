@@ -129,8 +129,8 @@ export function replaceDatabaseWithBuffer(buffer: Buffer): void {
   ensureSchemaAndMigrations();
 }
 
-export function ensureSchemaAndMigrations() {
-  db.exec(`
+export function ensureSchemaAndMigrations(targetDb: Database.Database = db) {
+  targetDb.exec(`
     CREATE TABLE IF NOT EXISTS app_meta (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
@@ -607,23 +607,61 @@ export function ensureSchemaAndMigrations() {
       sent_count INTEGER NOT NULL DEFAULT 0,
       author_id TEXT,
       author_nickname TEXT,
+      created_by TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_site_news_created ON site_news(created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS daily_mini_game_attempts (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      game_id TEXT NOT NULL,
+      cycle_id TEXT NOT NULL,
+      is_correct INTEGER NOT NULL DEFAULT 0,
+      score INTEGER NOT NULL DEFAULT 0,
+      xp_earned INTEGER NOT NULL DEFAULT 0,
+      selected_value TEXT,
+      correct_value TEXT,
+      details_json TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(user_id, game_id, cycle_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_mini_game_attempts_user_game
+      ON daily_mini_game_attempts(user_id, game_id, cycle_id);
+
+    CREATE TABLE IF NOT EXISTS game_completions (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      game_type TEXT NOT NULL,
+      cycle_id TEXT NOT NULL,
+      is_correct INTEGER NOT NULL DEFAULT 0,
+      score INTEGER NOT NULL DEFAULT 0,
+      xp_earned INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(user_id, game_type, cycle_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_game_completions_lookup
+      ON game_completions(user_id, game_type, cycle_id);
   `);
 
   // Safe additive column migration helper (checks PRAGMA table_info before ALTER TABLE)
   const ensureColumn = (tableName: string, columnName: string, columnDef: string) => {
     try {
-      const cols = db.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name: string }>;
-      if (!cols.some((c) => c.name === columnName)) {
-        db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${columnDef};`);
+      const cols = targetDb.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name: string }>;
+      if (cols.length > 0 && !cols.some((c) => c.name === columnName)) {
+        targetDb.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${columnDef};`);
       }
     } catch {}
   };
 
-  // Safe table schema migrations for existing databases
-  ensureColumn('daily_track_challenges', 'snippet_start_ratio', 'REAL NOT NULL DEFAULT 0');
+  // Safe additive table schema migrations for existing Stage 1-6 databases
+  ensureColumn('users', 'email', 'TEXT');
+  ensureColumn('users', 'email_verified', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('users', 'failed_login_attempts', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('users', 'locked_until', 'TEXT');
+  ensureColumn('users', 'password_changed_at', 'TEXT');
+  ensureColumn('users', 'accepted_rules', 'INTEGER NOT NULL DEFAULT 0');
+
   ensureColumn('profiles', 'total_xp', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('profiles', 'custom_status', 'TEXT');
   ensureColumn('profiles', 'equipped_frame', 'TEXT');
@@ -639,61 +677,119 @@ export function ensureSchemaAndMigrations() {
   ensureColumn('profiles', 'favorite_track', 'TEXT');
   ensureColumn('profiles', 'notify_follows', 'INTEGER NOT NULL DEFAULT 1');
   ensureColumn('profiles', 'notify_news', 'INTEGER NOT NULL DEFAULT 0');
-  ensureColumn('tracks', 'is_game_eligible', 'INTEGER NOT NULL DEFAULT 1');
+
+  ensureColumn('albums', 'release_date', 'TEXT');
+  ensureColumn('albums', 'format_type', "TEXT NOT NULL DEFAULT 'album'");
+  ensureColumn('albums', 'source_url', 'TEXT');
+  ensureColumn('albums', 'streaming_links_json', 'TEXT');
+  ensureColumn('albums', 'verified_source', 'TEXT');
+  ensureColumn('albums', 'last_verified_at', 'TEXT');
+  ensureColumn('albums', 'is_verified', 'INTEGER NOT NULL DEFAULT 1');
+
+  ensureColumn('singles', 'release_date', 'TEXT');
+  ensureColumn('singles', 'audio_url', 'TEXT');
+  ensureColumn('singles', 'source_url', 'TEXT');
+  ensureColumn('singles', 'streaming_links_json', 'TEXT');
+  ensureColumn('singles', 'verified_source', 'TEXT');
+  ensureColumn('singles', 'last_verified_at', 'TEXT');
+  ensureColumn('singles', 'is_verified', 'INTEGER NOT NULL DEFAULT 1');
+  ensureColumn('singles', 'lyrics', 'TEXT');
   ensureColumn('singles', 'is_game_eligible', 'INTEGER NOT NULL DEFAULT 1');
-  try { db.exec("ALTER TABLE post_categories ADD COLUMN is_official INTEGER NOT NULL DEFAULT 0;"); } catch {}
-  try { db.exec("ALTER TABLE posts ADD COLUMN status TEXT NOT NULL DEFAULT 'approved';"); } catch {}
-  try { db.exec("ALTER TABLE posts ADD COLUMN rejection_reason TEXT;"); } catch {}
+
+  ensureColumn('tracks', 'single_id', 'TEXT');
+  ensureColumn('tracks', 'snippet_start_seconds', 'INTEGER DEFAULT 0');
+  ensureColumn('tracks', 'snippet_duration_seconds', 'INTEGER DEFAULT 15');
+  ensureColumn('tracks', 'lyrics', 'TEXT');
+  ensureColumn('tracks', 'external_url', 'TEXT');
+  ensureColumn('tracks', 'source_url', 'TEXT');
+  ensureColumn('tracks', 'is_verified', 'INTEGER NOT NULL DEFAULT 1');
+  ensureColumn('tracks', 'is_game_eligible', 'INTEGER NOT NULL DEFAULT 1');
+
+  ensureColumn('games', 'is_active', 'INTEGER NOT NULL DEFAULT 1');
+
+  ensureColumn('daily_track_challenges', 'track_source', "TEXT NOT NULL DEFAULT 'track'");
+  ensureColumn('daily_track_challenges', 'snippet_start_ratio', 'REAL NOT NULL DEFAULT 0');
+  ensureColumn('daily_track_challenges', 'snippet_duration_seconds', 'INTEGER NOT NULL DEFAULT 5');
+
+  ensureColumn('post_categories', 'is_official', 'INTEGER NOT NULL DEFAULT 0');
+
+  ensureColumn('posts', 'media_url', 'TEXT');
+  ensureColumn('posts', 'media_type', 'TEXT');
+  ensureColumn('posts', 'is_pinned', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('posts', 'is_locked', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('posts', 'views_count', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('posts', 'reactions_count', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('posts', 'comments_count', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('posts', 'status', "TEXT NOT NULL DEFAULT 'approved'");
+  ensureColumn('posts', 'rejection_reason', 'TEXT');
   ensureColumn('posts', 'xp_awarded', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('posts', 'xp_awarded_amount', 'INTEGER NOT NULL DEFAULT 0');
-  try { db.exec("ALTER TABLE comments ADD COLUMN parent_id TEXT;"); } catch {}
-  try { db.exec("ALTER TABLE comments ADD COLUMN status TEXT NOT NULL DEFAULT 'approved';"); } catch {}
+
+  ensureColumn('comments', 'creation_id', 'TEXT');
+  ensureColumn('comments', 'parent_id', 'TEXT');
+  ensureColumn('comments', 'status', "TEXT NOT NULL DEFAULT 'approved'");
   ensureColumn('comments', 'album_id', 'TEXT');
   ensureColumn('comments', 'single_id', 'TEXT');
   ensureColumn('comments', 'is_hidden', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('comments', 'xp_awarded', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('comments', 'xp_awarded_amount', 'INTEGER NOT NULL DEFAULT 0');
-  try { db.exec("CREATE INDEX IF NOT EXISTS idx_comments_album ON comments(album_id);"); } catch {}
-  try { db.exec("CREATE INDEX IF NOT EXISTS idx_comments_single ON comments(single_id);"); } catch {}
+  try { targetDb.exec("CREATE INDEX IF NOT EXISTS idx_comments_album ON comments(album_id);"); } catch {}
+  try { targetDb.exec("CREATE INDEX IF NOT EXISTS idx_comments_single ON comments(single_id);"); } catch {}
+
   ensureColumn('creations', 'category', "TEXT DEFAULT 'art'");
-  try { db.exec("ALTER TABLE creations ADD COLUMN status TEXT NOT NULL DEFAULT 'approved';"); } catch {}
-  try { db.exec("ALTER TABLE creations ADD COLUMN rejection_reason TEXT;"); } catch {}
+  ensureColumn('creations', 'is_approved', 'INTEGER NOT NULL DEFAULT 1');
+  ensureColumn('creations', 'status', "TEXT NOT NULL DEFAULT 'approved'");
+  ensureColumn('creations', 'rejection_reason', 'TEXT');
   ensureColumn('creations', 'xp_awarded', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('creations', 'xp_awarded_amount', 'INTEGER NOT NULL DEFAULT 0');
+
   ensureColumn('xp_transactions', 'reference_key', 'TEXT');
   try {
-    db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_xp_transactions_ref_key ON xp_transactions(reference_key) WHERE reference_key IS NOT NULL;");
+    targetDb.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_xp_transactions_ref_key ON xp_transactions(reference_key) WHERE reference_key IS NOT NULL;");
   } catch {}
-  ensureColumn('users', 'email', 'TEXT');
-  ensureColumn('users', 'email_verified', 'INTEGER NOT NULL DEFAULT 0');
-  ensureColumn('users', 'failed_login_attempts', 'INTEGER NOT NULL DEFAULT 0');
-  ensureColumn('users', 'locked_until', 'TEXT');
-  ensureColumn('users', 'password_changed_at', 'TEXT');
-  ensureColumn('users', 'accepted_rules', 'INTEGER NOT NULL DEFAULT 0');
+
+  ensureColumn('shop_items', 'rarity', "TEXT NOT NULL DEFAULT 'common'");
+  ensureColumn('shop_items', 'is_active', 'INTEGER NOT NULL DEFAULT 1');
+  ensureColumn('shop_items', 'requires_achievement_id', 'TEXT');
+
   ensureColumn('promo_codes', 'max_uses', 'INTEGER');
   ensureColumn('promo_codes', 'expires_at', 'TEXT');
-  try { db.exec("ALTER TABLE achievements ADD COLUMN rarity TEXT NOT NULL DEFAULT 'common';"); } catch {}
-  try { db.exec("ALTER TABLE achievements ADD COLUMN category TEXT NOT NULL DEFAULT 'general';"); } catch {}
-  try { db.exec("ALTER TABLE achievements ADD COLUMN condition_ru TEXT;"); } catch {}
-  try { db.exec("ALTER TABLE achievements ADD COLUMN condition_en TEXT;"); } catch {}
+
+  ensureColumn('achievements', 'rarity', "TEXT NOT NULL DEFAULT 'common'");
+  ensureColumn('achievements', 'category', "TEXT NOT NULL DEFAULT 'general'");
+  ensureColumn('achievements', 'condition_ru', 'TEXT');
+  ensureColumn('achievements', 'condition_en', 'TEXT');
   ensureColumn('achievements', 'difficulty_tier', "TEXT NOT NULL DEFAULT 'easy'");
   ensureColumn('achievements', 'is_secret', 'INTEGER NOT NULL DEFAULT 0');
-  try { db.exec("ALTER TABLE albums ADD COLUMN streaming_links_json TEXT;"); } catch {}
-  try { db.exec("ALTER TABLE albums ADD COLUMN verified_source TEXT;"); } catch {}
-  try { db.exec("ALTER TABLE albums ADD COLUMN last_verified_at TEXT;"); } catch {}
-  try { db.exec("ALTER TABLE singles ADD COLUMN streaming_links_json TEXT;"); } catch {}
-  try { db.exec("ALTER TABLE singles ADD COLUMN verified_source TEXT;"); } catch {}
-  try { db.exec("ALTER TABLE singles ADD COLUMN last_verified_at TEXT;"); } catch {}
-  try { db.exec("ALTER TABLE singles ADD COLUMN lyrics TEXT;"); } catch {}
+
+  ensureColumn('site_news', 'link', "TEXT NOT NULL DEFAULT '/'");
+  ensureColumn('site_news', 'sent_count', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('site_news', 'author_id', 'TEXT');
+  ensureColumn('site_news', 'author_nickname', 'TEXT');
+  ensureColumn('site_news', 'created_by', 'TEXT');
+
+  // Non-destructive backfill for site_news author_id <-> created_by
+  try {
+    targetDb.exec(`
+      UPDATE site_news
+      SET created_by = author_id
+      WHERE (created_by IS NULL OR trim(created_by) = '')
+        AND author_id IS NOT NULL AND trim(author_id) <> '';
+      UPDATE site_news
+      SET author_id = created_by
+      WHERE (author_id IS NULL OR trim(author_id) = '')
+        AND created_by IS NOT NULL AND trim(created_by) <> '';
+    `);
+  } catch {}
 
   // Sync total_xp with existing xp if total_xp is 0 (non-destructive)
   try {
-    db.exec("UPDATE profiles SET total_xp = xp WHERE total_xp = 0 AND xp > 0;");
+    targetDb.exec("UPDATE profiles SET total_xp = xp WHERE total_xp = 0 AND xp > 0;");
   } catch {}
 
   // Ensure legacy accounts with empty display_name gracefully inherit nickname
   try {
-    db.exec(`
+    targetDb.exec(`
       UPDATE profiles
       SET display_name = (SELECT u.nickname FROM users u WHERE u.id = profiles.user_id)
       WHERE display_name IS NULL OR trim(display_name) = '';
@@ -729,10 +825,6 @@ function seedInitialData() {
       1500
     );
   }
-
-  try {
-    db.exec("ALTER TABLE users ADD COLUMN email TEXT;");
-  } catch {}
 
   const sushkanovAdmin = db.prepare('SELECT id FROM users WHERE nickname = ? OR email = ?').get('sushkanov097', 'sushkanov097@gmail.com') as any;
   if (!sushkanovAdmin) {
@@ -1057,14 +1149,6 @@ function seedInitialData() {
   for (const promo of initialPromoCodes) {
     insertPromo.run(promo);
   }
-
-  // Safe table schema migrations for existing SQLite databases
-  try { db.exec("ALTER TABLE albums ADD COLUMN streaming_links_json TEXT;"); } catch {}
-  try { db.exec("ALTER TABLE albums ADD COLUMN verified_source TEXT;"); } catch {}
-  try { db.exec("ALTER TABLE albums ADD COLUMN last_verified_at TEXT;"); } catch {}
-  try { db.exec("ALTER TABLE singles ADD COLUMN streaming_links_json TEXT;"); } catch {}
-  try { db.exec("ALTER TABLE singles ADD COLUMN verified_source TEXT;"); } catch {}
-  try { db.exec("ALTER TABLE singles ADD COLUMN last_verified_at TEXT;"); } catch {}
 
   // --------------------------------------------------------------------------
   // SEED VERIFIED DEATHMARRIED DISCOGRAPHY (ALBUMS, EPS, SINGLES) — ONCE ONLY
@@ -1501,26 +1585,7 @@ function seedInitialData() {
     // Update cliché admin display_name if untouched
     db.prepare("UPDATE profiles SET display_name = 'Archive Curator (Admin)' WHERE user_id = 'usr_admin_001' AND display_name = 'Arch-Apostle (Admin)'").run();
 
-    // Stage 5 additive migrations: new games, quiz settings in app_meta, and mini-game cycle attempts
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS daily_mini_game_attempts (
-        id TEXT PRIMARY KEY,
-        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        game_id TEXT NOT NULL,
-        cycle_id TEXT NOT NULL,
-        is_correct INTEGER NOT NULL DEFAULT 0,
-        score INTEGER NOT NULL DEFAULT 0,
-        xp_earned INTEGER NOT NULL DEFAULT 0,
-        selected_value TEXT,
-        correct_value TEXT,
-        details_json TEXT,
-        created_at TEXT NOT NULL DEFAULT (datetime('now')),
-        UNIQUE(user_id, game_id, cycle_id)
-      );
-      CREATE INDEX IF NOT EXISTS idx_mini_game_attempts_user_game
-        ON daily_mini_game_attempts(user_id, game_id, cycle_id);
-    `);
-
+    // Seed Stage 5/6 games, app_meta defaults, and backfill game_completions
     db.prepare(`
       INSERT OR IGNORE INTO games (id, slug, title, description, xp_multiplier, is_active)
       VALUES
@@ -1569,23 +1634,6 @@ function seedInitialData() {
         ('active_quiz_ids', '[]'),
         ('community_rules_json', ?)
     `).run(defaultCommunityRules);
-
-    // Stage 6 additive migrations: unified game_completions lock across all 5 games
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS game_completions (
-        id TEXT PRIMARY KEY,
-        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        game_type TEXT NOT NULL,
-        cycle_id TEXT NOT NULL,
-        is_correct INTEGER NOT NULL DEFAULT 0,
-        score INTEGER NOT NULL DEFAULT 0,
-        xp_earned INTEGER NOT NULL DEFAULT 0,
-        created_at TEXT NOT NULL DEFAULT (datetime('now')),
-        UNIQUE(user_id, game_type, cycle_id)
-      );
-      CREATE INDEX IF NOT EXISTS idx_game_completions_lookup
-        ON game_completions(user_id, game_type, cycle_id);
-    `);
 
     db.exec(`
       INSERT OR IGNORE INTO game_completions (id, user_id, game_type, cycle_id, is_correct, score, xp_earned, created_at)

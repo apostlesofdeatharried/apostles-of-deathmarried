@@ -1483,9 +1483,9 @@ app.put('/api/notifications/preferences', requireAuth, (req: AuthRequest, res: R
 
 app.get('/api/admin/news', requireAdmin, (_req: AuthRequest, res: Response) => {
   const news = db.prepare(`
-    SELECT sn.*, u.nickname as author_nickname
+    SELECT sn.*, COALESCE(u.nickname, sn.author_nickname, 'admin') as author_nickname
     FROM site_news sn
-    LEFT JOIN users u ON u.id = sn.created_by
+    LEFT JOIN users u ON u.id = COALESCE(sn.created_by, sn.author_id)
     ORDER BY datetime(sn.created_at) DESC
     LIMIT 100
   `).all();
@@ -1501,8 +1501,11 @@ app.get('/api/admin/news', requireAdmin, (_req: AuthRequest, res: Response) => {
 app.post('/api/admin/news/broadcast', requireAdmin, (req: AuthRequest, res: Response) => {
   const cleanTitle = String(req.body?.title || '').replace(/\s+/g, ' ').trim().slice(0, 120);
   const cleanMessage = String(req.body?.message || '').replace(/\s+/g, ' ').trim().slice(0, 300);
-  const rawLink = String(req.body?.link || '/').trim();
-  const safeLink = rawLink.startsWith('/') ? rawLink.slice(0, 200) : '/';
+  const rawLink = typeof req.body?.link === 'string' ? req.body.link.trim() : '';
+  const safeLink =
+    !rawLink || rawLink === 'none' || rawLink === '__none__'
+      ? ''
+      : (rawLink.startsWith('/') ? rawLink : `/${rawLink}`).slice(0, 200);
 
   if (!cleanTitle || !cleanMessage) {
     res.status(400).json({ error: 'Укажите заголовок и текст новости.' });
@@ -1535,9 +1538,9 @@ app.post('/api/admin/news/broadcast', requireAdmin, (req: AuthRequest, res: Resp
       sentCount += 1;
     }
     db.prepare(`
-      INSERT INTO site_news (id, title, message, link, sent_count, created_by)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(newsId, cleanTitle, cleanMessage, safeLink, sentCount, req.user!.id);
+      INSERT INTO site_news (id, title, message, link, sent_count, author_id, author_nickname, created_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(newsId, cleanTitle, cleanMessage, safeLink, sentCount, req.user!.id, req.user!.nickname, req.user!.id);
   })();
 
   res.json({ ok: true, id: newsId, sent_count: sentCount });
@@ -7458,12 +7461,12 @@ app.post('/api/admin/users/:id/achievements', requireAdmin, (req: AuthRequest, r
       );
       if (ach.slug === 'secret_on_repeat') {
         db.prepare('DELETE FROM user_track_plays WHERE user_id = ?').run(targetId);
-      } else if (ach.slug === 'secret_rose_hunter') {
+      } else if (ach.slug === 'secret_curious_rose') {
         db.prepare("DELETE FROM user_secret_flags WHERE user_id = ? AND flag_key = 'curious_rose'").run(targetId);
-      } else if (ach.slug === 'secret_scribe') {
+      } else if (ach.slug === 'easy_avid_reader' || ach.slug === 'hard_community_reader') {
         db.prepare('DELETE FROM post_reads WHERE user_id = ?').run(targetId);
-      } else if (ach.slug === 'secret_midnight_apostle') {
-        db.prepare("DELETE FROM user_secret_flags WHERE user_id = ? AND flag_key = 'midnight_visit'").run(targetId);
+      } else if (ach.slug === 'secret_midnight_visitor') {
+        db.prepare("DELETE FROM user_secret_flags WHERE user_id = ? AND flag_key = 'midnight_msk'").run(targetId);
       }
 
       const profRow = db.prepare('SELECT featured_achievements_json FROM profiles WHERE user_id = ?').get(targetId) as
