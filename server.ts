@@ -597,6 +597,72 @@ function getSessionUser(req: Request) {
   return null;
 }
 
+function hasValidDbUserAndProfile(userId?: string | null): boolean {
+  if (!userId || typeof userId !== 'string') return false;
+  try {
+    const row = db
+      .prepare(
+        `SELECT 1 FROM users u JOIN profiles p ON p.user_id = u.id WHERE u.id = ? AND u.is_banned = 0 LIMIT 1`
+      )
+      .get(userId);
+    return Boolean(row);
+  } catch {
+    return false;
+  }
+}
+
+type KnownGameId = 'guess-track' | 'daily-quiz' | 'guess-lyrics' | 'reverse-track' | 'speed-track';
+
+const GAME_CATALOG_DEFAULTS: Record<
+  KnownGameId,
+  { title: string; description: string; xpMultiplier: number }
+> = {
+  'guess-track': {
+    title: 'Guess The Track',
+    description: 'Listen to short fragments and identify the track title.',
+    xpMultiplier: 1.0,
+  },
+  'daily-quiz': {
+    title: 'Daily Lore Quiz',
+    description: 'Daily questions about verified discography and official facts.',
+    xpMultiplier: 1.2,
+  },
+  'guess-lyrics': {
+    title: 'Угадай строчку',
+    description: 'Продолжи строчку из трека deathmarried.',
+    xpMultiplier: 1.0,
+  },
+  'reverse-track': {
+    title: 'Задом наперёд',
+    description: 'Угадай трек по 5-секундному фрагменту в реверсе.',
+    xpMultiplier: 1.1,
+  },
+  'speed-track': {
+    title: 'Трек 0.5x / 2.5x',
+    description: 'Угадай трек в замедленном 0.5x или ускоренном 2.5x режиме.',
+    xpMultiplier: 1.1,
+  },
+};
+
+function ensureGameCatalogRow(gameId: KnownGameId): string {
+  const byId = db.prepare('SELECT id FROM games WHERE id = ?').get(gameId) as
+    | { id: string }
+    | undefined;
+  if (byId) return byId.id;
+
+  const bySlug = db.prepare('SELECT id FROM games WHERE slug = ?').get(gameId) as
+    | { id: string }
+    | undefined;
+  if (bySlug) return bySlug.id;
+
+  const meta = GAME_CATALOG_DEFAULTS[gameId];
+  db.prepare(`
+    INSERT OR IGNORE INTO games (id, slug, title, description, xp_multiplier, is_active)
+    VALUES (?, ?, ?, ?, ?, 1)
+  `).run(gameId, gameId, meta.title, meta.description, meta.xpMultiplier);
+  return gameId;
+}
+
 function requireAuth(req: AuthRequest, res: Response, next: NextFunction) {
   const user = getSessionUser(req);
   if (!user) {
@@ -2894,7 +2960,8 @@ function getOrCreateDailyQuizChallenge(cycleId: string): ValidatedQuizQuestion[]
 
 // 1. Guess The Track (shared 12-hour MSK challenge: 00:00 & 12:00 МСК, exact 5-second snippet)
 app.get('/api/games/guess-track/round', (req: Request, res: Response) => {
-  const user = getSessionUser(req);
+  const sessionUser = getSessionUser(req);
+  const user = sessionUser && hasValidDbUserAndProfile(sessionUser.id) ? sessionUser : null;
   const { cycleId: slotKey, nextResetAt } = getMoscow12hCycle();
 
   const daily = getOrCreateDailyTrackChallenge(slotKey);
@@ -2959,7 +3026,8 @@ app.post('/api/games/guess-track/verify', (req: AuthRequest, res: Response) => {
     return;
   }
 
-  const user = getSessionUser(req);
+  const sessionUser = getSessionUser(req);
+  const user = sessionUser && hasValidDbUserAndProfile(sessionUser.id) ? sessionUser : null;
   const { cycleId: slotKey, nextResetAt } = getMoscow12hCycle();
 
   let clientSlot: string | null = null;
@@ -3089,12 +3157,14 @@ app.post('/api/games/guess-track/verify', (req: AuthRequest, res: Response) => {
           safeTimeSpent
         );
 
+        const resolvedGameId = ensureGameCatalogRow('guess-track');
         db.prepare(`
           INSERT INTO game_attempts (id, user_id, game_id, score, xp_earned, details_json)
-          VALUES (?, ?, 'guess-track', ?, ?, ?)
+          VALUES (?, ?, ?, ?, ?, ?)
         `).run(
           'att_' + crypto.randomUUID().slice(0, 8),
           user.id,
+          resolvedGameId,
           score,
           xpEarned,
           JSON.stringify({ isCorrect, correctTrackId, challengeDate: slotKey, streakBonusPercent })
@@ -3162,7 +3232,8 @@ app.post('/api/games/guess-track/verify', (req: AuthRequest, res: Response) => {
 
 // 2. Daily Quiz (12-hour MSK schedule: 00:00 & 12:00 МСК, quiz_enabled toggle, active_quiz_ids manual mode, difficulty XP + Fisher-Yates options)
 app.get('/api/games/quiz/daily', (req: Request, res: Response) => {
-  const user = getSessionUser(req);
+  const sessionUser = getSessionUser(req);
+  const user = sessionUser && hasValidDbUserAndProfile(sessionUser.id) ? sessionUser : null;
   const { cycleId, nextResetAt } = getMoscow12hCycle();
   const quizSecret = getDailyChallengeSecret();
   const { quiz_enabled } = getQuizSettingsFromDb();
@@ -3243,7 +3314,8 @@ app.post('/api/games/quiz/submit', (req: AuthRequest, res: Response) => {
     return;
   }
 
-  const user = getSessionUser(req);
+  const sessionUser = getSessionUser(req);
+  const user = sessionUser && hasValidDbUserAndProfile(sessionUser.id) ? sessionUser : null;
   const { cycleId, nextResetAt } = getMoscow12hCycle();
   const quizSecret = getDailyChallengeSecret();
 
@@ -3366,12 +3438,14 @@ app.post('/api/games/quiz/submit', (req: AuthRequest, res: Response) => {
           VALUES (?, ?, ?, ?, ?)
         `).run('qa_' + crypto.randomUUID().slice(0, 8), user.id, cycleId, baseScore, totalXp);
 
+        const resolvedQuizGameId = ensureGameCatalogRow('daily-quiz');
         db.prepare(`
           INSERT INTO game_attempts (id, user_id, game_id, score, xp_earned, details_json)
-          VALUES (?, ?, 'daily-quiz', ?, ?, ?)
+          VALUES (?, ?, ?, ?, ?, ?)
         `).run(
           'att_' + crypto.randomUUID().slice(0, 8),
           user.id,
+          resolvedQuizGameId,
           baseScore,
           totalXp,
           JSON.stringify({ correctCount, total, challengeDate: cycleId, streakBonusPercent })
@@ -3459,6 +3533,15 @@ function recordMiniGameAttempt(params: {
   newlyUnlockedAchievements: UnlockedAchievementInfo[];
 } {
   const { userId, gameId, xpSource, cycleId, isCorrect, baseXp, selectedValue, correctValue, details } = params;
+  if (!hasValidDbUserAndProfile(userId)) {
+    return {
+      xpEarned: baseXp,
+      streakBonusXp: 0,
+      streakBonusPercent: 0,
+      nextStreak: 0,
+      newlyUnlockedAchievements: [],
+    };
+  }
   const todayMoscowDate = getMoscowDateString();
   const prev = db
     .prepare('SELECT total_xp, daily_streak, last_active_date FROM profiles WHERE user_id = ?')
@@ -3471,6 +3554,8 @@ function recordMiniGameAttempt(params: {
   let duplicate = false;
 
   db.transaction(() => {
+    const resolvedGameId = ensureGameCatalogRow(gameId);
+
     const gcInsert = db.prepare(`
       INSERT OR IGNORE INTO game_completions (id, user_id, game_type, cycle_id, is_correct, score, xp_earned)
       VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -3504,7 +3589,7 @@ function recordMiniGameAttempt(params: {
     `).run(
       'att_' + crypto.randomUUID().slice(0, 8),
       userId,
-      gameId,
+      resolvedGameId,
       score,
       xpEarned,
       JSON.stringify({ ...details, challengeDate: cycleId, streakBonusPercent: boosted.bonusPercent })
@@ -3574,7 +3659,8 @@ function resolveLyricsChallengeForCycle(cycleId: string) {
 }
 
 app.get('/api/games/guess-lyrics/round', (req: Request, res: Response) => {
-  const user = getSessionUser(req);
+  const sessionUser = getSessionUser(req);
+  const user = sessionUser && hasValidDbUserAndProfile(sessionUser.id) ? sessionUser : null;
   const { cycleId, nextResetAt } = getMoscow12hCycle();
   const round = resolveLyricsChallengeForCycle(cycleId);
 
@@ -3636,7 +3722,8 @@ app.post('/api/games/guess-lyrics/verify', (req: AuthRequest, res: Response) => 
     return;
   }
 
-  const user = getSessionUser(req);
+  const sessionUser = getSessionUser(req);
+  const user = sessionUser && hasValidDbUserAndProfile(sessionUser.id) ? sessionUser : null;
   const { cycleId, nextResetAt } = getMoscow12hCycle();
 
   if (isValidMoscow12hCycle(challenge_date) && challenge_date !== cycleId) {
@@ -3787,7 +3874,8 @@ function resolveReverseTrackForCycle(cycleId: string) {
 }
 
 app.get('/api/games/reverse-track/round', (req: Request, res: Response) => {
-  const user = getSessionUser(req);
+  const sessionUser = getSessionUser(req);
+  const user = sessionUser && hasValidDbUserAndProfile(sessionUser.id) ? sessionUser : null;
   const { cycleId, nextResetAt } = getMoscow12hCycle();
   const round = resolveReverseTrackForCycle(cycleId);
 
@@ -3846,7 +3934,8 @@ app.post('/api/games/reverse-track/verify', (req: AuthRequest, res: Response) =>
     return;
   }
 
-  const user = getSessionUser(req);
+  const sessionUser = getSessionUser(req);
+  const user = sessionUser && hasValidDbUserAndProfile(sessionUser.id) ? sessionUser : null;
   const { cycleId, nextResetAt } = getMoscow12hCycle();
 
   if (isValidMoscow12hCycle(challenge_date) && challenge_date !== cycleId) {
@@ -3995,7 +4084,8 @@ function resolveSpeedTrackForCycle(cycleId: string) {
 }
 
 app.get('/api/games/speed-track/round', (req: Request, res: Response) => {
-  const user = getSessionUser(req);
+  const sessionUser = getSessionUser(req);
+  const user = sessionUser && hasValidDbUserAndProfile(sessionUser.id) ? sessionUser : null;
   const { cycleId, nextResetAt } = getMoscow12hCycle();
   const round = resolveSpeedTrackForCycle(cycleId);
 
@@ -4056,7 +4146,8 @@ app.post('/api/games/speed-track/verify', (req: AuthRequest, res: Response) => {
     return;
   }
 
-  const user = getSessionUser(req);
+  const sessionUser = getSessionUser(req);
+  const user = sessionUser && hasValidDbUserAndProfile(sessionUser.id) ? sessionUser : null;
   const { cycleId, nextResetAt } = getMoscow12hCycle();
 
   if (isValidMoscow12hCycle(challenge_date) && challenge_date !== cycleId) {
@@ -8669,6 +8760,7 @@ app.get('/uploads/:filename', async (req: Request, res: Response, next: NextFunc
       res.setHeader('Accept-Ranges', 'bytes');
       res.setHeader('Cache-Control', 'public, max-age=31536000, s-maxage=31536000, immutable');
 
+      const MAX_SERVERLESS_RANGE_BYTES = 1572864; // 1.5 MiB (< 4.5 MB Vercel Serverless limit)
       const range = req.headers.range;
       if (range) {
         const match = /^bytes=(\d*)-(\d*)$/i.exec(range.trim());
@@ -8676,12 +8768,13 @@ app.get('/uploads/:filename', async (req: Request, res: Response, next: NextFunc
           let start: number;
           let end: number;
           if (match[1] === '' && match[2] !== '') {
-            const suffix = parseInt(match[2], 10);
+            const suffix = Math.min(parseInt(match[2], 10), MAX_SERVERLESS_RANGE_BYTES);
             start = Math.max(0, total - suffix);
             end = total - 1;
           } else {
             start = match[1] ? parseInt(match[1], 10) : 0;
-            end = match[2] ? Math.min(parseInt(match[2], 10), total - 1) : total - 1;
+            const requestedEnd = match[2] ? Math.min(parseInt(match[2], 10), total - 1) : total - 1;
+            end = Math.min(requestedEnd, start + MAX_SERVERLESS_RANGE_BYTES - 1, total - 1);
           }
           if (!isNaN(start) && !isNaN(end) && start >= 0 && start < total && start <= end) {
             res.status(206);
@@ -8702,8 +8795,23 @@ app.get('/uploads/:filename', async (req: Request, res: Response, next: NextFunc
       return;
     }
 
+    // Clamp open-ended/oversized Range headers before proxying from Supabase so Vercel responses stay <= 1.5 MiB
+    let effectiveRange = typeof req.headers.range === 'string' ? req.headers.range.trim() : undefined;
+    if (effectiveRange) {
+      const match = /^bytes=(\d*)-(\d*)$/i.exec(effectiveRange);
+      if (match && match[1] !== '') {
+        const start = parseInt(match[1], 10);
+        const rawEnd = match[2] ? parseInt(match[2], 10) : NaN;
+        if (!Number.isNaN(start)) {
+          if (Number.isNaN(rawEnd) || rawEnd - start + 1 > 1572864) {
+            effectiveRange = `bytes=${start}-${start + 1572864 - 1}`;
+          }
+        }
+      }
+    }
+
     // Fallback to Supabase Storage (supports audio seeking via HTTP Range / 206 Partial Content)
-    const cloudMedia = await fetchMediaFromSupabase(filename, req.headers.range);
+    const cloudMedia = await fetchMediaFromSupabase(filename, effectiveRange);
     if (cloudMedia) {
       res.status(cloudMedia.status);
       res.setHeader('Content-Type', cloudMedia.contentType);
@@ -8711,6 +8819,10 @@ app.get('/uploads/:filename', async (req: Request, res: Response, next: NextFunc
       res.setHeader('Cache-Control', 'public, max-age=31536000, s-maxage=31536000, immutable');
       if (cloudMedia.contentRange) {
         res.setHeader('Content-Range', cloudMedia.contentRange);
+      }
+      if (cloudMedia.status === 416) {
+        res.end();
+        return;
       }
       res.setHeader('Content-Length', cloudMedia.contentLength || String(cloudMedia.body.length));
       res.end(cloudMedia.body);

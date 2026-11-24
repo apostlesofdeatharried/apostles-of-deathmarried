@@ -7,6 +7,9 @@ const isVercel = Boolean(process.env.VERCEL);
 const bundledDbPath = path.resolve(process.cwd(), 'data', 'apostles.db');
 
 function resolveWritableDbPath(): string {
+  if (process.env.NODE_ENV === 'test' && process.env.APOSTLES_DB_PATH) {
+    return process.env.APOSTLES_DB_PATH;
+  }
   if (isVercel) {
     const tmpDir = '/tmp';
     if (!fs.existsSync(tmpDir)) {
@@ -753,9 +756,176 @@ export function ensureSchemaAndMigrations(targetDb: Database.Database = db) {
 
   ensureColumn('games', 'is_active', 'INTEGER NOT NULL DEFAULT 1');
 
+  // Ensure ALL 5 games exist in `games` table inside ensureSchemaAndMigrations
+  // (critical after hot-swapping prod apostles.db from Supabase when seedInitialData is not re-run)
+  try {
+    targetDb.exec(`
+      INSERT OR IGNORE INTO games (id, slug, title, description, xp_multiplier, is_active) VALUES
+        ('guess-track', 'guess-track', 'Guess The Track', 'Listen to short fragments and identify the track title.', 1.0, 1),
+        ('daily-quiz', 'daily-quiz', 'Daily Lore Quiz', 'Daily questions about verified discography and official facts.', 1.2, 1),
+        ('guess-lyrics', 'guess-lyrics', 'Угадай строчку', 'Продолжи строчку из трека deathmarried.', 1.0, 1),
+        ('reverse-track', 'reverse-track', 'Задом наперёд', 'Угадай трек по 5-секундному фрагменту в реверсе.', 1.1, 1),
+        ('speed-track', 'speed-track', 'Трек 0.5x / 2.5x', 'Угадай трек в замедленном 0.5x или ускоренном 2.5x режиме.', 1.1, 1);
+    `);
+  } catch (err) {
+    recordMigrationError('games:seed_all_five', err);
+  }
+
+  // Safely drop any stale foreign key referencing `tracks`, `singles`, `games`, or challenge tables
+  // on progress/challenge tables because round tracks/options can come from either `tracks` OR `singles`
+  // and legacy production DBs may carry outdated FK definitions. Only `users(id)` FK is retained.
+  const rebuildTableWithoutTrackFk = (
+    tableName: string,
+    createCleanSql: (tempTable: string) => string
+  ) => {
+    try {
+      const fks = targetDb
+        .prepare(`PRAGMA foreign_key_list(${tableName})`)
+        .all() as Array<{ table?: string }>;
+      const hasUnexpectedFk = fks.some(
+        (fk) => fk.table && fk.table.toLowerCase() !== 'users'
+      );
+      if (!hasUnexpectedFk) return;
+
+      const oldCols = targetDb
+        .prepare(`PRAGMA table_info(${tableName})`)
+        .all() as Array<{ name: string }>;
+      if (oldCols.length === 0) return;
+
+      const existingIndexes = targetDb
+        .prepare(
+          `SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL`
+        )
+        .all(tableName) as Array<{ sql: string }>;
+
+      const oldColSet = new Set(oldCols.map((c) => c.name));
+      const tempName = `${tableName}_clean_tmp`;
+      const fkWasOn = Boolean(targetDb.pragma('foreign_keys', { simple: true }));
+      if (fkWasOn) targetDb.pragma('foreign_keys = OFF');
+      try {
+        targetDb.transaction(() => {
+          targetDb.exec(`DROP TABLE IF EXISTS ${tempName};`);
+          targetDb.exec(createCleanSql(tempName));
+          const newCols = targetDb
+            .prepare(`PRAGMA table_info(${tempName})`)
+            .all() as Array<{ name: string }>;
+          const commonCols = newCols
+            .map((c) => c.name)
+            .filter((name) => oldColSet.has(name));
+          if (commonCols.length > 0) {
+            targetDb.exec(`
+              INSERT INTO ${tempName} (${commonCols.join(', ')})
+              SELECT ${commonCols.join(', ')} FROM ${tableName};
+            `);
+          }
+          targetDb.exec(`
+            DROP TABLE ${tableName};
+            ALTER TABLE ${tempName} RENAME TO ${tableName};
+          `);
+          for (const idx of existingIndexes) {
+            if (idx?.sql) {
+              try {
+                targetDb.exec(idx.sql);
+              } catch (idxErr) {
+                recordMigrationError(`${tableName}:recreate_index`, idxErr);
+              }
+            }
+          }
+        })();
+      } finally {
+        if (fkWasOn) targetDb.pragma('foreign_keys = ON');
+      }
+    } catch (err) {
+      recordMigrationError(`${tableName}:drop_unexpected_fk`, err);
+    }
+  };
+
+  rebuildTableWithoutTrackFk('daily_track_challenges', (tmp) => `
+    CREATE TABLE ${tmp} (
+      id TEXT PRIMARY KEY,
+      challenge_date TEXT NOT NULL UNIQUE,
+      track_id TEXT NOT NULL,
+      track_source TEXT NOT NULL DEFAULT 'track',
+      snippet_start_seconds INTEGER NOT NULL DEFAULT 0,
+      snippet_start_ratio REAL NOT NULL DEFAULT 0,
+      snippet_duration_seconds INTEGER NOT NULL DEFAULT 5,
+      options_json TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+
+  rebuildTableWithoutTrackFk('daily_track_attempts', (tmp) => `
+    CREATE TABLE ${tmp} (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      challenge_date TEXT NOT NULL,
+      track_id TEXT NOT NULL,
+      selected_track_id TEXT NOT NULL,
+      is_correct INTEGER NOT NULL DEFAULT 0,
+      score INTEGER NOT NULL DEFAULT 0,
+      xp_earned INTEGER NOT NULL DEFAULT 0,
+      time_spent INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(user_id, challenge_date)
+    );
+  `);
+
+  rebuildTableWithoutTrackFk('daily_mini_game_attempts', (tmp) => `
+    CREATE TABLE ${tmp} (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      game_id TEXT NOT NULL,
+      cycle_id TEXT NOT NULL,
+      is_correct INTEGER NOT NULL DEFAULT 0,
+      score INTEGER NOT NULL DEFAULT 0,
+      xp_earned INTEGER NOT NULL DEFAULT 0,
+      selected_value TEXT,
+      correct_value TEXT,
+      details_json TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(user_id, game_id, cycle_id)
+    );
+  `);
+
+  rebuildTableWithoutTrackFk('game_completions', (tmp) => `
+    CREATE TABLE ${tmp} (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      game_type TEXT NOT NULL,
+      cycle_id TEXT NOT NULL,
+      is_correct INTEGER NOT NULL DEFAULT 0,
+      score INTEGER NOT NULL DEFAULT 0,
+      xp_earned INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(user_id, game_type, cycle_id)
+    );
+  `);
+
+  rebuildTableWithoutTrackFk('quiz_attempts', (tmp) => `
+    CREATE TABLE ${tmp} (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      challenge_date TEXT NOT NULL,
+      score INTEGER NOT NULL,
+      xp_earned INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(user_id, challenge_date)
+    );
+  `);
+
   ensureColumn('daily_track_challenges', 'track_source', "TEXT NOT NULL DEFAULT 'track'");
   ensureColumn('daily_track_challenges', 'snippet_start_ratio', 'REAL NOT NULL DEFAULT 0');
   ensureColumn('daily_track_challenges', 'snippet_duration_seconds', 'INTEGER NOT NULL DEFAULT 5');
+
+  try {
+    targetDb.exec(`
+      INSERT OR IGNORE INTO app_meta (key, value) VALUES
+        ('quiz_enabled', '1'),
+        ('active_quiz_ids', '[]');
+    `);
+  } catch (err) {
+    recordMigrationError('app_meta:quiz_defaults', err);
+  }
 
   ensureColumn('post_categories', 'is_official', 'INTEGER NOT NULL DEFAULT 0');
 

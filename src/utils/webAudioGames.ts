@@ -7,8 +7,17 @@
  * - Caches decoded AudioBuffers in memory so replays are instantaneous.
  */
 
+export const AUDIO_CHUNK_SIZE_BYTES = 1572864; // 1.5 MiB per request (well below Vercel 4.5 MB cap)
+export const AUDIO_MAX_DOWNLOAD_BYTES = 4 * 1024 * 1024; // 4 MiB ceiling for huge files
+
+interface CachedAudioEntry {
+  raw: ArrayBuffer;
+  ctx?: AudioContext;
+  decoded?: AudioBuffer;
+}
+
 let sharedAudioCtx: AudioContext | null = null;
-const decodedBufferCache = new Map<string, AudioBuffer>();
+const audioCache = new Map<string, CachedAudioEntry>();
 const MAX_CACHE_ENTRIES = 6;
 
 export interface ActiveAudioPlayback {
@@ -16,10 +25,16 @@ export interface ActiveAudioPlayback {
   durationSeconds: number;
 }
 
+export interface UnlockedAudioContextResult {
+  ctx: AudioContext;
+  resumePromise: Promise<void>;
+}
+
 /**
  * Must be called synchronously inside a user click/tap handler (critical for iPhone/iOS Safari).
+ * Triggers a silent 1-sample node + ctx.resume() inside the gesture stack so Web Audio unlocks reliably.
  */
-export function unlockAudioContext(): AudioContext {
+export function unlockAudioContextWithResume(): UnlockedAudioContextResult {
   const Ctor =
     window.AudioContext ||
     (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
@@ -29,23 +44,56 @@ export function unlockAudioContext(): AudioContext {
   if (!sharedAudioCtx || sharedAudioCtx.state === 'closed') {
     sharedAudioCtx = new Ctor();
   }
-  if (sharedAudioCtx.state === 'suspended') {
-    // Trigger resume synchronously inside the click gesture
-    sharedAudioCtx.resume().catch(() => {});
-  }
-  return sharedAudioCtx;
+  const ctx = sharedAudioCtx;
+
+  // iOS Safari unlock: play an inaudible 1-sample buffer synchronously inside the user gesture
+  try {
+    const silentBuffer = ctx.createBuffer(1, 1, 22050);
+    const silentSource = ctx.createBufferSource();
+    silentSource.buffer = silentBuffer;
+    silentSource.connect(ctx.destination);
+    silentSource.start(0);
+  } catch {}
+
+  const resumePromise =
+    ctx.state === 'suspended' ? ctx.resume().catch(() => {}) : Promise.resolve();
+
+  return { ctx, resumePromise };
 }
 
-function normalizeSameOriginUrl(rawUrl: string): string {
+export function unlockAudioContext(): AudioContext {
+  return unlockAudioContextWithResume().ctx;
+}
+
+export async function closeWebAudioContext(): Promise<void> {
+  const ctx = sharedAudioCtx;
+  sharedAudioCtx = null;
+  for (const entry of audioCache.values()) {
+    if (entry.ctx === ctx) {
+      entry.ctx = undefined;
+      entry.decoded = undefined;
+    }
+  }
+  if (ctx && ctx.state !== 'closed') {
+    try {
+      await ctx.close();
+    } catch {}
+  }
+}
+
+export function normalizeSameOriginUrl(rawUrl: string): string {
   const trimmed = (rawUrl || '').trim();
   if (!trimmed) throw new Error('Аудиофайл недоступен.');
   if (trimmed.startsWith('/uploads/') || trimmed.startsWith('/audio/')) {
     return trimmed;
   }
-  // If an absolute URL points to our own origin, keep its path
+  const baseOrigin =
+    typeof window !== 'undefined' && window.location?.origin
+      ? window.location.origin
+      : 'http://localhost';
   try {
-    const parsed = new URL(trimmed, window.location.origin);
-    if (parsed.origin === window.location.origin) {
+    const parsed = new URL(trimmed, baseOrigin);
+    if (parsed.origin === baseOrigin) {
       return `${parsed.pathname}${parsed.search}`;
     }
     // Proxy Supabase Storage media URLs through same-origin /uploads/<file>
@@ -74,32 +122,136 @@ function decodeAudioDataCompat(ctx: AudioContext, arrayBuffer: ArrayBuffer): Pro
   });
 }
 
-export async function fetchAndDecodeAudio(url: string, ctx: AudioContext): Promise<AudioBuffer> {
-  const safeUrl = normalizeSameOriginUrl(url);
-  const cached = decodedBufferCache.get(safeUrl);
-  if (cached) return cached;
-
-  const response = await fetch(safeUrl, {
-    method: 'GET',
-    credentials: 'same-origin',
-  });
-  if (!response.ok) {
-    throw new Error(`Не удалось загрузить аудио (${response.status}).`);
+/**
+ * Downloads audio via sequential 1.5 MB HTTP Range chunks (capped at 4 MB for large files),
+ * staying safely below Vercel's 4.5 MB Serverless payload limit.
+ */
+export async function fetchAudioBufferInChunks(
+  url: string,
+  options?: {
+    signal?: AbortSignal;
+    fetchImpl?: typeof fetch;
+    chunkSizeBytes?: number;
+    maxDownloadBytes?: number;
   }
-  const arrayBuffer = await response.arrayBuffer();
-  if (!arrayBuffer || arrayBuffer.byteLength < 64) {
+): Promise<ArrayBuffer> {
+  const safeUrl = normalizeSameOriginUrl(url);
+  const fetchFn = options?.fetchImpl || fetch;
+  const signal = options?.signal;
+  const chunkSize = Math.max(1024, options?.chunkSizeBytes || AUDIO_CHUNK_SIZE_BYTES);
+  const maxBytes = Math.max(chunkSize, options?.maxDownloadBytes || AUDIO_MAX_DOWNLOAD_BYTES);
+
+  const chunks: Uint8Array[] = [];
+  let offset = 0;
+  let totalReceived = 0;
+
+  while (offset < maxBytes) {
+    if (signal?.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+
+    const end = Math.min(offset + chunkSize - 1, maxBytes - 1);
+    const requestedLength = end - offset + 1;
+    const response = await fetchFn(safeUrl, {
+      method: 'GET',
+      credentials: 'same-origin',
+      headers: {
+        Range: `bytes=${offset}-${end}`,
+      },
+      signal,
+    });
+
+    if (response.status === 416) {
+      if (chunks.length > 0) break;
+      throw new Error('Аудиофайл не найден или пуст.');
+    }
+
+    if (response.status === 200) {
+      const fullBuffer = await response.arrayBuffer();
+      if (!fullBuffer || fullBuffer.byteLength < 64) {
+        throw new Error('Аудиофайл пуст или повреждён.');
+      }
+      if (chunks.length === 0) {
+        return fullBuffer;
+      }
+      break;
+    }
+
+    if (!response.ok) {
+      throw new Error(`Не удалось загрузить аудио (${response.status}).`);
+    }
+
+    const contentRange = response.headers.get('content-range') || '';
+    const crMatch = /bytes\s+(\d+)-(\d+)\/(\d+|\*)/i.exec(contentRange);
+    const totalFileBytes = crMatch && crMatch[3] !== '*' ? Number(crMatch[3]) : null;
+
+    const chunkBuffer = await response.arrayBuffer();
+    const chunkBytes = new Uint8Array(chunkBuffer);
+    if (chunkBytes.byteLength === 0) {
+      break;
+    }
+
+    chunks.push(chunkBytes);
+    totalReceived += chunkBytes.byteLength;
+    offset += chunkBytes.byteLength;
+
+    if (totalFileBytes !== null && offset >= totalFileBytes) {
+      break;
+    }
+    if (totalFileBytes === null && chunkBytes.byteLength < requestedLength) {
+      break;
+    }
+  }
+
+  if (totalReceived < 64) {
     throw new Error('Аудиофайл пуст или повреждён.');
   }
 
-  // Clone buffer before decoding because decodeAudioData detaches the ArrayBuffer
-  const copy = arrayBuffer.slice(0);
-  const decoded = await decodeAudioDataCompat(ctx, copy);
-
-  if (decodedBufferCache.size >= MAX_CACHE_ENTRIES) {
-    const oldestKey = decodedBufferCache.keys().next().value;
-    if (oldestKey) decodedBufferCache.delete(oldestKey);
+  const merged = new Uint8Array(totalReceived);
+  let writeOffset = 0;
+  for (const part of chunks) {
+    merged.set(part, writeOffset);
+    writeOffset += part.byteLength;
   }
-  decodedBufferCache.set(safeUrl, decoded);
+  return merged.buffer;
+}
+
+export async function fetchAndDecodeAudio(
+  url: string,
+  ctx: AudioContext,
+  signal?: AbortSignal
+): Promise<AudioBuffer> {
+  const safeUrl = normalizeSameOriginUrl(url);
+  const existing = audioCache.get(safeUrl);
+  if (existing?.decoded && existing.ctx === ctx && ctx.state !== 'closed') {
+    return existing.decoded;
+  }
+
+  let rawBuffer = existing?.raw;
+  if (!rawBuffer) {
+    rawBuffer = await fetchAudioBufferInChunks(safeUrl, { signal });
+    if (audioCache.size >= MAX_CACHE_ENTRIES) {
+      const oldestKey = audioCache.keys().next().value;
+      if (oldestKey) audioCache.delete(oldestKey);
+    }
+    audioCache.set(safeUrl, { raw: rawBuffer });
+  }
+
+  if (signal?.aborted) {
+    throw new DOMException('Aborted', 'AbortError');
+  }
+
+  let decoded: AudioBuffer;
+  try {
+    // Clone buffer before decoding because decodeAudioData detaches the ArrayBuffer
+    const copy = rawBuffer.slice(0);
+    decoded = await decodeAudioDataCompat(ctx, copy);
+  } catch (err: any) {
+    if (err?.name === 'AbortError') throw err;
+    throw new Error('Не удалось декодировать аудиофайл. Попробуйте ещё раз.');
+  }
+
+  audioCache.set(safeUrl, { raw: rawBuffer, ctx, decoded });
   return decoded;
 }
 

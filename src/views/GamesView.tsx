@@ -9,10 +9,10 @@ import { dispatchAchievementUnlocked } from '../components/AchievementToast.js';
 import { safeJson, getStreakBonusPercent } from '../utils/logic.js';
 import { formatHandle, renderEquippedBadge, renderEquippedTitle } from '../utils/cosmetics.js';
 import {
-  unlockAudioContext,
+  unlockAudioContextWithResume,
+  closeWebAudioContext,
   fetchAndDecodeAudio,
   playReversedSnippet,
-  playSpeedSnippet,
   type ActiveAudioPlayback,
 } from '../utils/webAudioGames.js';
 import confetti from 'canvas-confetti';
@@ -265,6 +265,18 @@ export const GamesView: React.FC = () => {
   const [speedError, setSpeedError] = useState<string | null>(null);
 
   const webAudioPlaybackRef = useRef<ActiveAudioPlayback | null>(null);
+  const reverseAbortRef = useRef<AbortController | null>(null);
+  const reverseRequestIdRef = useRef<number>(0);
+
+  const speedAudioRef = useRef<HTMLAudioElement | null>(null);
+  const speedTimerRef = useRef<number | null>(null);
+  const speedBoundsRef = useRef<{
+    start: number;
+    sourceDur: number;
+    listenDur: number;
+    rate: 0.5 | 2.5;
+  }>({ start: 0, sourceDur: 2.5, listenDur: 5, rate: 0.5 });
+
   const autoReloadedCycleRef = useRef<Record<string, string>>({});
 
   // -------------------------------------------------------------------------
@@ -281,6 +293,15 @@ export const GamesView: React.FC = () => {
     return () => window.clearInterval(id);
   }, []);
 
+  const abortReverseFetch = useCallback(() => {
+    if (reverseAbortRef.current) {
+      reverseAbortRef.current.abort();
+      reverseAbortRef.current = null;
+    }
+    reverseRequestIdRef.current += 1;
+    setReverseAudioDecoding(false);
+  }, []);
+
   const stopWebAudioPlayback = useCallback(() => {
     if (webAudioPlaybackRef.current) {
       webAudioPlaybackRef.current.stop();
@@ -288,9 +309,38 @@ export const GamesView: React.FC = () => {
     }
     setReversePlaying(false);
     setReverseElapsed(0);
+  }, []);
+
+  const stopSpeedPlayback = useCallback((resetToStart = true) => {
+    if (speedTimerRef.current !== null) {
+      window.clearInterval(speedTimerRef.current);
+      speedTimerRef.current = null;
+    }
+    const audio = speedAudioRef.current;
+    if (audio) {
+      audio.pause();
+      if (resetToStart) {
+        try {
+          audio.currentTime = speedBoundsRef.current.start;
+        } catch {}
+      }
+    }
+    setSpeedAudioDecoding(false);
     setSpeedPlaying(false);
     setSpeedElapsed(0);
   }, []);
+
+  const destroySpeedAudio = useCallback(() => {
+    stopSpeedPlayback(false);
+    if (speedAudioRef.current) {
+      speedAudioRef.current.onended = null;
+      speedAudioRef.current.onerror = null;
+      speedAudioRef.current.ontimeupdate = null;
+      speedAudioRef.current.onloadedmetadata = null;
+      speedAudioRef.current.src = '';
+      speedAudioRef.current = null;
+    }
+  }, [stopSpeedPlayback]);
 
   const stopSnippetPlayback = useCallback((resetToStart = true) => {
     if (snippetTimerRef.current !== null) {
@@ -451,6 +501,7 @@ export const GamesView: React.FC = () => {
     setReverseResult(null);
     setReverseCompleted(false);
     setSelectedReverseOption(null);
+    abortReverseFetch();
     stopWebAudioPlayback();
 
     try {
@@ -483,7 +534,7 @@ export const GamesView: React.FC = () => {
     } finally {
       setReverseLoading(false);
     }
-  }, [stopWebAudioPlayback, user]);
+  }, [abortReverseFetch, stopWebAudioPlayback, user]);
 
   const loadSpeedRound = useCallback(async () => {
     setSpeedLoading(true);
@@ -491,14 +542,22 @@ export const GamesView: React.FC = () => {
     setSpeedResult(null);
     setSpeedCompleted(false);
     setSelectedSpeedOption(null);
-    stopWebAudioPlayback();
+    destroySpeedAudio();
 
     try {
       const res = await authFetch('/api/games/speed-track/round', { cache: 'no-store' });
       const data = await safeJson<DailyTrackRound & { error?: string }>(res, null as any);
       if (res.ok && data) {
+        const rate: 0.5 | 2.5 = data.speed_mode === 2.5 ? 2.5 : 0.5;
+        const listenDur = Math.min(5, Math.max(1, Number(data.snippet_duration) || 5));
+        speedBoundsRef.current = {
+          start: Math.max(0, Number(data.snippet_start) || 0),
+          sourceDur: listenDur * rate,
+          listenDur,
+          rate,
+        };
         setSpeedRound(data);
-        setSpeedDuration(Math.min(5, Math.max(1, Number(data.snippet_duration) || 5)));
+        setSpeedDuration(listenDur);
         if (data.completed || data.already_completed) {
           setSpeedCompleted(true);
           if (data.previous_attempt) {
@@ -523,7 +582,7 @@ export const GamesView: React.FC = () => {
     } finally {
       setSpeedLoading(false);
     }
-  }, [stopWebAudioPlayback, user]);
+  }, [destroySpeedAudio, user]);
 
   const loadLeaderboard = useCallback(async (tf: 'all' | 'weekly' | 'monthly', game: LeaderboardGameFilter) => {
     setLeadersLoading(true);
@@ -545,7 +604,12 @@ export const GamesView: React.FC = () => {
 
   useEffect(() => {
     stopSnippetPlayback(false);
+    stopSpeedPlayback(false);
+    abortReverseFetch();
     stopWebAudioPlayback();
+    if (activeTab !== 'reverse') {
+      closeWebAudioContext().catch(() => {});
+    }
 
     if (activeTab === 'guess') loadGuessRound();
     else if (activeTab === 'quiz') loadDailyQuiz();
@@ -556,6 +620,8 @@ export const GamesView: React.FC = () => {
 
     return () => {
       stopSnippetPlayback(false);
+      stopSpeedPlayback(false);
+      abortReverseFetch();
       stopWebAudioPlayback();
     };
   }, [activeTab, user?.id]);
@@ -577,9 +643,12 @@ export const GamesView: React.FC = () => {
     return () => {
       window.removeEventListener('open-games-tab', handleOpenGamesTab);
       destroySnippetAudio();
+      destroySpeedAudio();
+      abortReverseFetch();
       stopWebAudioPlayback();
+      closeWebAudioContext().catch(() => {});
     };
-  }, [destroySnippetAudio, stopWebAudioPlayback]);
+  }, [abortReverseFetch, destroySnippetAudio, destroySpeedAudio, stopWebAudioPlayback]);
 
   // Auto-reload active tab when the 12-hour MSK reset boundary passes
   useEffect(() => {
@@ -711,7 +780,7 @@ export const GamesView: React.FC = () => {
     }
   };
 
-  // Reverse Track Web Audio handler (unlocks AudioContext synchronously inside click for iOS Safari)
+  // Reverse Track Web Audio handler (synchronously unlocks AudioContext inside tap & loads via 1.5MB Range chunks)
   const toggleReverseAudio = async () => {
     if (!reverseRound) return;
     setReverseError(null);
@@ -721,19 +790,33 @@ export const GamesView: React.FC = () => {
     }
 
     let ctx: AudioContext;
+    let resumePromise: Promise<void>;
     try {
-      ctx = unlockAudioContext();
+      const unlocked = unlockAudioContextWithResume();
+      ctx = unlocked.ctx;
+      resumePromise = unlocked.resumePromise;
     } catch (err: any) {
       setReverseError(err?.message || 'Web Audio API недоступен в этом браузере.');
       return;
     }
 
+    abortReverseFetch();
+    const controller = new AbortController();
+    reverseAbortRef.current = controller;
+    const reqId = ++reverseRequestIdRef.current;
+
     setReverseAudioDecoding(true);
     try {
+      await resumePromise;
+      if (controller.signal.aborted || reqId !== reverseRequestIdRef.current) return;
+
+      const buffer = await fetchAndDecodeAudio(reverseRound.audio_url, ctx, controller.signal);
+      if (controller.signal.aborted || reqId !== reverseRequestIdRef.current) return;
+
       if (ctx.state === 'suspended') {
-        await ctx.resume();
+        await ctx.resume().catch(() => {});
       }
-      const buffer = await fetchAndDecodeAudio(reverseRound.audio_url, ctx);
+
       stopWebAudioPlayback();
       const handle = playReversedSnippet({
         ctx,
@@ -755,64 +838,141 @@ export const GamesView: React.FC = () => {
       setReverseDuration(handle.durationSeconds);
       setReversePlaying(true);
     } catch (err: any) {
+      if (err?.name === 'AbortError' || controller.signal.aborted) {
+        return;
+      }
       stopWebAudioPlayback();
       setReverseError(err?.message || 'Не удалось воспроизвести реверс-фрагмент.');
     } finally {
-      setReverseAudioDecoding(false);
+      if (reverseRequestIdRef.current === reqId) {
+        reverseAbortRef.current = null;
+        setReverseAudioDecoding(false);
+      }
     }
   };
 
-  // Speed Track 0.5x / 2.5x Web Audio handler (unlocks AudioContext synchronously inside click for iOS Safari)
-  const toggleSpeedAudio = async () => {
+  // Speed Track 0.5x / 2.5x via native HTML5 <audio> Range streaming (zero 4.5MB limit issues & rock-solid on iOS Safari)
+  const applySpeedAudioProperties = (audio: HTMLAudioElement, rate: 0.5 | 2.5) => {
+    audio.defaultPlaybackRate = rate;
+    audio.playbackRate = rate;
+    const pitchTarget = audio as unknown as {
+      preservesPitch?: boolean;
+      webkitPreservesPitch?: boolean;
+      mozPreservesPitch?: boolean;
+    };
+    if ('preservesPitch' in pitchTarget) pitchTarget.preservesPitch = false;
+    if ('webkitPreservesPitch' in pitchTarget) pitchTarget.webkitPreservesPitch = false;
+    if ('mozPreservesPitch' in pitchTarget) pitchTarget.mozPreservesPitch = false;
+  };
+
+  const computeEffectiveSpeedBounds = (
+    audio: HTMLAudioElement,
+    round: DailyTrackRound,
+    rate: 0.5 | 2.5
+  ) => {
+    const targetListenDur = Math.min(5, Math.max(1, Number(round.snippet_duration) || 5));
+    const neededSourceSec = targetListenDur * rate;
+    const realDur = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 0;
+
+    if (realDur <= 0) {
+      return {
+        start: Math.max(0, Number(round.snippet_start) || 0),
+        sourceDur: neededSourceSec,
+        listenDur: targetListenDur,
+        rate,
+      };
+    }
+
+    const actualSourceSec = Math.min(realDur, neededSourceSec);
+    const actualListenDur = Math.max(0.5, actualSourceSec / rate);
+    let start = Math.max(0, Number(round.snippet_start) || 0);
+    if (start + actualSourceSec > realDur) {
+      const maxStart = Math.max(0, realDur - actualSourceSec);
+      const ratio = Number.isFinite(Number(round.snippet_start_ratio))
+        ? Math.max(0, Math.min(0.999999, Number(round.snippet_start_ratio)))
+        : 0.25;
+      start = Math.max(0, Math.min(maxStart, Math.floor(maxStart * ratio)));
+    }
+    return { start, sourceDur: actualSourceSec, listenDur: actualListenDur, rate };
+  };
+
+  const toggleSpeedAudio = () => {
     if (!speedRound) return;
     setSpeedError(null);
     if (speedPlaying) {
-      stopWebAudioPlayback();
-      return;
-    }
-
-    let ctx: AudioContext;
-    try {
-      ctx = unlockAudioContext();
-    } catch (err: any) {
-      setSpeedError(err?.message || 'Web Audio API недоступен в этом браузере.');
+      stopSpeedPlayback(true);
       return;
     }
 
     const rate: 0.5 | 2.5 = speedRound.speed_mode === 2.5 ? 2.5 : 0.5;
-    setSpeedAudioDecoding(true);
-    try {
-      if (ctx.state === 'suspended') {
-        await ctx.resume();
-      }
-      const buffer = await fetchAndDecodeAudio(speedRound.audio_url, ctx);
-      stopWebAudioPlayback();
-      const handle = playSpeedSnippet({
-        ctx,
-        buffer,
-        snippetStart: speedRound.snippet_start,
-        snippetStartRatio: speedRound.snippet_start_ratio,
-        playbackRate: rate,
-        listenDurationSeconds: 5,
-        onProgress: (elapsed, total) => {
-          setSpeedElapsed(elapsed);
-          setSpeedDuration(total);
-        },
-        onEnded: () => {
-          webAudioPlaybackRef.current = null;
-          setSpeedPlaying(false);
-          setSpeedElapsed(0);
-        },
-      });
-      webAudioPlaybackRef.current = handle;
-      setSpeedDuration(handle.durationSeconds);
-      setSpeedPlaying(true);
-    } catch (err: any) {
-      stopWebAudioPlayback();
-      setSpeedError(err?.message || 'Не удалось воспроизвести ускоренный/замедленный фрагмент.');
-    } finally {
-      setSpeedAudioDecoding(false);
+    let audio = speedAudioRef.current;
+    const resolvedTargetSrc = new URL(speedRound.audio_url, window.location.origin).href;
+    if (!audio || audio.src !== resolvedTargetSrc) {
+      destroySpeedAudio();
+      audio = new Audio(speedRound.audio_url);
+      audio.preload = 'metadata';
+      (audio as unknown as { playsInline?: boolean }).playsInline = true;
+      audio.setAttribute('playsinline', '');
+      speedAudioRef.current = audio;
     }
+
+    const enforceSpeedBounds = () => {
+      if (!audio) return;
+      const { start, sourceDur, listenDur, rate: activeRate } = speedBoundsRef.current;
+      const end = start + sourceDur;
+      const mediaElapsed = Math.max(0, (audio.currentTime - start) / activeRate);
+      if (audio.currentTime >= end - 0.04 || mediaElapsed >= listenDur - 0.04) {
+        stopSpeedPlayback(true);
+        return;
+      }
+      setSpeedElapsed(Math.min(listenDur, mediaElapsed));
+    };
+
+    const syncBoundsAndSeek = () => {
+      if (!audio) return;
+      const bounds = computeEffectiveSpeedBounds(audio, speedRound, rate);
+      speedBoundsRef.current = bounds;
+      setSpeedDuration(bounds.listenDur);
+      applySpeedAudioProperties(audio, rate);
+      if (audio.readyState >= 1 && Math.abs(audio.currentTime - bounds.start) > 0.25) {
+        try {
+          audio.currentTime = bounds.start;
+        } catch {}
+      }
+    };
+
+    audio.onloadedmetadata = syncBoundsAndSeek;
+    audio.onplaying = () => {
+      if (!audio) return;
+      applySpeedAudioProperties(audio, rate);
+      setSpeedAudioDecoding(false);
+    };
+    audio.ontimeupdate = enforceSpeedBounds;
+    audio.onended = () => stopSpeedPlayback(true);
+    audio.onerror = () => {
+      stopSpeedPlayback(false);
+      setSpeedError('Не удалось загрузить или воспроизвести аудиофайл.');
+    };
+
+    syncBoundsAndSeek();
+    setSpeedAudioDecoding(true);
+
+    // Call play() synchronously inside click gesture so iOS Safari unlocks HTML5 Audio immediately
+    audio
+      .play()
+      .then(() => {
+        if (!audio) return;
+        syncBoundsAndSeek();
+        setSpeedAudioDecoding(false);
+        setSpeedPlaying(true);
+        setSpeedElapsed(0);
+        if (speedTimerRef.current !== null) window.clearInterval(speedTimerRef.current);
+        speedTimerRef.current = window.setInterval(enforceSpeedBounds, 50);
+      })
+      .catch(() => {
+        stopSpeedPlayback(false);
+        setSpeedError('Браузер заблокировал воспроизведение или файл недоступен.');
+      });
   };
 
   // -------------------------------------------------------------------------
@@ -1039,7 +1199,7 @@ export const GamesView: React.FC = () => {
     setSpeedSubmitting(true);
     setSpeedError(null);
     setSelectedSpeedOption(selectedId);
-    stopWebAudioPlayback();
+    stopSpeedPlayback(true);
 
     try {
       const res = await authFetch('/api/games/speed-track/verify', {
@@ -2051,7 +2211,7 @@ export const GamesView: React.FC = () => {
                       <span>{speedElapsed.toFixed(1)}s</span>
                       <span>
                         {speedAudioDecoding
-                          ? 'Декодирование аудио...'
+                          ? 'Буферизация фрагмента...'
                           : speedPlaying
                             ? `Играет в ${speedRound.speed_mode === 2.5 ? '2.5x' : '0.5x'}...`
                             : '5 секунд звучания'}

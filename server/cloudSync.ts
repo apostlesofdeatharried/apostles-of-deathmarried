@@ -578,6 +578,14 @@ export async function fetchMediaFromSupabase(
       `${baseUrl}/storage/v1/object/${encodeURIComponent(bucketName)}/${encodeObjectPath(objectPath)}`,
       { method: 'GET', headers }
     );
+    if (res.status === 416) {
+      return {
+        status: 416,
+        contentType: 'text/plain',
+        contentRange: res.headers.get('content-range') || undefined,
+        body: Buffer.alloc(0),
+      };
+    }
     if (!res.ok && res.status !== 206) {
       return null;
     }
