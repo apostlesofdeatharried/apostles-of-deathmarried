@@ -1,10 +1,17 @@
 import crypto from 'crypto';
-import { serializeDatabase, replaceDatabaseWithBuffer, getDbPath } from './db.js';
+import {
+  serializeDatabase,
+  replaceDatabaseWithBuffer,
+  getDbPath,
+  didDatabaseExistOnBoot,
+  checkpointDatabase,
+} from './db.js';
 import { transliterateToAsciiSlug } from '../src/utils/logic.js';
 
 const DEFAULT_BUCKET_NAME = 'apostles-archive-persistence';
 const DB_OBJECT_PATH = 'db/apostles.db';
 const MEDIA_OBJECT_PREFIX = 'media';
+const SUPABASE_STARTUP_TIMEOUT_MS = 4000;
 
 export interface SyncPullResult {
   updated: boolean;
@@ -120,7 +127,7 @@ export async function ensureBucketExists(): Promise<void> {
       method: 'GET',
       headers: getSupabaseHeaders('application/json'),
       cache: 'no-store',
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(SUPABASE_STARTUP_TIMEOUT_MS),
     });
     if (checkRes.ok) {
       bucketEnsured = true;
@@ -136,7 +143,7 @@ export async function ensureBucketExists(): Promise<void> {
           public: false,
           file_size_limit: 104857600, // 100 MB
         }),
-        signal: AbortSignal.timeout(8000),
+        signal: AbortSignal.timeout(SUPABASE_STARTUP_TIMEOUT_MS),
       });
       if (createRes.ok || createRes.status === 409) {
         bucketEnsured = true;
@@ -163,6 +170,7 @@ async function uploadCurrentDatabaseInternal(): Promise<SyncPushResult> {
 
   let buffer: Buffer;
   try {
+    checkpointDatabase();
     buffer = hooks.serializeDb();
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Failed to serialize SQLite database';
@@ -269,7 +277,7 @@ async function pullDatabaseFromSupabaseInternal(options: {
         Pragma: 'no-cache',
       },
       cache: 'no-store',
-      signal: AbortSignal.timeout(10000),
+      signal: AbortSignal.timeout(SUPABASE_STARTUP_TIMEOUT_MS),
     });
 
     if (res.ok) {
@@ -348,14 +356,33 @@ export async function syncCloudDatabase(options: {
 }
 
 /**
- * Restores the latest SQLite snapshot from Supabase Storage on cold start (read-only).
+ * Restores the latest SQLite snapshot from Supabase Storage ONLY on cold start
+ * (when the local DB file did not exist yet in `/tmp` or `data/`), with a strict
+ * 4-second timeout so startup falls back to local DB immediately if cloud is unreachable.
  */
 export async function ensureCloudDatabaseRestored(): Promise<void> {
-  if (initialRestoreCompleted || !isSupabaseConfigured()) {
+  if (initialRestoreCompleted || !isSupabaseConfigured() || didDatabaseExistOnBoot()) {
     initialRestoreCompleted = true;
     return;
   }
-  await syncCloudDatabase({ force: true });
+
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      syncCloudDatabase({ force: true }),
+      new Promise<void>((resolve) => {
+        timeoutId = setTimeout(() => {
+          console.warn(
+            `[CloudSync] Cold-start restore timed out after ${SUPABASE_STARTUP_TIMEOUT_MS}ms — continuing on local database`
+          );
+          resolve();
+        }, SUPABASE_STARTUP_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
+    initialRestoreCompleted = true;
+  }
 }
 
 /**

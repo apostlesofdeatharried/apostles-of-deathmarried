@@ -8,7 +8,11 @@ const bundledDbPath = path.resolve(process.cwd(), 'data', 'apostles.db');
 
 function resolveWritableDbPath(): string {
   if (isVercel) {
-    const tmpDbPath = path.join('/tmp', 'apostles.db');
+    const tmpDir = '/tmp';
+    if (!fs.existsSync(tmpDir)) {
+      fs.mkdirSync(tmpDir, { recursive: true });
+    }
+    const tmpDbPath = path.join(tmpDir, 'apostles.db');
     if (!fs.existsSync(tmpDbPath) && fs.existsSync(bundledDbPath)) {
       try {
         fs.copyFileSync(bundledDbPath, tmpDbPath);
@@ -21,13 +25,12 @@ function resolveWritableDbPath(): string {
 
   const dbDir = path.resolve(process.cwd(), 'data');
   try {
-    if (!fs.existsSync(dbDir)) {
-      fs.mkdirSync(dbDir, { recursive: true });
-    }
+    fs.mkdirSync(dbDir, { recursive: true });
     return path.join(dbDir, 'apostles.db');
   } catch {
     // Fallback to /tmp if current directory is read-only
     const tmpDbPath = path.join('/tmp', 'apostles.db');
+    fs.mkdirSync(path.dirname(tmpDbPath), { recursive: true });
     if (!fs.existsSync(tmpDbPath) && fs.existsSync(bundledDbPath)) {
       try {
         fs.copyFileSync(bundledDbPath, tmpDbPath);
@@ -38,8 +41,10 @@ function resolveWritableDbPath(): string {
 }
 
 const activeDbPath = resolveWritableDbPath();
+const dbExistedBeforeBoot = fs.existsSync(activeDbPath);
 
 function openConfiguredDatabase(dbPath: string): Database.Database {
+  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   const instance = new Database(dbPath);
   try {
     instance.pragma('busy_timeout = 5000');
@@ -71,6 +76,10 @@ export function getDbPath(): string {
   return activeDbPath;
 }
 
+export function didDatabaseExistOnBoot(): boolean {
+  return dbExistedBeforeBoot;
+}
+
 export function checkpointDatabase(): void {
   try {
     currentDb.pragma('wal_checkpoint(TRUNCATE)');
@@ -88,6 +97,9 @@ export function closeDatabase(): void {
 }
 
 export function serializeDatabase(): Buffer {
+  try {
+    currentDb.pragma('wal_checkpoint(TRUNCATE)');
+  } catch {}
   checkpointDatabase();
   return currentDb.serialize();
 }
@@ -586,6 +598,18 @@ export function ensureSchemaAndMigrations() {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_notifications_user_read ON notifications(user_id, is_read, created_at);
+
+    CREATE TABLE IF NOT EXISTS site_news (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      message TEXT NOT NULL,
+      link TEXT NOT NULL DEFAULT '/',
+      sent_count INTEGER NOT NULL DEFAULT 0,
+      author_id TEXT,
+      author_nickname TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_site_news_created ON site_news(created_at DESC);
   `);
 
   // Safe additive column migration helper (checks PRAGMA table_info before ALTER TABLE)
@@ -613,26 +637,41 @@ export function ensureSchemaAndMigrations() {
   ensureColumn('profiles', 'username_changed_at', 'TEXT');
   ensureColumn('profiles', 'privacy_settings', 'TEXT');
   ensureColumn('profiles', 'favorite_track', 'TEXT');
+  ensureColumn('profiles', 'notify_follows', 'INTEGER NOT NULL DEFAULT 1');
+  ensureColumn('profiles', 'notify_news', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('tracks', 'is_game_eligible', 'INTEGER NOT NULL DEFAULT 1');
   ensureColumn('singles', 'is_game_eligible', 'INTEGER NOT NULL DEFAULT 1');
   try { db.exec("ALTER TABLE post_categories ADD COLUMN is_official INTEGER NOT NULL DEFAULT 0;"); } catch {}
   try { db.exec("ALTER TABLE posts ADD COLUMN status TEXT NOT NULL DEFAULT 'approved';"); } catch {}
   try { db.exec("ALTER TABLE posts ADD COLUMN rejection_reason TEXT;"); } catch {}
+  ensureColumn('posts', 'xp_awarded', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('posts', 'xp_awarded_amount', 'INTEGER NOT NULL DEFAULT 0');
   try { db.exec("ALTER TABLE comments ADD COLUMN parent_id TEXT;"); } catch {}
   try { db.exec("ALTER TABLE comments ADD COLUMN status TEXT NOT NULL DEFAULT 'approved';"); } catch {}
   ensureColumn('comments', 'album_id', 'TEXT');
   ensureColumn('comments', 'single_id', 'TEXT');
   ensureColumn('comments', 'is_hidden', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('comments', 'xp_awarded', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('comments', 'xp_awarded_amount', 'INTEGER NOT NULL DEFAULT 0');
   try { db.exec("CREATE INDEX IF NOT EXISTS idx_comments_album ON comments(album_id);"); } catch {}
   try { db.exec("CREATE INDEX IF NOT EXISTS idx_comments_single ON comments(single_id);"); } catch {}
+  ensureColumn('creations', 'category', "TEXT DEFAULT 'art'");
   try { db.exec("ALTER TABLE creations ADD COLUMN status TEXT NOT NULL DEFAULT 'approved';"); } catch {}
   try { db.exec("ALTER TABLE creations ADD COLUMN rejection_reason TEXT;"); } catch {}
+  ensureColumn('creations', 'xp_awarded', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('creations', 'xp_awarded_amount', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('xp_transactions', 'reference_key', 'TEXT');
+  try {
+    db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_xp_transactions_ref_key ON xp_transactions(reference_key) WHERE reference_key IS NOT NULL;");
+  } catch {}
   ensureColumn('users', 'email', 'TEXT');
   ensureColumn('users', 'email_verified', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('users', 'failed_login_attempts', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('users', 'locked_until', 'TEXT');
   ensureColumn('users', 'password_changed_at', 'TEXT');
   ensureColumn('users', 'accepted_rules', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('promo_codes', 'max_uses', 'INTEGER');
+  ensureColumn('promo_codes', 'expires_at', 'TEXT');
   try { db.exec("ALTER TABLE achievements ADD COLUMN rarity TEXT NOT NULL DEFAULT 'common';"); } catch {}
   try { db.exec("ALTER TABLE achievements ADD COLUMN category TEXT NOT NULL DEFAULT 'general';"); } catch {}
   try { db.exec("ALTER TABLE achievements ADD COLUMN condition_ru TEXT;"); } catch {}
@@ -1490,12 +1529,77 @@ function seedInitialData() {
         ('speed-track', 'speed-track', 'Трек 0.5x / 2.5x', 'Угадай трек в замедленном 0.5x или ускоренном 2.5x режиме.', 1.1, 1)
     `).run();
 
+    const defaultCommunityRules = JSON.stringify({
+      intro_ru: 'Тут общаются слушатели и авторы вокруг музыки deathmarried. Чтобы всем было комфортно, держимся четырёх простых правил:',
+      intro_en: 'Listeners and creators gather here around deathmarried music. To keep the space welcoming, we follow four simple rules:',
+      footer_ru: 'За нарушения модераторы могут скрыть или удалить публикацию, а при повторах — ограничить доступ к аккаунту.',
+      footer_en: 'Moderators may hide or remove content that breaks the rules, and repeated violations can lead to account restrictions.',
+      items: [
+        {
+          title_ru: 'Без 18+ и NSFW',
+          title_en: 'No 18+ or NSFW',
+          body_ru: 'Никакой порнографии, эротики и откровенного контента — ни в текстах, ни в картинках, ни в ссылках.',
+          body_en: 'No pornography, erotica, or explicit adult content in text, images, or external links.',
+        },
+        {
+          title_ru: 'Без насилия, крови и жести',
+          title_en: 'No violence or gore',
+          body_ru: 'Запрещены шок-контент, реальная кровь, расчленёнка, угрозы и любые призывы к причинению вреда.',
+          body_en: 'Shock content, real gore, threats, and any calls to violence or self-harm are strictly forbidden.',
+        },
+        {
+          title_ru: 'Без оскорблений и травли',
+          title_en: 'No harassment or hate',
+          body_ru: 'Спорить о музыке и вкусах — нормально. Переходить на личности, унижать участников или разжигать ненависть — нет.',
+          body_en: 'Debating music and taste is welcome; personal attacks, bullying, and hate speech are not.',
+        },
+        {
+          title_ru: 'Без спама и рекламы',
+          title_en: 'No spam or promotion',
+          body_ru: 'Никакого флуда, реферальных ссылок, рекламы чужих каналов/магазинов, ботов и скама.',
+          body_en: 'No flooding, referral links, unsolicited promotion of external channels/stores, bots, or scams.',
+        },
+      ],
+    });
+
     db.prepare(`
       INSERT OR IGNORE INTO app_meta (key, value)
       VALUES
         ('quiz_enabled', '1'),
-        ('active_quiz_ids', '[]')
-    `).run();
+        ('active_quiz_ids', '[]'),
+        ('community_rules_json', ?)
+    `).run(defaultCommunityRules);
+
+    // Stage 6 additive migrations: unified game_completions lock across all 5 games
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS game_completions (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        game_type TEXT NOT NULL,
+        cycle_id TEXT NOT NULL,
+        is_correct INTEGER NOT NULL DEFAULT 0,
+        score INTEGER NOT NULL DEFAULT 0,
+        xp_earned INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(user_id, game_type, cycle_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_game_completions_lookup
+        ON game_completions(user_id, game_type, cycle_id);
+    `);
+
+    db.exec(`
+      INSERT OR IGNORE INTO game_completions (id, user_id, game_type, cycle_id, is_correct, score, xp_earned, created_at)
+      SELECT 'gc_gt_' || id, user_id, 'guess-track', challenge_date, is_correct, score, xp_earned, created_at
+      FROM daily_track_attempts;
+
+      INSERT OR IGNORE INTO game_completions (id, user_id, game_type, cycle_id, is_correct, score, xp_earned, created_at)
+      SELECT 'gc_dq_' || id, user_id, 'daily-quiz', challenge_date, CASE WHEN score > 0 THEN 1 ELSE 0 END, score, xp_earned, created_at
+      FROM quiz_attempts;
+
+      INSERT OR IGNORE INTO game_completions (id, user_id, game_type, cycle_id, is_correct, score, xp_earned, created_at)
+      SELECT 'gc_mg_' || id, user_id, game_id, cycle_id, is_correct, score, xp_earned, created_at
+      FROM daily_mini_game_attempts;
+    `);
   } catch (err) {
     console.warn('DB cleanup notice:', err);
   }

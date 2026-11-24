@@ -26,6 +26,9 @@ import {
   applyStreakBonusXp,
   parsePrivacySettings,
   formatXpTransactionLabel,
+  sanitizeCssColor,
+  buildCustomShieldValue,
+  parseCustomShieldValue,
 } from './logic';
 
 test('calculateLevelFromXp maps balanced XP thresholds smoothly without multi-level jumps', () => {
@@ -338,5 +341,71 @@ test('formatXpTransactionLabel translates legacy English and current entries to 
     title: 'Промокод',
     subtitle: 'Промокод «APOSTLES»',
   });
+  assert.deepEqual(formatXpTransactionLabel('meme_upload', 'Мем «Night»', 'ru'), {
+    title: 'Публикация мема',
+    subtitle: 'Мем «Night»',
+  });
+  assert.deepEqual(formatXpTransactionLabel('xp_rollback', 'Откат XP при удалении публикации', 'ru'), {
+    title: 'Откат XP при удалении/отклонении',
+    subtitle: 'Откат XP при удалении публикации',
+  });
 });
+
+test('sanitizeCssColor allows valid hex/rgb/rgba colors and blocks unsafe CSS expressions', () => {
+  assert.equal(sanitizeCssColor('#821c2c', '#000000'), '#821c2c');
+  assert.equal(sanitizeCssColor('#abc', '#000000'), '#abc');
+  assert.equal(sanitizeCssColor('rgb(12, 34, 56)', '#000000'), 'rgb(12, 34, 56)');
+  assert.equal(sanitizeCssColor('rgba(130, 28, 44, 0.45)', '#000000'), 'rgba(130, 28, 44, 0.45)');
+
+  assert.equal(sanitizeCssColor('url(javascript:alert(1))', '#111111'), '#111111');
+  assert.equal(sanitizeCssColor('red; position:fixed', '#111111'), '#111111');
+  assert.equal(sanitizeCssColor('expression(alert(1))', '#111111'), '#111111');
+  assert.equal(sanitizeCssColor('', '#111111'), '#111111');
+});
+
+test('buildCustomShieldValue and parseCustomShieldValue round-trip safely and reject malformed inputs', () => {
+  const encoded = buildCustomShieldValue({
+    ru: 'тёмный хранитель',
+    en: 'dark warden',
+    bg: '#220d14',
+    border: '#962a3d',
+    text: '#f2bcc6',
+    glow: 'rgba(130, 28, 44, 0.4)',
+  });
+  assert.ok(encoded.startsWith('cshield:'));
+
+  const parsed = parseCustomShieldValue(encoded);
+  assert.deepEqual(parsed, {
+    ru: 'тёмный хранитель',
+    en: 'dark warden',
+    bg: '#220d14',
+    border: '#962a3d',
+    text: '#f2bcc6',
+    glow: 'rgba(130, 28, 44, 0.4)',
+  });
+
+  // Malicious color values inside cshield payload should fall back to safe defaults
+  const sanitized = parseCustomShieldValue(
+    'cshield:' +
+      JSON.stringify({
+        ru: 'Тест',
+        en: 'Test',
+        bg: 'url(https://evil.example/x)',
+        border: 'red;content:"x"',
+        text: '#ffffff',
+        glow: 'expression(1)',
+      })
+  );
+  assert.ok(sanitized);
+  assert.equal(sanitized?.ru, 'Тест');
+  assert.equal(sanitized?.text, '#ffffff');
+  assert.notEqual(sanitized?.bg, 'url(https://evil.example/x)');
+  assert.notEqual(sanitized?.border, 'red;content:"x"');
+
+  assert.equal(parseCustomShieldValue('shield_apostol'), null);
+  assert.equal(parseCustomShieldValue('cshield:{broken json'), null);
+  assert.equal(parseCustomShieldValue(null), null);
+});
+
+
 

@@ -84,6 +84,7 @@ export const IntroAnimation: React.FC<IntroAnimationProps> = ({ onComplete }) =>
                 <img
                   src="/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg"
                   alt="Apostles of deathmarried"
+                  loading="lazy"
                   className="w-full h-full object-contain scale-[1.3] filter contrast-125 brightness-95"
                 />
               </div>

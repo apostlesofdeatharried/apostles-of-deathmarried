@@ -203,7 +203,7 @@ export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center p-2.5 sm:p-4 bg-black/82 backdrop-blur-md animate-fadeIn"
+      className="fixed inset-0 z-[110] flex items-center justify-center p-2.5 sm:p-4 bg-black/82 backdrop-blur-md animate-fadeIn"
       role="dialog"
       aria-modal="true"
       aria-label={t('shopTitle')}
@@ -307,6 +307,7 @@ export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
                   <img
                     src={user?.avatar_url || '/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg'}
                     alt="Preview"
+                    loading="lazy"
                     className="w-full h-full object-cover"
                   />
                 </div>
@@ -531,6 +532,7 @@ export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
                             <img
                               src={user?.avatar_url || '/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg'}
                               alt=""
+                              loading="lazy"
                               className="w-full h-full object-cover opacity-85"
                             />
                           </div>

@@ -85,13 +85,17 @@ export const PlayerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
   const reportTrackCompletion = useCallback((track: Track | null, durationSec: number) => {
     if (!track?.id || !getStoredToken()) return;
-    const minRequired = durationSec > 0 ? Math.min(durationSec * 0.7, Math.max(10, durationSec - 2)) : 15;
+    const minRequired = durationSec > 0 ? Math.max(8, durationSec * 0.75) : 15;
     if (listenedSecondsRef.current < minRequired) return;
 
     authFetch('/api/achievements/track-complete', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ track_id: track.id }),
+      body: JSON.stringify({
+        track_id: track.id,
+        listened_seconds: Math.floor(listenedSecondsRef.current),
+        duration_seconds: durationSec > 0 ? Math.floor(durationSec) : 0,
+      }),
     })
       .then((res) => (res.ok ? safeJson<any>(res, null) : null))
       .then((data) => {
@@ -105,7 +109,7 @@ export const PlayerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   // Initialize audio element once
   useEffect(() => {
     const audio = new Audio();
-    audio.preload = 'metadata';
+    audio.preload = 'none';
     audioRef.current = audio;
 
     const onTimeUpdate = () => {

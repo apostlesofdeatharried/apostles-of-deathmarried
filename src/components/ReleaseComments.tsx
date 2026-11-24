@@ -269,6 +269,7 @@ export const ReleaseComments: React.FC<ReleaseCommentsProps> = ({
                             <img
                               src={cm.author_avatar || DEFAULT_AVATAR}
                               alt={cm.author_name}
+                              loading="lazy"
                               className="w-full h-full object-cover"
                             />
                           </button>

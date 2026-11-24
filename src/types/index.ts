@@ -35,7 +35,21 @@ export interface UserProfile {
   is_private?: number;
   accepted_rules?: number;
   favorite_track?: string | null;
+  notify_follows?: number;
+  notify_news?: number;
   registered_at?: string;
+  games_played?: number | null;
+  guess_track_played?: number | null;
+  guess_track_wins?: number | null;
+  quiz_played?: number | null;
+  quiz_perfect_runs?: number | null;
+  quiz_best_score?: number | null;
+  guess_lyrics_played?: number | null;
+  guess_lyrics_wins?: number | null;
+  reverse_track_played?: number | null;
+  reverse_track_wins?: number | null;
+  speed_track_played?: number | null;
+  speed_track_wins?: number | null;
 }
 
 export interface Track {
@@ -179,6 +193,8 @@ export interface Post {
   rose_count?: number;
   skull_count?: number;
   user_reaction?: 'rose' | 'skull' | null;
+  author_followers_count?: number;
+  author_is_following?: boolean;
 }
 
 export interface Comment {
@@ -208,7 +224,7 @@ export interface Creation {
   id: string;
   user_id: string;
   title: string;
-  category: 'artwork' | 'covers' | 'beats' | 'video' | 'lyrics';
+  category: 'art' | 'meme' | 'artwork' | 'covers' | 'beats' | 'video' | 'lyrics';
   description?: string;
   media_url: string;
   media_type: 'image' | 'audio' | 'video';
@@ -228,6 +244,8 @@ export interface Creation {
   author_name_style?: string;
   author_badge?: string;
   has_liked?: boolean;
+  author_followers_count?: number;
+  author_is_following?: boolean;
 }
 
 export interface AppNotification {
@@ -237,7 +255,7 @@ export interface AppNotification {
   actor_nickname: string;
   actor_name: string;
   type: string;
-  target_type: 'post' | 'creation' | 'album' | 'single';
+  target_type: 'post' | 'creation' | 'album' | 'single' | 'news';
   target_id: string;
   target_title: string;
   target_link: string;
@@ -315,3 +333,31 @@ export interface GuessTrackRound {
   snippet_duration_seconds: number;
   options: GuessTrackOption[];
 }
+
+export interface CommunityRuleItem {
+  id?: string;
+  title_ru: string;
+  title_en: string;
+  body_ru: string;
+  body_en: string;
+}
+
+export interface CommunityRulesPayload {
+  intro_ru: string;
+  intro_en: string;
+  footer_ru: string;
+  footer_en: string;
+  items: CommunityRuleItem[];
+}
+
+export interface PromoCodeAdminItem {
+  id: string;
+  code: string;
+  xp_reward: number;
+  is_active: number;
+  max_uses?: number | null;
+  expires_at?: string | null;
+  uses_count?: number;
+  created_at?: string;
+}
+

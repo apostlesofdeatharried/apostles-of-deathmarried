@@ -567,6 +567,8 @@ const XP_SOURCE_LABELS_RU: Record<string, string> = {
   comment: 'Комментарий',
   comment_create: 'Комментарий в сообществе',
   creation_upload: 'Публикация работы',
+  meme_upload: 'Публикация мема',
+  xp_rollback: 'Откат XP при удалении/отклонении',
   registration: 'Регистрация',
 };
 
@@ -591,6 +593,8 @@ const XP_SOURCE_LABELS_EN: Record<string, string> = {
   comment: 'Comment',
   comment_create: 'Community Comment',
   creation_upload: 'Creation Published',
+  meme_upload: 'Meme Published',
+  xp_rollback: 'XP Rollback (Deleted/Rejected)',
   registration: 'Registration',
 };
 
@@ -830,5 +834,61 @@ export function formatXpTransactionLabel(
 
   // Already clean Russian or readable custom subtitle
   return { title: baseTitle, subtitle: rawDetails };
+}
+
+export interface CustomShieldStyle {
+  ru: string;
+  en: string;
+  bg: string;
+  border: string;
+  text: string;
+  glow: string;
+}
+
+const HEX_OR_RGBA_COLOR_REGEX =
+  /^(#[0-9a-fA-F]{3,8}|rgba?\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}(?:\s*,\s*(?:0|1|0?\.\d+))?\s*\))$/;
+
+export function sanitizeCssColor(value: unknown, fallback: string): string {
+  if (typeof value !== 'string') return fallback;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > 64) return fallback;
+  return HEX_OR_RGBA_COLOR_REGEX.test(trimmed) ? trimmed : fallback;
+}
+
+export function parseCustomShieldValue(raw: unknown): CustomShieldStyle | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed.startsWith('cshield:')) return null;
+  try {
+    const parsed = JSON.parse(trimmed.slice('cshield:'.length));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const ru = String(parsed.ru || '').replace(/\s+/g, ' ').trim().slice(0, 32);
+    const en = String(parsed.en || ru || '').replace(/\s+/g, ' ').trim().slice(0, 32);
+    if (!ru && !en) return null;
+    return {
+      ru: ru || en,
+      en: en || ru,
+      bg: sanitizeCssColor(parsed.bg, '#1a1014'),
+      border: sanitizeCssColor(parsed.border, '#821c2c'),
+      text: sanitizeCssColor(parsed.text, '#f2bcc6'),
+      glow: sanitizeCssColor(parsed.glow, 'rgba(130, 28, 44, 0.35)'),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function buildCustomShieldValue(spec: Partial<CustomShieldStyle>): string {
+  const ru = String(spec.ru || spec.en || 'уникальный').replace(/\s+/g, ' ').trim().slice(0, 32) || 'уникальный';
+  const en = String(spec.en || ru).replace(/\s+/g, ' ').trim().slice(0, 32) || ru;
+  const payload: CustomShieldStyle = {
+    ru,
+    en,
+    bg: sanitizeCssColor(spec.bg, '#1a1014'),
+    border: sanitizeCssColor(spec.border, '#821c2c'),
+    text: sanitizeCssColor(spec.text, '#f2bcc6'),
+    glow: sanitizeCssColor(spec.glow, 'rgba(130, 28, 44, 0.35)'),
+  };
+  return `cshield:${JSON.stringify(payload)}`;
 }
 

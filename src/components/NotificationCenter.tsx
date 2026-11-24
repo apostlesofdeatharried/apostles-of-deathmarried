@@ -33,14 +33,29 @@ export async function requestBrowserNotifications(): Promise<BrowserNotifStatus>
   }
 }
 
+function getNotificationActionText(n: AppNotification): { nativeTitle: string; verb: string; hideActorPrefix?: boolean } {
+  switch (n.type) {
+    case 'new_post':
+      return { nativeTitle: `${n.actor_name} опубликовал тему`, verb: 'опубликовал новую тему' };
+    case 'new_creation':
+      return { nativeTitle: `${n.actor_name} опубликовал работу`, verb: 'опубликовал работу' };
+    case 'new_comment':
+      return { nativeTitle: `${n.actor_name} оставил комментарий`, verb: 'оставил комментарий' };
+    case 'news':
+      return { nativeTitle: `Новости сайта: ${n.target_title}`, verb: 'Новости и обновления сайта', hideActorPrefix: true };
+    default:
+      return { nativeTitle: `${n.actor_name} ответил вам`, verb: 'ответил' };
+  }
+}
+
 function showNativeBrowserNotification(n: AppNotification, onOpen: () => void) {
   try {
     if (typeof window === 'undefined' || !('Notification' in window) || window.Notification.permission !== 'granted') {
       return;
     }
-    const title = `${n.actor_name} ответил вам`;
+    const { nativeTitle } = getNotificationActionText(n);
     const body = n.excerpt ? `«${n.excerpt}» · ${n.target_title}` : n.target_title;
-    const nativeNotif = new window.Notification(title, {
+    const nativeNotif = new window.Notification(nativeTitle, {
       body,
       icon: '/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg',
       tag: n.id,
@@ -78,6 +93,8 @@ function targetTypeLabel(type: AppNotification['target_type']): string {
       return 'Альбом';
     case 'single':
       return 'Сингл';
+    case 'news':
+      return 'Новости';
     default:
       return 'Ответ';
   }
@@ -144,16 +161,62 @@ export const BrowserNotificationsControl: React.FC<{ compact?: boolean }> = ({ c
 };
 
 export const NotificationCenter: React.FC = () => {
-  const { user } = useAuth();
+  const { user, refresh } = useAuth();
   const [open, setOpen] = useState(false);
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
   const [unreadCount, setUnreadCount] = useState(0);
   const [toastNotif, setToastNotif] = useState<AppNotification | null>(null);
+  const [notifyFollows, setNotifyFollows] = useState<boolean>(user?.notify_follows === 0 ? false : true);
+  const [notifyNews, setNotifyNews] = useState<boolean>(Boolean(user?.notify_news));
+  const [prefsSaving, setPrefsSaving] = useState<'follows' | 'news' | null>(null);
 
   const dropdownRef = useRef<HTMLDivElement | null>(null);
   const knownIdsRef = useRef<Set<string>>(new Set());
   const initializedRef = useRef(false);
   const toastTimerRef = useRef<number | null>(null);
+
+  const fetchPreferences = useCallback(async () => {
+    if (!user?.id) return;
+    try {
+      const res = await authFetch('/api/notifications/preferences', { cache: 'no-store' });
+      if (!res.ok) return;
+      const data = await safeJson<{ notify_follows?: boolean; notify_news?: boolean }>(res, {});
+      if (typeof data.notify_follows === 'boolean') setNotifyFollows(data.notify_follows);
+      if (typeof data.notify_news === 'boolean') setNotifyNews(data.notify_news);
+    } catch {}
+  }, [user?.id]);
+
+  const handleTogglePreference = async (field: 'follows' | 'news') => {
+    if (!user?.id || prefsSaving) return;
+    const nextFollows = field === 'follows' ? !notifyFollows : notifyFollows;
+    const nextNews = field === 'news' ? !notifyNews : notifyNews;
+    const prevFollows = notifyFollows;
+    const prevNews = notifyNews;
+
+    setNotifyFollows(nextFollows);
+    setNotifyNews(nextNews);
+    setPrefsSaving(field);
+    try {
+      const res = await authFetch('/api/notifications/preferences', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(
+          field === 'follows' ? { notify_follows: nextFollows } : { notify_news: nextNews }
+        ),
+      });
+      if (res.ok) {
+        refresh().catch(() => {});
+      } else {
+        setNotifyFollows(prevFollows);
+        setNotifyNews(prevNews);
+      }
+    } catch {
+      setNotifyFollows(prevFollows);
+      setNotifyNews(prevNews);
+    } finally {
+      setPrefsSaving(null);
+    }
+  };
 
   const openNotificationTarget = useCallback(async (n: AppNotification) => {
     setOpen(false);
@@ -226,7 +289,10 @@ export const NotificationCenter: React.FC = () => {
       return;
     }
 
+    setNotifyFollows(user?.notify_follows === 0 ? false : true);
+    setNotifyNews(Boolean(user?.notify_news));
     fetchNotifications();
+    fetchPreferences();
     const intervalId = window.setInterval(() => {
       if (document.visibilityState === 'visible') {
         fetchNotifications();
@@ -237,7 +303,7 @@ export const NotificationCenter: React.FC = () => {
       window.clearInterval(intervalId);
       if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
     };
-  }, [user?.id, fetchNotifications]);
+  }, [user?.id, fetchNotifications, fetchPreferences]);
 
   // Close dropdown on outside click or Escape
   useEffect(() => {
@@ -279,7 +345,10 @@ export const NotificationCenter: React.FC = () => {
           onClick={() => {
             const next = !open;
             setOpen(next);
-            if (next) fetchNotifications();
+            if (next) {
+              fetchNotifications();
+              fetchPreferences();
+            }
           }}
           className="relative p-1.5 rounded-lg border border-white/[0.08] bg-[#100f13] hover:border-white/20 text-[#ded8ce] hover:text-white transition-colors cursor-pointer"
           aria-label="Уведомления"
@@ -328,35 +397,85 @@ export const NotificationCenter: React.FC = () => {
                   </p>
                 </div>
               ) : (
-                notifications.map((n) => (
-                  <button
-                    key={n.id}
-                    type="button"
-                    onClick={() => openNotificationTarget(n)}
-                    className={`w-full text-left px-3.5 py-3 transition-colors hover:bg-white/[0.04] cursor-pointer space-y-1 ${
-                      n.is_read ? 'opacity-70' : 'bg-[#17121a]/70'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between gap-2 text-[11px]">
-                      <span className="font-medium text-[#f2eee9] truncate">
-                        {n.actor_name}{' '}
-                        <span className="font-normal text-[#8e877e]">ответил</span>
-                      </span>
-                      <span className="font-mono text-[10px] text-[#736c64] shrink-0 tabular-nums">
-                        {formatNotifTime(n.created_at)}
-                      </span>
-                    </div>
-                    <div className="text-[11px] text-[#a39b8b] truncate">
-                      {targetTypeLabel(n.target_type)} · {n.target_title}
-                    </div>
-                    {n.excerpt && (
-                      <p className="text-xs text-[#ded8ce] line-clamp-2 leading-snug">
-                        «{n.excerpt}»
-                      </p>
-                    )}
-                  </button>
-                ))
+                notifications.map((n) => {
+                  const meta = getNotificationActionText(n);
+                  return (
+                    <button
+                      key={n.id}
+                      type="button"
+                      onClick={() => openNotificationTarget(n)}
+                      className={`w-full text-left px-3.5 py-3 transition-colors hover:bg-white/[0.04] cursor-pointer space-y-1 ${
+                        n.is_read ? 'opacity-70' : 'bg-[#17121a]/70'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2 text-[11px]">
+                        <span className="font-medium text-[#f2eee9] truncate">
+                          {meta.hideActorPrefix ? (
+                            <span className="text-[#e28593]">{meta.verb}</span>
+                          ) : (
+                            <>
+                              {n.actor_name}{' '}
+                              <span className="font-normal text-[#8e877e]">{meta.verb}</span>
+                            </>
+                          )}
+                        </span>
+                        <span className="font-mono text-[10px] text-[#736c64] shrink-0 tabular-nums">
+                          {formatNotifTime(n.created_at)}
+                        </span>
+                      </div>
+                      <div className="text-[11px] text-[#a39b8b] truncate">
+                        {targetTypeLabel(n.target_type)} · {n.target_title}
+                      </div>
+                      {n.excerpt && (
+                        <p className="text-xs text-[#ded8ce] line-clamp-2 leading-snug">
+                          «{n.excerpt}»
+                        </p>
+                      )}
+                    </button>
+                  );
+                })
               )}
+            </div>
+
+            <div className="px-3.5 py-2.5 border-t border-white/[0.06] bg-[#131218] space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[11px] text-[#ded8ce]">Уведомления от подписок</span>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={notifyFollows}
+                  disabled={prefsSaving === 'follows'}
+                  onClick={() => handleTogglePreference('follows')}
+                  className={`relative w-8 h-4.5 rounded-full transition-colors shrink-0 cursor-pointer disabled:opacity-50 ${
+                    notifyFollows ? 'bg-[#821c2c]' : 'bg-white/[0.14]'
+                  }`}
+                >
+                  <span
+                    className={`block w-3 h-3 rounded-full bg-white transition-transform ${
+                      notifyFollows ? 'translate-x-4.5' : 'translate-x-0.5'
+                    }`}
+                  />
+                </button>
+              </div>
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[11px] text-[#ded8ce]">Новости и обновления сайта</span>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={notifyNews}
+                  disabled={prefsSaving === 'news'}
+                  onClick={() => handleTogglePreference('news')}
+                  className={`relative w-8 h-4.5 rounded-full transition-colors shrink-0 cursor-pointer disabled:opacity-50 ${
+                    notifyNews ? 'bg-[#821c2c]' : 'bg-white/[0.14]'
+                  }`}
+                >
+                  <span
+                    className={`block w-3 h-3 rounded-full bg-white transition-transform ${
+                      notifyNews ? 'translate-x-4.5' : 'translate-x-0.5'
+                    }`}
+                  />
+                </button>
+              </div>
             </div>
 
             <BrowserNotificationsControl compact />

@@ -13,6 +13,7 @@ import {
   getStreakBonusPercent,
   type PrivacySettings,
 } from '../utils/logic.js';
+import { prepareAndUploadMedia } from '../utils/mediaCompression.js';
 import {
   RARITY_CONFIG,
   CATEGORY_LABELS,
@@ -115,6 +116,10 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
   const [privacyForm, setPrivacyForm] = useState<PrivacySettings>(parsePrivacySettings(null));
   const [privacySaving, setPrivacySaving] = useState(false);
   const [privacyMsg, setPrivacyMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+  const [notifyFollows, setNotifyFollows] = useState(true);
+  const [notifyNews, setNotifyNews] = useState(false);
+  const [notifPrefSaving, setNotifPrefSaving] = useState<'follows' | 'news' | null>(null);
+  const [notifPrefMsg, setNotifPrefMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
 
   // Email verification inside Settings tab
   const [verifyEmailInput, setVerifyEmailInput] = useState('');
@@ -160,6 +165,8 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
         setEditFavoriteTrack(p.favorite_track || '');
         setEditAvatar(p.avatar_url || DEFAULT_AVATAR);
         setVerifyEmailInput(p.email || '');
+        setNotifyFollows(p.notify_follows === 0 ? false : true);
+        setNotifyNews(Boolean(p.notify_news));
         if (p.privacy_settings) {
           setPrivacyForm(parsePrivacySettings(p.privacy_settings));
         }
@@ -332,13 +339,14 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
     setAvatarUploading(true);
     setSettingsMsg(null);
     try {
-      const fd = new FormData();
-      fd.append('file', file);
-      const res = await authFetch('/api/upload', { method: 'POST', body: fd });
-      const data = await safeJson<{ url?: string; error?: string }>(res, {});
-      if (!res.ok || !data.url) {
-        throw new Error(data.error || (lang === 'ru' ? 'Ошибка загрузки аватара.' : 'Failed to upload avatar.'));
-      }
+      const data = await prepareAndUploadMedia(file, {
+        imageMode: 'avatar',
+        authFetch,
+        lang,
+        allowAudio: false,
+        allowVideo: false,
+        allowImage: true,
+      });
       setEditAvatar(data.url);
       setSettingsMsg({
         type: 'ok',
@@ -425,6 +433,45 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
       setPrivacyMsg({ type: 'err', text: err?.message || 'Connection error' });
     } finally {
       setPrivacySaving(false);
+    }
+  };
+
+  const handleToggleNotificationPref = async (field: 'follows' | 'news') => {
+    if (!isOwnProfile || notifPrefSaving) return;
+    const prevFollows = notifyFollows;
+    const prevNews = notifyNews;
+    const nextFollows = field === 'follows' ? !notifyFollows : notifyFollows;
+    const nextNews = field === 'news' ? !notifyNews : notifyNews;
+
+    setNotifyFollows(nextFollows);
+    setNotifyNews(nextNews);
+    setNotifPrefSaving(field);
+    setNotifPrefMsg(null);
+    try {
+      const res = await authFetch('/api/notifications/preferences', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(
+          field === 'follows' ? { notify_follows: nextFollows } : { notify_news: nextNews }
+        ),
+      });
+      if (!res.ok) {
+        setNotifyFollows(prevFollows);
+        setNotifyNews(prevNews);
+        setNotifPrefMsg({ type: 'err', text: 'Не удалось обновить настройки уведомлений.' });
+      } else {
+        setNotifPrefMsg({
+          type: 'ok',
+          text: lang === 'ru' ? 'Настройка уведомлений сохранена.' : 'Notification preference updated.',
+        });
+        await refresh();
+      }
+    } catch {
+      setNotifyFollows(prevFollows);
+      setNotifyNews(prevNews);
+      setNotifPrefMsg({ type: 'err', text: 'Ошибка соединения.' });
+    } finally {
+      setNotifPrefSaving(null);
     }
   };
 
@@ -595,13 +642,13 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
     },
     {
       id: 'inventory',
-      label: lang === 'ru' ? 'Инвентарь / Промокоды' : 'Inventory / Promo',
+      label: lang === 'ru' ? 'Инвентарь / Промо' : 'Inventory / Promo',
       icon: <ShoppingBag className="w-3.5 h-3.5" />,
       ownerOnly: true,
     },
     {
       id: 'settings',
-      label: lang === 'ru' ? 'Настройки и приватность' : 'Settings & Privacy',
+      label: lang === 'ru' ? 'Настройки' : 'Settings',
       icon: <Settings className="w-3.5 h-3.5" />,
       ownerOnly: true,
     },
@@ -610,7 +657,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
   const visibleTabs = tabs.filter((tb) => !tb.ownerOnly || isOwnProfile);
 
   return (
-    <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-7 space-y-5 animate-fadeIn">
+    <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-7 space-y-5 animate-fadeIn">
       {isOwnProfile && (
         <ShopModal
           isOpen={isShopOpen}
@@ -665,6 +712,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
                 <img
                   src={profile.avatar_url || DEFAULT_AVATAR}
                   alt={profile.display_name || profile.nickname}
+                  loading="lazy"
                   className="w-full h-full object-cover"
                   onError={(e) => {
                     (e.currentTarget as HTMLImageElement).src = DEFAULT_AVATAR;
@@ -777,7 +825,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
                   {lang === 'ru' ? `Опыт уровня ${levelInfo.level}` : `Level ${levelInfo.level} XP`}
                 </span>
                 <span className="text-[#ded8ce]">
-                  {profile.total_xp} / {levelInfo.nextLevelXp} XP
+                  {levelInfo.currentLevelXp} / {levelInfo.nextLevelXp} XP
                 </span>
               </div>
               <div className="h-1.5 w-full rounded-full bg-white/[0.07] overflow-hidden">
@@ -826,7 +874,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
               key={tab.id}
               type="button"
               onClick={() => setActiveTab(tab.id)}
-              className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-md font-mono text-xs whitespace-nowrap transition-colors cursor-pointer shrink-0 ${
+              className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-md font-mono text-xs whitespace-nowrap transition-colors cursor-pointer shrink-0 ${
                 isActive
                   ? 'bg-white/[0.09] text-[#f2eee9] border border-white/[0.14]'
                   : 'text-[#8e877e] hover:text-[#ded8ce] hover:bg-white/[0.03] border border-transparent'
@@ -867,10 +915,10 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
                   label={lang === 'ru' ? 'Подробная игровая статистика скрыта настройками приватности.' : 'Game stats are hidden.'}
                 />
               ) : (
-                <div className="grid grid-cols-2 gap-2.5 font-mono tabular-nums">
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5 font-mono tabular-nums">
                   <div className="rounded-md border border-white/[0.06] bg-[#131218] p-3">
                     <div className="text-[10px] uppercase text-[#736c64]">
-                      {lang === 'ru' ? 'Всего игр' : 'Games Played'}
+                      {lang === 'ru' ? 'Всего игр' : 'Total Games'}
                     </div>
                     <div className="text-lg font-semibold text-[#f2eee9] mt-0.5">{profile.games_played ?? 0}</div>
                   </div>
@@ -885,7 +933,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
                   </div>
                   <div className="rounded-md border border-white/[0.06] bg-[#131218] p-3">
                     <div className="text-[10px] uppercase text-[#736c64]">
-                      {lang === 'ru' ? 'Викторин (5/5)' : 'Quizzes (5/5)'}
+                      {lang === 'ru' ? 'Викторина (5/5)' : 'Quiz (5/5)'}
                     </div>
                     <div className="text-lg font-semibold text-[#f2eee9] mt-0.5">
                       {profile.quiz_played ?? 0}
@@ -894,9 +942,30 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
                   </div>
                   <div className="rounded-md border border-white/[0.06] bg-[#131218] p-3">
                     <div className="text-[10px] uppercase text-[#736c64]">
-                      {lang === 'ru' ? 'Лучший счёт' : 'Best Quiz Score'}
+                      {lang === 'ru' ? 'Угадай строчку' : 'Guess Lyric'}
                     </div>
-                    <div className="text-lg font-semibold text-[#f2eee9] mt-0.5">{profile.quiz_best_score ?? 0}</div>
+                    <div className="text-lg font-semibold text-[#f2eee9] mt-0.5">
+                      {profile.guess_lyrics_wins ?? 0}
+                      <span className="text-xs font-normal text-[#736c64]"> / {profile.guess_lyrics_played ?? 0}</span>
+                    </div>
+                  </div>
+                  <div className="rounded-md border border-white/[0.06] bg-[#131218] p-3">
+                    <div className="text-[10px] uppercase text-[#736c64]">
+                      {lang === 'ru' ? 'Задом наперёд' : 'Reverse Track'}
+                    </div>
+                    <div className="text-lg font-semibold text-[#f2eee9] mt-0.5">
+                      {profile.reverse_track_wins ?? 0}
+                      <span className="text-xs font-normal text-[#736c64]"> / {profile.reverse_track_played ?? 0}</span>
+                    </div>
+                  </div>
+                  <div className="rounded-md border border-white/[0.06] bg-[#131218] p-3">
+                    <div className="text-[10px] uppercase text-[#736c64]">
+                      {lang === 'ru' ? '0.5x / 2.5x' : '0.5x / 2.5x'}
+                    </div>
+                    <div className="text-lg font-semibold text-[#f2eee9] mt-0.5">
+                      {profile.speed_track_wins ?? 0}
+                      <span className="text-xs font-normal text-[#736c64]"> / {profile.speed_track_played ?? 0}</span>
+                    </div>
                   </div>
                 </div>
               )}
@@ -1752,19 +1821,86 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
               )}
             </div>
 
-            {/* Browser Notifications Box */}
-            <div className="pt-4 border-t border-white/[0.07] space-y-2.5">
+            {/* Notification Preferences + Browser Notifications Box */}
+            <div className="pt-4 border-t border-white/[0.07] space-y-3">
               <div className="space-y-0.5">
                 <span className="font-mono text-xs uppercase tracking-wider text-[#ded8ce] flex items-center gap-1.5">
                   <BellRing className="w-3.5 h-3.5 text-[#c96075]" />
-                  {lang === 'ru' ? 'Уведомления в браузере' : 'Browser Notifications'}
+                  {lang === 'ru' ? 'Уведомления' : 'Notifications'}
                 </span>
                 <p className="text-[11px] text-[#736c64] leading-snug">
                   {lang === 'ru'
-                    ? 'Системные оповещения браузера, когда вам отвечают на форуме, в творчестве или под релизом.'
-                    : 'Receive browser notifications when someone replies to your topics, works, or comments.'}
+                    ? 'Выберите, какие оповещения приходят в колокольчик и системные уведомления браузера.'
+                    : 'Choose which alerts appear in your notification center and browser.'}
                 </p>
               </div>
+
+              <div className="space-y-2">
+                <label className="flex items-start justify-between gap-3 rounded-md border border-white/[0.07] bg-[#131218] p-3 cursor-pointer hover:border-white/[0.15] transition-colors">
+                  <div className="space-y-0.5 pr-2">
+                    <div className="text-xs font-medium text-[#f2eee9]">
+                      {lang === 'ru' ? 'Уведомления от подписок' : 'Subscription Alerts'}
+                    </div>
+                    <div className="text-[11px] text-[#736c64] leading-snug">
+                      {lang === 'ru'
+                        ? 'Оповещать о новых темах, работах, мемах и комментариях от тех, на кого вы подписаны'
+                        : 'Notify on new topics, creations, memes, and comments from authors you follow'}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={notifyFollows}
+                    disabled={notifPrefSaving === 'follows'}
+                    onClick={() => handleToggleNotificationPref('follows')}
+                    className={`relative w-10 h-5 rounded-full transition-colors shrink-0 mt-0.5 cursor-pointer disabled:opacity-50 ${
+                      notifyFollows ? 'bg-[#821c2c]' : 'bg-white/[0.12]'
+                    }`}
+                  >
+                    <span
+                      className={`block w-3.5 h-3.5 rounded-full bg-white transition-transform ${
+                        notifyFollows ? 'translate-x-5.5' : 'translate-x-1'
+                      }`}
+                    />
+                  </button>
+                </label>
+
+                <label className="flex items-start justify-between gap-3 rounded-md border border-white/[0.07] bg-[#131218] p-3 cursor-pointer hover:border-white/[0.15] transition-colors">
+                  <div className="space-y-0.5 pr-2">
+                    <div className="text-xs font-medium text-[#f2eee9]">
+                      {lang === 'ru' ? 'Новости и обновления сайта' : 'Site News & Updates'}
+                    </div>
+                    <div className="text-[11px] text-[#736c64] leading-snug">
+                      {lang === 'ru'
+                        ? 'Получать важные объявления от администрации (выключено по умолчанию)'
+                        : 'Receive official announcements and platform updates (off by default)'}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={notifyNews}
+                    disabled={notifPrefSaving === 'news'}
+                    onClick={() => handleToggleNotificationPref('news')}
+                    className={`relative w-10 h-5 rounded-full transition-colors shrink-0 mt-0.5 cursor-pointer disabled:opacity-50 ${
+                      notifyNews ? 'bg-[#821c2c]' : 'bg-white/[0.12]'
+                    }`}
+                  >
+                    <span
+                      className={`block w-3.5 h-3.5 rounded-full bg-white transition-transform ${
+                        notifyNews ? 'translate-x-5.5' : 'translate-x-1'
+                      }`}
+                    />
+                  </button>
+                </label>
+              </div>
+
+              {notifPrefMsg && (
+                <p className={`text-xs ${notifPrefMsg.type === 'ok' ? 'text-[#7ed6a3]' : 'text-[#e28593]'}`}>
+                  {notifPrefMsg.text}
+                </p>
+              )}
+
               <BrowserNotificationsControl />
             </div>
           </div>
@@ -1784,6 +1920,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
               <img
                 src={editAvatar || DEFAULT_AVATAR}
                 alt="Avatar preview"
+                loading="lazy"
                 className="w-14 h-14 rounded-full object-cover border border-white/[0.14] bg-[#14131a] shrink-0"
                 onError={(e) => {
                   (e.currentTarget as HTMLImageElement).src = DEFAULT_AVATAR;

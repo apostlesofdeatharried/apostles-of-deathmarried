@@ -1,11 +1,21 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { useAuth, authFetch } from '../context/AuthContext.js';
+import { useAuth, authFetch, setStoredToken } from '../context/AuthContext.js';
 import { useI18n } from '../context/I18nContext.js';
 import { usePlayer } from '../context/PlayerContext.js';
 import { CoverArt } from '../components/CoverArt.js';
 import { formatDuration, safeJson } from '../utils/logic.js';
-import { formatHandle, RARITY_CONFIG, CATEGORY_LABELS } from '../utils/cosmetics.js';
+import { prepareAndUploadMedia, AUDIO_ACCEPT_ATTR } from '../utils/mediaCompression.js';
+import { formatHandle } from '../utils/cosmetics.js';
+import {
+  AdminUserEditorModal,
+  AdminUserDetailsPayload,
+} from '../components/admin/AdminUserEditorModal.js';
+import { AdminUserResetTab } from '../components/admin/AdminUserResetTab.js';
+import { AdminQuizTab } from '../components/admin/AdminQuizTab.js';
+import { AdminPromosTab, AdminShopTab } from '../components/admin/AdminShopPromoTab.js';
+import { AdminNewsTab, AdminRulesTab } from '../components/admin/AdminRulesNewsTab.js';
+import { AdminCommentsSubtab } from '../components/admin/AdminCommentsSubtab.js';
 import {
   Shield,
   Users,
@@ -39,9 +49,12 @@ import {
   Clock,
   Eye,
   EyeOff,
-  Award,
-  Package,
   Sliders,
+  Megaphone,
+  Ticket,
+  BookOpen,
+  MessageSquare,
+  Store,
 } from 'lucide-react';
 
 interface DeleteModalState {
@@ -74,11 +87,32 @@ const formatAdminDateTime = (dateStr?: string | null) => {
 };
 
 export const AdminView: React.FC = () => {
-  const { user, bindAdmin, openAuth } = useAuth();
+  const { user, bindAdmin, openAuth, refresh } = useAuth();
   const { t, lang } = useI18n();
   const { playTrack } = usePlayer();
 
-  const [activeTab, setActiveTab] = useState<'discography' | 'singles' | 'media' | 'gametracks' | 'leaderboard' | 'moderation' | 'users' | 'stats'>('discography');
+  const isAdmin = user?.role_id === 'admin';
+  const isModerator = user?.role_id === 'moderator';
+
+  type AdminTabId =
+    | 'discography'
+    | 'singles'
+    | 'media'
+    | 'gametracks'
+    | 'quiz'
+    | 'leaderboard'
+    | 'moderation'
+    | 'users'
+    | 'user_reset'
+    | 'news'
+    | 'promos'
+    | 'shop'
+    | 'rules'
+    | 'stats';
+
+  const [activeTab, setActiveTab] = useState<AdminTabId>(() =>
+    user?.role_id === 'moderator' ? 'moderation' : 'discography'
+  );
   const [stats, setStats] = useState<any>(null);
   const [usersList, setUsersList] = useState<any[]>([]);
   const [albumsList, setAlbumsList] = useState<any[]>([]);
@@ -89,15 +123,24 @@ export const AdminView: React.FC = () => {
   const [adminLeaderboard, setAdminLeaderboard] = useState<any[]>([]);
   const [adminLeaderboardSummary, setAdminLeaderboardSummary] = useState<any | null>(null);
   const [lbTimeframe, setLbTimeframe] = useState<'all' | 'weekly' | 'monthly'>('all');
-  const [lbGameFilter, setLbGameFilter] = useState<'all' | 'guess-track' | 'daily-quiz'>('all');
+  const [lbGameFilter, setLbGameFilter] = useState<
+    'all' | 'guess-track' | 'daily-quiz' | 'guess-lyrics' | 'reverse-track' | 'speed-track'
+  >('all');
   const [lbSearch, setLbSearch] = useState('');
   const [lbLoading, setLbLoading] = useState(false);
   const [allPostsList, setAllPostsList] = useState<any[]>([]);
   const [allCreationsList, setAllCreationsList] = useState<any[]>([]);
   const [reportsList, setReportsList] = useState<any[]>([]);
-  const [moderationSection, setModerationSection] = useState<'posts' | 'creations' | 'reports'>('posts');
+  const [moderationSection, setModerationSection] = useState<'posts' | 'creations' | 'comments' | 'reports'>('posts');
   const [moderationStatusFilter, setModerationStatusFilter] = useState<'pending' | 'all'>('pending');
+  const [creationCategoryOverrides, setCreationCategoryOverrides] = useState<Record<string, 'art' | 'meme'>>({});
   const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    if (isModerator && activeTab !== 'moderation' && activeTab !== 'rules') {
+      setActiveTab('moderation');
+    }
+  }, [isModerator, activeTab]);
 
   // User Management & Statistics State
   const [userSearch, setUserSearch] = useState('');
@@ -117,30 +160,14 @@ export const AdminView: React.FC = () => {
   const [resetPassConfirm, setResetPassConfirm] = useState('');
   const [showResetPass, setShowResetPass] = useState(false);
   const [resettingPass, setResettingPass] = useState(false);
-  const [userDetailsModal, setUserDetailsModal] = useState<{ user: any; achievements: any[]; items: any[] } | null>(null);
+  const [userDetailsModal, setUserDetailsModal] = useState<AdminUserDetailsPayload | null>(null);
   const [loadingUserDetails, setLoadingUserDetails] = useState(false);
-  const [userDetailsTab, setUserDetailsTab] = useState<'overview' | 'achievements' | 'items'>('overview');
-  const [togglingAssetId, setTogglingAssetId] = useState<string | null>(null);
 
-  // Quiz Question Form & Bulk Import State
-  const [editingQuizId, setEditingQuizId] = useState<string | null>(null);
-  const [quizQuestionRu, setQuizQuestionRu] = useState('');
-  const [quizQuestionEn, setQuizQuestionEn] = useState('');
-  const [quizOpt0, setQuizOpt0] = useState('');
-  const [quizOpt1, setQuizOpt1] = useState('');
-  const [quizOpt2, setQuizOpt2] = useState('');
-  const [quizOpt3, setQuizOpt3] = useState('');
-  const [quizCorrectIndex, setQuizCorrectIndex] = useState('0');
-  const [quizExplanationRu, setQuizExplanationRu] = useState('');
-  const [quizDifficulty, setQuizDifficulty] = useState('1');
   const [quizPoolMeta, setQuizPoolMeta] = useState<{
     custom_active_count: number;
     generated_pool_count: number;
     total_pool_count: number;
   } | null>(null);
-  const [bulkQuizOpen, setBulkQuizOpen] = useState(false);
-  const [bulkQuizText, setBulkQuizText] = useState('');
-  const [importingBulkQuiz, setImportingBulkQuiz] = useState(false);
 
   // In-UI Delete Confirmation Modal
   const [deleteModal, setDeleteModal] = useState<DeleteModalState | null>(null);
@@ -176,7 +203,6 @@ export const AdminView: React.FC = () => {
   const [savingAlbum, setSavingAlbum] = useState(false);
   const [savingSingle, setSavingSingle] = useState(false);
   const [savingTrack, setSavingTrack] = useState(false);
-  const [savingQuiz, setSavingQuiz] = useState(false);
   const [healthStatus, setHealthStatus] = useState<any>(null);
 
   // Album Form State
@@ -260,7 +286,7 @@ export const AdminView: React.FC = () => {
 
   const fetchAdminLeaderboard = async (
     tf: 'all' | 'weekly' | 'monthly' = lbTimeframe,
-    game: 'all' | 'guess-track' | 'daily-quiz' = lbGameFilter,
+    game: 'all' | 'guess-track' | 'daily-quiz' | 'guess-lyrics' | 'reverse-track' | 'speed-track' = lbGameFilter,
     searchQuery: string = lbSearch
   ) => {
     setLbLoading(true);
@@ -286,17 +312,18 @@ export const AdminView: React.FC = () => {
   };
 
   useEffect(() => {
-    if (activeTab !== 'leaderboard') return;
+    if (!isAdmin || activeTab !== 'leaderboard') return;
     const timer = window.setTimeout(() => {
       fetchAdminLeaderboard(lbTimeframe, lbGameFilter, lbSearch);
     }, 150);
     return () => window.clearTimeout(timer);
-  }, [activeTab, lbTimeframe, lbGameFilter, lbSearch]);
+  }, [isAdmin, activeTab, lbTimeframe, lbGameFilter, lbSearch]);
 
   const fetchAdminUsers = async (
     searchQuery: string = userSearch,
     sortKey: typeof userSort = userSort
   ) => {
+    if (!isAdmin) return;
     setUsersLoading(true);
     try {
       const params = new URLSearchParams();
@@ -317,19 +344,18 @@ export const AdminView: React.FC = () => {
   };
 
   useEffect(() => {
-    if (activeTab !== 'users') return;
+    if (!isAdmin || (activeTab !== 'users' && activeTab !== 'user_reset')) return;
     const timer = window.setTimeout(() => {
       fetchAdminUsers(userSearch, userSort);
     }, 180);
     return () => window.clearTimeout(timer);
-  }, [activeTab, userSearch, userSort]);
+  }, [isAdmin, activeTab, userSearch, userSort]);
 
   const openUserDetails = async (userId: string) => {
     setLoadingUserDetails(true);
-    setUserDetailsTab('overview');
     try {
       const res = await authFetch(`/api/admin/users/${userId}/details`, { cache: 'no-store' });
-      const data = await safeJson<any>(res, null);
+      const data = await safeJson<AdminUserDetailsPayload & { error?: string }>(res, null as any);
       if (res.ok && data?.user) {
         setUserDetailsModal(data);
       } else {
@@ -379,117 +405,69 @@ export const AdminView: React.FC = () => {
     }
   };
 
-  const handleToggleUserAchievement = async (targetUserId: string, achievementId: string, currentlyUnlocked: boolean) => {
-    setTogglingAssetId(achievementId);
-    try {
-      const action = currentlyUnlocked ? 'revoke' : 'grant';
-      const res = await authFetch(`/api/admin/users/${targetUserId}/achievements`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ achievement_id: achievementId, action }),
-      });
-      const data = await safeJson<any>(res, {});
-      if (res.ok) {
-        setStatusMessage(
-          action === 'grant'
-            ? lang === 'ru' ? 'Достижение выдано пользователю' : 'Achievement granted'
-            : lang === 'ru' ? 'Достижение отозвано у пользователя' : 'Achievement revoked'
-        );
-        await openUserDetails(targetUserId);
-        fetchAdminUsers(userSearch);
-      } else {
-        setErrorMessage(data.error || 'Failed to update achievement');
-      }
-    } catch (err: any) {
-      setErrorMessage(err?.message || 'Network error');
-    } finally {
-      setTogglingAssetId(null);
-    }
-  };
-
-  const handleToggleUserItem = async (targetUserId: string, itemId: string, currentlyOwned: boolean) => {
-    setTogglingAssetId(itemId);
-    try {
-      const action = currentlyOwned ? 'revoke' : 'grant';
-      const res = await authFetch(`/api/admin/users/${targetUserId}/items`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ item_id: itemId, action }),
-      });
-      const data = await safeJson<any>(res, {});
-      if (res.ok) {
-        setStatusMessage(
-          action === 'grant'
-            ? lang === 'ru' ? 'Предмет выдан в коллекцию пользователя' : 'Item granted'
-            : lang === 'ru' ? 'Предмет удалён из коллекции пользователя' : 'Item revoked'
-        );
-        await openUserDetails(targetUserId);
-        fetchAdminUsers(userSearch);
-      } else {
-        setErrorMessage(data.error || 'Failed to update item');
-      }
-    } catch (err: any) {
-      setErrorMessage(err?.message || 'Network error');
-    } finally {
-      setTogglingAssetId(null);
-    }
-  };
-
   const fetchAdminData = async () => {
     setLoading(true);
     try {
       const noStoreInit: RequestInit = { cache: 'no-store' };
-      const [resStats, resUsers, resAlb, resSng, resAud, resGame, resQuiz, resPosts, resCreations, resReports, resHealth, resLb] = await Promise.all([
-        authFetch('/api/admin/stats', noStoreInit),
-        authFetch('/api/admin/users', noStoreInit),
-        authFetch('/api/archive/albums', noStoreInit),
-        authFetch('/api/archive/singles', noStoreInit),
-        authFetch('/api/admin/audio-files', noStoreInit),
-        authFetch('/api/admin/game-tracks', noStoreInit),
-        authFetch('/api/admin/quiz-questions', noStoreInit),
+      const adminFlag = user?.role_id === 'admin';
+
+      const [resPosts, resCreations, resReports, resHealth] = await Promise.all([
         authFetch('/api/community/posts?status=all', noStoreInit),
         authFetch('/api/creations?status=all', noStoreInit),
         authFetch('/api/admin/reports', noStoreInit),
         fetch('/api/health', noStoreInit),
-        authFetch(`/api/admin/leaderboard?timeframe=${encodeURIComponent(lbTimeframe)}&game=${encodeURIComponent(lbGameFilter)}`, noStoreInit),
       ]);
 
-      if (resStats.ok) setStats((await safeJson<any>(resStats, {})).stats);
-      if (resUsers.ok) {
-        const uData = await safeJson<any>(resUsers, {});
-        setUsersList(uData.users || []);
-        if (uData.summary) setUsersSummary(uData.summary);
-      }
-      if (resAlb.ok) {
-        const albs = (await safeJson<any>(resAlb, {})).albums || [];
-        setAlbumsList(albs);
-        setTrackAlbumId((prev) => {
-          if (albs.length === 0) return '';
-          if (prev && albs.some((a: any) => a.id === prev)) return prev;
-          return albs[0].id;
-        });
-      }
-      if (resSng.ok) setSinglesList((await safeJson<any>(resSng, {})).singles || []);
-      if (resAud.ok) setMediaFilesList((await safeJson<any>(resAud, {})).files || []);
-      if (resGame.ok) setGameTracksList((await safeJson<any>(resGame, {})).tracks || []);
-      if (resQuiz.ok) {
-        const qData = await safeJson<any>(resQuiz, {});
-        setQuizQuestionsList(qData.questions || []);
-        setQuizPoolMeta({
-          custom_active_count: qData.custom_active_count ?? 0,
-          generated_pool_count: qData.generated_pool_count ?? 0,
-          total_pool_count: qData.total_pool_count ?? (qData.questions || []).length,
-        });
-      }
       if (resPosts.ok) setAllPostsList((await safeJson<any>(resPosts, {})).posts || []);
       if (resCreations.ok) setAllCreationsList((await safeJson<any>(resCreations, {})).creations || []);
       if (resReports.ok) setReportsList((await safeJson<any>(resReports, {})).reports || []);
       if (resHealth.ok) setHealthStatus(await safeJson<any>(resHealth, null));
-      if (resLb.ok) {
-        const lbData = await safeJson<any>(resLb, null);
-        if (lbData) {
-          setAdminLeaderboard(lbData.leaders || []);
-          setAdminLeaderboardSummary(lbData.summary || null);
+
+      if (adminFlag) {
+        const [resStats, resUsers, resAlb, resSng, resAud, resGame, resQuiz, resLb] = await Promise.all([
+          authFetch('/api/admin/stats', noStoreInit),
+          authFetch('/api/admin/users', noStoreInit),
+          authFetch('/api/archive/albums', noStoreInit),
+          authFetch('/api/archive/singles', noStoreInit),
+          authFetch('/api/admin/audio-files', noStoreInit),
+          authFetch('/api/admin/game-tracks', noStoreInit),
+          authFetch('/api/admin/quiz-questions', noStoreInit),
+          authFetch(`/api/admin/leaderboard?timeframe=${encodeURIComponent(lbTimeframe)}&game=${encodeURIComponent(lbGameFilter)}`, noStoreInit),
+        ]);
+
+        if (resStats.ok) setStats((await safeJson<any>(resStats, {})).stats);
+        if (resUsers.ok) {
+          const uData = await safeJson<any>(resUsers, {});
+          setUsersList(uData.users || []);
+          if (uData.summary) setUsersSummary(uData.summary);
+        }
+        if (resAlb.ok) {
+          const albs = (await safeJson<any>(resAlb, {})).albums || [];
+          setAlbumsList(albs);
+          setTrackAlbumId((prev) => {
+            if (albs.length === 0) return '';
+            if (prev && albs.some((a: any) => a.id === prev)) return prev;
+            return albs[0].id;
+          });
+        }
+        if (resSng.ok) setSinglesList((await safeJson<any>(resSng, {})).singles || []);
+        if (resAud.ok) setMediaFilesList((await safeJson<any>(resAud, {})).files || []);
+        if (resGame.ok) setGameTracksList((await safeJson<any>(resGame, {})).tracks || []);
+        if (resQuiz.ok) {
+          const qData = await safeJson<any>(resQuiz, {});
+          setQuizQuestionsList(qData.questions || []);
+          setQuizPoolMeta({
+            custom_active_count: qData.custom_active_count ?? 0,
+            generated_pool_count: qData.generated_pool_count ?? 0,
+            total_pool_count: qData.total_pool_count ?? (qData.questions || []).length,
+          });
+        }
+        if (resLb.ok) {
+          const lbData = await safeJson<any>(resLb, null);
+          if (lbData) {
+            setAdminLeaderboard(lbData.leaders || []);
+            setAdminLeaderboardSummary(lbData.summary || null);
+          }
         }
       }
     } catch (e) {
@@ -519,132 +497,6 @@ export const AdminView: React.FC = () => {
       }
     } catch (e: any) {
       setErrorMessage(e?.message || 'Ошибка сети');
-    }
-  };
-
-  const resetQuizForm = () => {
-    setEditingQuizId(null);
-    setQuizQuestionRu('');
-    setQuizQuestionEn('');
-    setQuizOpt0('');
-    setQuizOpt1('');
-    setQuizOpt2('');
-    setQuizOpt3('');
-    setQuizCorrectIndex('0');
-    setQuizExplanationRu('');
-    setQuizDifficulty('1');
-  };
-
-  const handleEditQuizQuestion = (q: any) => {
-    let parsedOpts: string[] = [];
-    try {
-      parsedOpts = Array.isArray(q.options) ? q.options : JSON.parse(q.options_json || '[]');
-    } catch {
-      parsedOpts = [];
-    }
-    setEditingQuizId(q.id);
-    setQuizQuestionRu(q.question_ru || '');
-    setQuizQuestionEn(q.question_en || '');
-    setQuizOpt0(parsedOpts[0] || '');
-    setQuizOpt1(parsedOpts[1] || '');
-    setQuizOpt2(parsedOpts[2] || '');
-    setQuizOpt3(parsedOpts[3] || '');
-    setQuizCorrectIndex(String(q.correct_index ?? 0));
-    setQuizExplanationRu(q.explanation_ru || '');
-    setQuizDifficulty(String(q.difficulty ?? 1));
-  };
-
-  const handleSaveQuizQuestion = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (savingQuiz) return;
-    const opts = [quizOpt0.trim(), quizOpt1.trim(), quizOpt2.trim(), quizOpt3.trim()].filter(Boolean);
-    if (!quizQuestionRu.trim() || opts.length < 2) {
-      setErrorMessage(lang === 'ru' ? 'Введите вопрос и минимум 2 варианта ответа' : 'Provide question and at least 2 options');
-      return;
-    }
-    const payload = {
-      question_ru: quizQuestionRu.trim(),
-      question_en: quizQuestionEn.trim() || quizQuestionRu.trim(),
-      options: opts,
-      correct_index: Math.min(parseInt(quizCorrectIndex, 10) || 0, opts.length - 1),
-      explanation_ru: quizExplanationRu.trim(),
-      explanation_en: quizExplanationRu.trim(),
-      difficulty: parseInt(quizDifficulty, 10) || 1,
-    };
-    setSavingQuiz(true);
-    try {
-      const res = editingQuizId
-        ? await authFetch(`/api/admin/quiz-questions/${editingQuizId}`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-          })
-        : await authFetch('/api/admin/quiz-questions', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-          });
-      if (res.ok) {
-        setStatusMessage(
-          editingQuizId
-            ? (lang === 'ru' ? 'Вопрос викторины обновлён' : 'Quiz question updated')
-            : (lang === 'ru' ? 'Вопрос викторины добавлен' : 'Quiz question added')
-        );
-        resetQuizForm();
-        fetchAdminData();
-      } else {
-        const data = await safeJson<{ error?: string }>(res, {});
-        setErrorMessage(data.error || (lang === 'ru' ? 'Не удалось сохранить вопрос' : 'Failed to save question'));
-      }
-    } catch (e: any) {
-      setErrorMessage(e?.message || 'Network error');
-    } finally {
-      setSavingQuiz(false);
-    }
-  };
-
-  const handleBulkImportQuiz = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (importingBulkQuiz || !bulkQuizText.trim()) return;
-    setImportingBulkQuiz(true);
-    setErrorMessage(null);
-    try {
-      const res = await authFetch('/api/admin/quiz-questions/bulk', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ raw_text: bulkQuizText }),
-      });
-      const data = await safeJson<{
-        imported_count?: number;
-        skipped_count?: number;
-        error?: string;
-        errors?: string[];
-      }>(res, {});
-      if (res.ok) {
-        const skippedNote =
-          data.skipped_count && data.skipped_count > 0
-            ? lang === 'ru'
-              ? ` (пропущено строк: ${data.skipped_count})`
-              : ` (${data.skipped_count} skipped)`
-            : '';
-        setStatusMessage(
-          lang === 'ru'
-            ? `Импортировано вопросов викторины: ${data.imported_count || 0}${skippedNote}`
-            : `Imported ${data.imported_count || 0} quiz questions${skippedNote}`
-        );
-        setBulkQuizText('');
-        setBulkQuizOpen(false);
-        fetchAdminData();
-      } else {
-        setErrorMessage(
-          data.error ||
-            (lang === 'ru' ? 'Не удалось импортировать вопросы.' : 'Failed to bulk import quiz questions.')
-        );
-      }
-    } catch (err: any) {
-      setErrorMessage(err?.message || 'Network error');
-    } finally {
-      setImportingBulkQuiz(false);
     }
   };
 
@@ -705,12 +557,16 @@ export const AdminView: React.FC = () => {
     }
   };
 
-  const handleModerateCreation = async (id: string, status: 'approved' | 'rejected') => {
+  const handleModerateCreation = async (
+    id: string,
+    status: 'approved' | 'rejected',
+    category?: 'art' | 'meme'
+  ) => {
     try {
       const res = await authFetch(`/api/admin/creations/${id}/moderate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status }),
+        body: JSON.stringify({ status, ...(category ? { category } : {}) }),
       });
       if (res.ok) {
         setStatusMessage(status === 'approved' ? 'Работа галереи одобрена' : 'Работа галереи отклонена');
@@ -765,7 +621,7 @@ export const AdminView: React.FC = () => {
     }
   };
 
-  // General Upload Handler (supports direct Supabase Storage signed upload for large MP3/WAV + server fallback)
+  // General Upload Handler (compresses images to WebP 1200px, enforces MP3/OGG/M4A <= 12MB, uses Supabase signed-url + fallback)
   const handleUploadFile = async (
     file: File,
     targetField: 'albumCover' | 'singleCover' | 'trackAudio' | 'singleAudio' | 'mediaStorage'
@@ -774,17 +630,28 @@ export const AdminView: React.FC = () => {
       setErrorMessage(lang === 'ru' ? 'Выбран пустой файл.' : 'Selected file is empty.');
       return;
     }
-    if (file.size > 100 * 1024 * 1024) {
-      setErrorMessage(lang === 'ru' ? 'Файл превышает лимит 100 МБ.' : 'File exceeds the 100 MB limit.');
-      return;
-    }
+
+    const allowAudio =
+      targetField === 'trackAudio' || targetField === 'singleAudio' || targetField === 'mediaStorage';
+    const allowImage =
+      targetField === 'albumCover' || targetField === 'singleCover' || targetField === 'mediaStorage';
+    const allowVideo = targetField === 'mediaStorage';
 
     setUploadingField(targetField);
     setStatusMessage(lang === 'ru' ? 'Загрузка файла...' : 'Uploading file...');
     setErrorMessage(null);
 
-    const applyUploadedResult = async (uploadedUrl: string, uploadedName: string) => {
-      const normalizedUrl = uploadedUrl.trim();
+    try {
+      const uploaded = await prepareAndUploadMedia(file, {
+        imageMode: 'artwork',
+        authFetch,
+        lang,
+        allowAudio,
+        allowImage,
+        allowVideo,
+      });
+
+      const normalizedUrl = uploaded.url.trim();
       if (targetField === 'albumCover') {
         updateAlbumCoverUrl(normalizedUrl);
       } else if (targetField === 'singleCover') {
@@ -798,117 +665,14 @@ export const AdminView: React.FC = () => {
       }
       setStatusMessage(
         lang === 'ru'
-          ? `Файл загружен и привязан к форме: ${uploadedName || file.name}. Нажмите «Сохранить» для записи в архив.`
-          : `Uploaded and attached to form: ${uploadedName || file.name}. Click Save to persist.`
+          ? `Файл загружен и привязан к форме: ${uploaded.filename || file.name}. Нажмите «Сохранить» для записи в архив.`
+          : `Uploaded and attached to form: ${uploaded.filename || file.name}. Click Save to persist.`
       );
       await fetchAdminData();
-    };
-
-    try {
-      // Attempt Step 1: direct signed Supabase Storage upload (bypasses Vercel 4.5MB body limit)
-      let directHandled = false;
-      let uploadedToCloudStorage = false;
-      try {
-        const signRes = await authFetch('/api/upload/signed-url', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            filename: file.name,
-            mimetype: file.type || 'application/octet-stream',
-            size: file.size,
-          }),
-        });
-        const signData = await safeJson<{
-          direct?: boolean;
-          signedUrl?: string;
-          storedFilename?: string;
-          url?: string;
-          error?: string;
-        }>(signRes, {});
-
-        if (!signRes.ok) {
-          setErrorMessage(signData.error || (lang === 'ru' ? 'Формат файла не поддерживается.' : 'File rejected.'));
-          setStatusMessage(null);
-          return;
-        }
-
-        if (signData.direct && signData.signedUrl && signData.storedFilename) {
-          const putRes = await fetch(signData.signedUrl, {
-            method: 'PUT',
-            headers: {
-              'Content-Type': file.type || 'application/octet-stream',
-              'x-upsert': 'true',
-            },
-            body: file,
-          });
-          if (!putRes.ok) {
-            throw new Error(
-              lang === 'ru'
-                ? `Ошибка облачного хранилища (HTTP ${putRes.status}). Проверьте настройки Supabase Storage.`
-                : `Cloud storage upload failed (HTTP ${putRes.status}).`
-            );
-          }
-          uploadedToCloudStorage = true;
-
-          const completeRes = await authFetch('/api/upload/complete', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              storedFilename: signData.storedFilename,
-              originalName: file.name,
-              mimetype: file.type || 'application/octet-stream',
-              size: file.size,
-            }),
-          });
-          const completeData = await safeJson<{ url?: string; filename?: string; error?: string }>(completeRes, {});
-          if (!completeRes.ok || !completeData.url) {
-            throw new Error(
-              completeData.error ||
-                (lang === 'ru'
-                  ? `Файл загружен в Supabase, но не удалось зарегистрировать запись (HTTP ${completeRes.status}).`
-                  : `Uploaded to Supabase, but failed to register metadata (HTTP ${completeRes.status}).`)
-            );
-          }
-          directHandled = true;
-          await applyUploadedResult(completeData.url, completeData.filename || file.name);
-        }
-      } catch (directErr: any) {
-        if (uploadedToCloudStorage || file.size > 4 * 1024 * 1024) {
-          throw directErr;
-        }
-      }
-
-      if (directHandled) return;
-
-      // Fallback: standard multipart POST to /api/upload
-      const formData = new FormData();
-      formData.append('file', file);
-
-      const res = await authFetch('/api/upload', {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (res.status === 413) {
-        setErrorMessage(
-          lang === 'ru'
-            ? 'Файл слишком большой для прямого серверного запроса (лимит хостинга ~4.5 МБ). Подключите Supabase Storage для загрузки крупных MP3/WAV.'
-            : 'File exceeds direct serverless upload limit (~4.5 MB). Configure Supabase Storage for large MP3/WAV files.'
-        );
-        setStatusMessage(null);
-        return;
-      }
-
-      const data = await safeJson<{ url?: string; error?: string; filename?: string }>(res, {});
-      if (!res.ok || !data.url) {
-        setErrorMessage(data.error || (lang === 'ru' ? `Ошибка загрузки (HTTP ${res.status})` : `Upload error (HTTP ${res.status})`));
-        setStatusMessage(null);
-        return;
-      }
-
-      await applyUploadedResult(data.url, data.filename || file.name);
     } catch (err: any) {
-      setErrorMessage(err?.message || (lang === 'ru' ? 'Ошибка сети при загрузке файла' : 'Upload failed due to network error'));
+      setErrorMessage(
+        err?.message || (lang === 'ru' ? 'Ошибка сети при загрузке файла' : 'Upload failed due to network error')
+      );
       setStatusMessage(null);
     } finally {
       setUploadingField(null);
@@ -1453,46 +1217,54 @@ export const AdminView: React.FC = () => {
         </div>
       </div>
 
-      {/* Main Tabs Navigation */}
-      <div className="flex items-center gap-2 border-b border-white/[0.08] pb-2 overflow-x-auto no-scrollbar w-full max-w-full">
-        {[
-          { id: 'discography', label: lang === 'ru' ? 'Альбомы & EP' : 'Albums & EPs', icon: Disc, count: albumsList.length },
-          { id: 'singles', label: lang === 'ru' ? 'Синглы' : 'Singles', icon: Music, count: singlesList.length },
-          { id: 'media', label: lang === 'ru' ? 'Медиатека (MP3 / WAV)' : 'Media Storage', icon: Library, count: mediaFilesList.length },
-          { id: 'gametracks', label: lang === 'ru' ? 'Игры & Викторина' : 'Games & Quiz', icon: Volume2, count: gameTracksList.length },
-          { id: 'leaderboard', label: lang === 'ru' ? 'Таблица лидеров' : 'Leaderboards', icon: Trophy, count: adminLeaderboardSummary?.total_ranked ?? adminLeaderboard.length },
-          { id: 'moderation', label: lang === 'ru' ? 'Модерация & Посты' : 'Moderation', icon: ShieldAlert, count: pendingPosts.length + pendingCreations.length + pendingReports.length },
-          { id: 'users', label: lang === 'ru' ? 'Пользователи и статистика' : 'Users & Stats', icon: Users, count: usersSummary?.total_users ?? usersList.length },
-          { id: 'stats', label: lang === 'ru' ? 'Статистика' : 'Statistics', icon: Activity },
-        ].map((tab) => {
-          const Icon = tab.icon;
-          const isActive = activeTab === tab.id;
-          return (
-            <button
-              key={tab.id}
-              onClick={() => setActiveTab(tab.id as any)}
-              className={`flex items-center gap-2 px-4 py-2.5 text-xs font-mono uppercase tracking-wider transition-all shrink-0 rounded-lg cursor-pointer ${
-                isActive
-                  ? 'bg-white/[0.12] text-white font-medium border border-white/20 shadow-md'
-                  : 'text-ash hover:text-white hover:bg-white/[0.04]'
-              }`}
-            >
-              <Icon className="w-4 h-4" />
-              <span>{tab.label}</span>
-              {tab.count !== undefined && (
-                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-white/[0.08] text-ash">
-                  {tab.count}
-                </span>
-              )}
-            </button>
-          );
-        })}
+      {/* Main Tabs Navigation (RBAC Filtered & Wrapped) */}
+      <div className="flex flex-wrap items-center gap-2 border-b border-white/[0.08] pb-3 w-full">
+        {([
+          { id: 'discography', label: lang === 'ru' ? 'Альбомы & EP' : 'Albums & EPs', icon: Disc, count: albumsList.length, adminOnly: true },
+          { id: 'singles', label: lang === 'ru' ? 'Синглы' : 'Singles', icon: Music, count: singlesList.length, adminOnly: true },
+          { id: 'media', label: lang === 'ru' ? 'Медиатека' : 'Media', icon: Library, count: mediaFilesList.length, adminOnly: true },
+          { id: 'gametracks', label: lang === 'ru' ? 'Аудио игр' : 'Game Audio', icon: Volume2, count: gameTracksList.length, adminOnly: true },
+          { id: 'quiz', label: lang === 'ru' ? 'Викторина' : 'Quiz', icon: Sparkles, count: quizPoolMeta?.total_pool_count ?? quizQuestionsList.length, adminOnly: true },
+          { id: 'leaderboard', label: lang === 'ru' ? 'Лидеры' : 'Leaderboards', icon: Trophy, count: adminLeaderboardSummary?.total_ranked ?? adminLeaderboard.length, adminOnly: true },
+          { id: 'moderation', label: lang === 'ru' ? 'Модерация' : 'Moderation', icon: ShieldAlert, count: pendingPosts.length + pendingCreations.length + pendingReports.length, adminOnly: false },
+          { id: 'users', label: lang === 'ru' ? 'Пользователи' : 'Users', icon: Users, count: usersSummary?.total_users ?? usersList.length, adminOnly: true },
+          { id: 'user_reset', label: lang === 'ru' ? 'Сброс пользователей' : 'User Reset', icon: RotateCcw, adminOnly: true },
+          { id: 'news', label: lang === 'ru' ? 'Новости сайта' : 'Site News', icon: Megaphone, adminOnly: true },
+          { id: 'promos', label: lang === 'ru' ? 'Промокоды' : 'Promo Codes', icon: Ticket, adminOnly: true },
+          { id: 'shop', label: lang === 'ru' ? 'Магазин и Шилды' : 'Shop & Shields', icon: Store, adminOnly: true },
+          { id: 'rules', label: lang === 'ru' ? 'Правила' : 'Rules', icon: BookOpen, adminOnly: false },
+          { id: 'stats', label: lang === 'ru' ? 'Статистика' : 'Statistics', icon: Activity, adminOnly: true },
+        ] as Array<{ id: AdminTabId; label: string; icon: any; count?: number; adminOnly?: boolean }>)
+          .filter((tab) => isAdmin || !tab.adminOnly)
+          .map((tab) => {
+            const Icon = tab.icon;
+            const isActive = activeTab === tab.id;
+            return (
+              <button
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id)}
+                className={`flex items-center gap-1.5 px-3 py-2 text-[11px] font-mono uppercase tracking-wider transition-all shrink-0 rounded-lg cursor-pointer ${
+                  isActive
+                    ? 'bg-white/[0.12] text-white font-medium border border-white/20 shadow-md'
+                    : 'text-ash hover:text-white hover:bg-white/[0.04] border border-transparent'
+                }`}
+              >
+                <Icon className="w-3.5 h-3.5" />
+                <span>{tab.label}</span>
+                {tab.count !== undefined && (
+                  <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-white/[0.08] text-ash">
+                    {tab.count}
+                  </span>
+                )}
+              </button>
+            );
+          })}
       </div>
 
       {/* ==================================================================== */}
-      {/* TAB 1: ALBUMS & EPS (DISCOGRAPHY) */}
+      {/* TAB 1: ALBUMS & EPS (DISCOGRAPHY - ADMIN ONLY) */}
       {/* ==================================================================== */}
-      {activeTab === 'discography' && (
+      {isAdmin && activeTab === 'discography' && (
         <motion.div
           key="discography"
           initial={{ opacity: 0, y: 10 }}
@@ -1619,6 +1391,7 @@ export const AdminView: React.FC = () => {
                       <img
                         src={albumCoverUrl}
                         alt="Album cover preview"
+                        loading="lazy"
                         className="w-12 h-12 object-cover rounded shadow shrink-0"
                         onError={(e) => ((e.target as HTMLElement).style.display = 'none')}
                       />
@@ -1985,7 +1758,7 @@ export const AdminView: React.FC = () => {
                   <input
                     type="file"
                     ref={trackAudioInputRef}
-                    accept="audio/*,.mp3,.wav,.wave,.flac,.ogg,.m4a"
+                    accept={AUDIO_ACCEPT_ATTR}
                     onChange={(e) => {
                       const f = e.target.files?.[0];
                       e.target.value = '';
@@ -2031,7 +1804,7 @@ export const AdminView: React.FC = () => {
                           </span>
                         </span>
                       </div>
-                      <audio controls preload="metadata" src={trackAudioUrl} className="w-full h-8 rounded" />
+                      <audio controls preload="none" src={trackAudioUrl} className="w-full h-8 rounded" />
                     </div>
                   )}
                 </div>
@@ -2071,7 +1844,7 @@ export const AdminView: React.FC = () => {
       {/* ==================================================================== */}
       {/* TAB 2: SINGLES MANAGEMENT */}
       {/* ==================================================================== */}
-      {activeTab === 'singles' && (
+      {isAdmin && activeTab === 'singles' && (
         <motion.div
           key="singles"
           initial={{ opacity: 0, y: 10 }}
@@ -2196,6 +1969,7 @@ export const AdminView: React.FC = () => {
                       <img
                         src={singleCoverUrl}
                         alt="Single cover preview"
+                        loading="lazy"
                         className="w-12 h-12 object-cover rounded shadow shrink-0"
                         onError={(e) => ((e.target as HTMLElement).style.display = 'none')}
                       />
@@ -2247,7 +2021,7 @@ export const AdminView: React.FC = () => {
                 <input
                   type="file"
                   ref={singleAudioInputRef}
-                  accept="audio/*,.mp3,.wav,.wave,.flac,.ogg,.m4a"
+                  accept={AUDIO_ACCEPT_ATTR}
                   onChange={(e) => {
                     const f = e.target.files?.[0];
                     e.target.value = '';
@@ -2289,7 +2063,7 @@ export const AdminView: React.FC = () => {
                         {lang === 'ru' ? `Привязано: ${singleAudioUrl}` : `Attached: ${singleAudioUrl}`}
                       </span>
                     </div>
-                    <audio controls preload="metadata" src={singleAudioUrl} className="w-full h-8 rounded" />
+                    <audio controls preload="none" src={singleAudioUrl} className="w-full h-8 rounded" />
                   </div>
                 )}
               </div>
@@ -2480,7 +2254,7 @@ export const AdminView: React.FC = () => {
       {/* ==================================================================== */}
       {/* TAB 3: MEDIA STORAGE (MP3, WAV, COVERS) */}
       {/* ==================================================================== */}
-      {activeTab === 'media' && (
+      {isAdmin && activeTab === 'media' && (
         <motion.div
           key="media"
           initial={{ opacity: 0, y: 10 }}
@@ -2494,12 +2268,12 @@ export const AdminView: React.FC = () => {
               <div>
                 <h3 className="font-title text-2xl text-ivory font-light uppercase tracking-wider flex items-center gap-2">
                   <Library className="w-6 h-6 text-[#c49298]" />
-                  <span>{lang === 'ru' ? 'Хранилище медиафайлов (MP3, WAV, Обложки)' : 'Media Storage Repository'}</span>
+                  <span>{lang === 'ru' ? 'Хранилище медиафайлов (MP3, OGG, M4A, Обложки)' : 'Media Storage Repository'}</span>
                 </h3>
                 <p className="font-sans text-xs text-ash mt-1 max-w-xl">
                   {lang === 'ru'
-                    ? 'Загружайте любые треки в форматах MP3, WAV, OGG, FLAC (до 100 МБ) или изображения обложек. После загрузки вы можете скопировать ссылку в один клик или вставить файл в треклист.'
-                    : 'Upload any audio tracks in MP3, WAV, OGG, FLAC formats (up to 100 MB) or cover artwork. Copy direct paths with 1-click or assign to tracks.'}
+                    ? 'Загружайте треки в форматах MP3, OGG, M4A (до 12 МБ) или изображения обложек (автосжатие в WebP). После загрузки вы можете скопировать ссылку в один клик или вставить файл в треклист.'
+                    : 'Upload audio tracks in MP3, OGG, M4A formats (up to 12 MB) or cover artwork (auto-compressed to WebP). Copy direct paths with 1-click or assign to tracks.'}
                 </p>
               </div>
 
@@ -2519,7 +2293,7 @@ export const AdminView: React.FC = () => {
                 <input
                   type="file"
                   ref={mediaStorageInputRef}
-                  accept="audio/*,image/*,.mp3,.wav,.wave,.flac,.ogg,.m4a,.jpg,.jpeg,.png,.webp"
+                  accept={`${AUDIO_ACCEPT_ATTR},image/*,.jpg,.jpeg,.png,.webp`}
                   onChange={(e) => {
                     const f = e.target.files?.[0];
                     e.target.value = '';
@@ -2640,7 +2414,7 @@ export const AdminView: React.FC = () => {
       {/* ==================================================================== */}
       {/* TAB 4: USERS & ADMIN ACCOUNT BINDING */}
       {/* ==================================================================== */}
-      {activeTab === 'users' && (
+      {isAdmin && activeTab === 'users' && (
         <motion.div
           key="users"
           initial={{ opacity: 0, y: 10 }}
@@ -2826,7 +2600,7 @@ export const AdminView: React.FC = () => {
                     <div className="flex items-start sm:items-center gap-3.5 min-w-0">
                       <div className="w-11 h-11 rounded-full bg-[#1c1a24] border border-white/10 flex items-center justify-center font-title text-base text-ivory uppercase overflow-hidden shrink-0">
                         {u.avatar_url ? (
-                          <img src={u.avatar_url} alt={displayName} className="w-full h-full object-cover" />
+                          <img src={u.avatar_url} alt={displayName} loading="lazy" className="w-full h-full object-cover" />
                         ) : (
                           displayName?.[0] || 'A'
                         )}
@@ -2951,7 +2725,7 @@ export const AdminView: React.FC = () => {
       {/* ==================================================================== */}
       {/* TAB 5: STATS */}
       {/* ==================================================================== */}
-      {activeTab === 'stats' && (
+      {isAdmin && activeTab === 'stats' && (
         <motion.div
           key="stats"
           initial={{ opacity: 0, y: 10 }}
@@ -3013,7 +2787,7 @@ export const AdminView: React.FC = () => {
                   <span className="text-ash/60 block">{lang === 'ru' ? 'Прямая загрузка MP3 в облако:' : 'Direct Cloud MP3 Upload:'}</span>
                   <span className="text-ivory">
                     {healthStatus.direct_media_upload_enabled
-                      ? (lang === 'ru' ? 'Активна (до 100 МБ)' : 'Active (up to 100 MB)')
+                      ? (lang === 'ru' ? 'Активна (аудио до 12 МБ)' : 'Active (audio up to 12 MB)')
                       : (lang === 'ru' ? 'Ожидает ключи Supabase' : 'Requires Supabase env keys')}
                   </span>
                 </div>
@@ -3030,9 +2804,9 @@ export const AdminView: React.FC = () => {
       )}
 
       {/* ==================================================================== */}
-      {/* TAB: GAME AUDIO POOL (AUTOMATIC LINKING) */}
+      {/* TAB: GAME AUDIO POOL (AUTOMATIC LINKING - ADMIN ONLY) */}
       {/* ==================================================================== */}
-      {activeTab === 'gametracks' && (
+      {isAdmin && activeTab === 'gametracks' && (
         <motion.div
           key="gametracks"
           initial={{ opacity: 0, y: 10 }}
@@ -3046,8 +2820,8 @@ export const AdminView: React.FC = () => {
               <Volume2 className="w-4 h-4 text-[#821c2c]" />
               <span>
                 {lang === 'ru'
-                  ? 'Автоматический пул треков для испытания «Угадай трек»'
-                  : 'Automatic Track Pool for «Guess The Track»'}
+                  ? 'Автоматический пул треков для музыкальных режимов (Угадай трек / Реверс / 0.5x–2.5x)'
+                  : 'Automatic Track Pool for Music Modes'}
               </span>
             </div>
             <p className="text-ash leading-relaxed font-sans">
@@ -3124,237 +2898,22 @@ export const AdminView: React.FC = () => {
               </div>
             )}
           </div>
-
-          {/* Daily Quiz Pool Overview + Bulk Import Toggle */}
-          <div className="bg-[#100f13] border border-white/[0.08] rounded-xl p-5 space-y-4">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-              <div className="space-y-1">
-                <div className="flex flex-wrap items-center gap-2 font-mono text-xs text-white">
-                  <Sparkles className="w-4 h-4 text-[#c49298]" />
-                  <span className="uppercase tracking-wider font-medium">
-                    {lang === 'ru' ? 'Пул ежедневной викторины (5 вопросов/день · автоперемешивание)' : 'Daily Quiz Pool (5/day · shuffled options)'}
-                  </span>
-                </div>
-                <div className="flex flex-wrap items-center gap-2 font-mono text-[11px] text-ash">
-                  <span className="px-2 py-0.5 rounded bg-white/[0.06] border border-white/[0.1] text-white">
-                    {lang === 'ru' ? 'Всего в пуле' : 'Total pool'}: {quizPoolMeta?.total_pool_count ?? quizQuestionsList.length}
-                  </span>
-                  <span className="px-2 py-0.5 rounded bg-[#1a3820]/50 border border-[#388548]/50 text-[#6ee7b7]">
-                    {lang === 'ru' ? 'Авто из дискографии' : 'Auto from discography'}: {quizPoolMeta?.generated_pool_count ?? 0}
-                  </span>
-                  <span className="px-2 py-0.5 rounded bg-[#821c2c]/25 border border-[#821c2c]/50 text-[#f5c6cb]">
-                    {lang === 'ru' ? 'Ручных в БД' : 'Custom in DB'}: {quizPoolMeta?.custom_active_count ?? quizQuestionsList.length}
-                  </span>
-                </div>
-              </div>
-
-              <button
-                type="button"
-                onClick={() => setBulkQuizOpen((prev) => !prev)}
-                className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg bg-white/[0.08] hover:bg-white/[0.16] border border-white/[0.14] text-xs font-mono uppercase tracking-wider text-white cursor-pointer shrink-0"
-              >
-                <Upload className="w-3.5 h-3.5" />
-                <span>{lang === 'ru' ? 'Массовый импорт вопросов' : 'Bulk Import Questions'}</span>
-              </button>
-            </div>
-
-            {bulkQuizOpen && (
-              <form onSubmit={handleBulkImportQuiz} className="pt-3 border-t border-white/[0.08] space-y-3">
-                <div className="text-[11px] text-ash font-sans leading-relaxed">
-                  {lang === 'ru'
-                    ? 'Вставьте список вопросов — по одному на строку в формате «Вопрос | Вариант A | Вариант B | Вариант C | Вариант D | Номер правильного (1-4) | Пояснение | Сложность (1-3)» или в формате JSON-массива.'
-                    : 'Paste one question per line as "Question | Option A | Option B | Option C | Option D | Correct (1-4) | Explanation | Difficulty (1-3)" or a JSON array.'}
-                </div>
-                <textarea
-                  rows={5}
-                  value={bulkQuizText}
-                  onChange={(e) => setBulkQuizText(e.target.value)}
-                  placeholder={
-                    lang === 'ru'
-                      ? 'В каком году вышел альбом «deathmarried»? | 2024 | 2025 | 2026 | 2023 | 2 | Альбом вышел в 2025 году | 1'
-                      : 'Which year was deathmarried released? | 2024 | 2025 | 2026 | 2023 | 2 | Released in 2025 | 1'
-                  }
-                  className="w-full px-3 py-2.5 bg-[#16151a] border border-white/[0.12] rounded-lg text-xs font-mono text-white placeholder:text-ash/40 focus:outline-none focus:border-[#821c2c]"
-                />
-                <div className="flex items-center justify-end gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setBulkQuizOpen(false)}
-                    className="px-3.5 py-2 rounded-lg bg-white/[0.05] hover:bg-white/[0.1] text-xs font-mono text-ash hover:text-white cursor-pointer"
-                  >
-                    {lang === 'ru' ? 'Отмена' : 'Cancel'}
-                  </button>
-                  <button
-                    type="submit"
-                    disabled={importingBulkQuiz || !bulkQuizText.trim()}
-                    className="px-4 py-2 rounded-lg bg-[#5a1622] hover:bg-[#721b2b] border border-[#821c2c] text-xs font-mono uppercase tracking-wider text-white disabled:opacity-50 cursor-pointer"
-                  >
-                    {importingBulkQuiz
-                      ? lang === 'ru' ? 'Импорт...' : 'Importing...'
-                      : lang === 'ru' ? 'Импортировать в банк' : 'Import Questions'}
-                  </button>
-                </div>
-              </form>
-            )}
-          </div>
-
-          {/* Daily Quiz Questions Manager */}
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 pt-2">
-            <div className="lg:col-span-5 bg-[#100f13] border border-white/[0.08] rounded-xl p-6 space-y-4">
-              <div className="flex items-center justify-between border-b border-white/[0.06] pb-3">
-                <h3 className="font-title text-xl text-ivory font-light uppercase tracking-wider flex items-center gap-2">
-                  <Sparkles className="w-5 h-5 text-[#c49298]" />
-                  <span>
-                    {editingQuizId
-                      ? (lang === 'ru' ? 'Редактировать вопрос' : 'Edit Quiz Question')
-                      : (lang === 'ru' ? 'Добавить вопрос викторины' : 'Add Quiz Question')}
-                  </span>
-                </h3>
-                {editingQuizId && (
-                  <button
-                    type="button"
-                    onClick={resetQuizForm}
-                    className="font-mono text-[10px] uppercase text-ash hover:text-white flex items-center gap-1 cursor-pointer px-2 py-1 bg-white/[0.04] rounded"
-                  >
-                    <RotateCcw className="w-3 h-3" />
-                    <span>{lang === 'ru' ? 'Сброс' : 'Reset'}</span>
-                  </button>
-                )}
-              </div>
-              <form onSubmit={handleSaveQuizQuestion} className="space-y-3 text-xs font-sans">
-                <input
-                  type="text"
-                  required
-                  value={quizQuestionRu}
-                  onChange={(e) => setQuizQuestionRu(e.target.value)}
-                  placeholder={lang === 'ru' ? 'Текст вопроса (RU) *' : 'Question text (RU) *'}
-                  className="w-full px-3 py-2 bg-[#16151a] border border-white/[0.1] rounded-lg text-white focus:outline-none"
-                />
-                <input
-                  type="text"
-                  value={quizQuestionEn}
-                  onChange={(e) => setQuizQuestionEn(e.target.value)}
-                  placeholder={lang === 'ru' ? 'Текст вопроса (EN, опционально)' : 'Question text (EN, optional)'}
-                  className="w-full px-3 py-2 bg-[#16151a] border border-white/[0.1] rounded-lg text-white focus:outline-none"
-                />
-                <div className="grid grid-cols-2 gap-2">
-                  <input type="text" required value={quizOpt0} onChange={(e) => setQuizOpt0(e.target.value)} placeholder="A *" className="px-3 py-2 bg-[#16151a] border border-white/[0.1] rounded text-white" />
-                  <input type="text" required value={quizOpt1} onChange={(e) => setQuizOpt1(e.target.value)} placeholder="B *" className="px-3 py-2 bg-[#16151a] border border-white/[0.1] rounded text-white" />
-                  <input type="text" value={quizOpt2} onChange={(e) => setQuizOpt2(e.target.value)} placeholder="C" className="px-3 py-2 bg-[#16151a] border border-white/[0.1] rounded text-white" />
-                  <input type="text" value={quizOpt3} onChange={(e) => setQuizOpt3(e.target.value)} placeholder="D" className="px-3 py-2 bg-[#16151a] border border-white/[0.1] rounded text-white" />
-                </div>
-                <div className="grid grid-cols-2 gap-2">
-                  <div>
-                    <label className="block font-mono text-[10px] text-ash mb-1 uppercase">
-                      {lang === 'ru' ? 'Правильный ответ' : 'Correct Option'}
-                    </label>
-                    <select value={quizCorrectIndex} onChange={(e) => setQuizCorrectIndex(e.target.value)} className="w-full px-3 py-2 bg-[#16151a] border border-white/[0.1] rounded text-white font-mono">
-                      <option value="0">A</option>
-                      <option value="1">B</option>
-                      <option value="2">C</option>
-                      <option value="3">D</option>
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block font-mono text-[10px] text-ash mb-1 uppercase">
-                      {lang === 'ru' ? 'Сложность' : 'Difficulty'}
-                    </label>
-                    <select value={quizDifficulty} onChange={(e) => setQuizDifficulty(e.target.value)} className="w-full px-3 py-2 bg-[#16151a] border border-white/[0.1] rounded text-white font-mono">
-                      <option value="1">{lang === 'ru' ? '1 — Обычная' : '1 — Normal'}</option>
-                      <option value="2">{lang === 'ru' ? '2 — Средняя' : '2 — Medium'}</option>
-                      <option value="3">{lang === 'ru' ? '3 — Сложная' : '3 — Hard'}</option>
-                    </select>
-                  </div>
-                </div>
-                <input
-                  type="text"
-                  value={quizExplanationRu}
-                  onChange={(e) => setQuizExplanationRu(e.target.value)}
-                  placeholder={lang === 'ru' ? 'Пояснение (опционально)' : 'Explanation (optional)'}
-                  className="w-full px-3 py-2 bg-[#16151a] border border-white/[0.1] rounded-lg text-white focus:outline-none"
-                />
-                <button
-                  type="submit"
-                  disabled={savingQuiz}
-                  className="w-full py-2.5 font-mono text-xs uppercase tracking-widest bg-white/[0.1] hover:bg-white/[0.2] disabled:opacity-50 text-white border border-white/20 rounded-lg cursor-pointer"
-                >
-                  {savingQuiz
-                    ? (lang === 'ru' ? 'Сохранение...' : 'Saving...')
-                    : editingQuizId
-                      ? t('saveBtn')
-                      : (lang === 'ru' ? 'Добавить вопрос' : 'Add Question')}
-                </button>
-              </form>
-            </div>
-
-            <div className="lg:col-span-7 bg-[#100f13] border border-white/[0.08] rounded-xl p-6 space-y-4">
-              <div className="flex items-center justify-between gap-2">
-                <h3 className="font-title text-xl text-ivory font-light uppercase tracking-wider">
-                  {lang === 'ru' ? 'Ручные вопросы викторины' : 'Custom Quiz Questions'} ({quizQuestionsList.length})
-                </h3>
-                <span className="font-mono text-[10px] text-ash/70">
-                  {lang === 'ru' ? 'Варианты перемешиваются автоматически' : 'Options auto-shuffled daily'}
-                </span>
-              </div>
-              <div className="divide-y divide-white/[0.05] max-h-[460px] overflow-y-auto pr-1">
-                {quizQuestionsList.map((q) => {
-                  let qOpts: string[] = [];
-                  try {
-                    qOpts = Array.isArray(q.options) ? q.options : JSON.parse(q.options_json || '[]');
-                  } catch {
-                    qOpts = [];
-                  }
-                  return (
-                    <div key={q.id} className="py-3 flex items-start justify-between gap-3">
-                      <div className="space-y-1.5 min-w-0 flex-1">
-                        <div className="text-xs text-white font-sans font-medium">
-                          {lang === 'ru' ? q.question_ru : q.question_en}
-                        </div>
-                        {qOpts.length > 0 && (
-                          <div className="flex flex-wrap gap-1.5 font-mono text-[10px]">
-                            {qOpts.map((opt, idx) => (
-                              <span
-                                key={idx}
-                                className={`px-2 py-0.5 rounded border ${
-                                  idx === Number(q.correct_index)
-                                    ? 'bg-[#1a3820]/70 border-[#388548] text-[#6ee7b7]'
-                                    : 'bg-white/[0.03] border-white/[0.08] text-ash/80'
-                                }`}
-                              >
-                                {String.fromCharCode(65 + idx)}: {opt}
-                              </span>
-                            ))}
-                          </div>
-                        )}
-                        <div className="font-mono text-[10px] text-ash/65">
-                          {lang === 'ru' ? 'Сложность' : 'Difficulty'}: {q.difficulty || 1} · {formatAdminDate(q.created_at)}
-                        </div>
-                      </div>
-                      <div className="flex items-center gap-1 shrink-0">
-                        <button
-                          type="button"
-                          onClick={() => handleEditQuizQuestion(q)}
-                          className="p-1.5 rounded hover:bg-white/[0.08] text-ash hover:text-white transition-colors cursor-pointer"
-                          title={t('editBtn')}
-                        >
-                          <Edit2 className="w-3.5 h-3.5" />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setDeleteModal({ type: 'quiz', id: q.id, name: q.question_ru })}
-                          className="p-1.5 rounded hover:bg-red-950/60 text-ash hover:text-red-400 transition-colors cursor-pointer"
-                          title={t('deleteBtn')}
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          </div>
         </motion.div>
+      )}
+
+      {/* ==================================================================== */}
+      {/* TAB: DEDICATED QUIZ MANAGEMENT (ADMIN ONLY) */}
+      {/* ==================================================================== */}
+      {isAdmin && activeTab === 'quiz' && (
+        <AdminQuizTab
+          lang={lang}
+          quizQuestionsList={quizQuestionsList}
+          quizPoolMeta={quizPoolMeta}
+          onRefresh={fetchAdminData}
+          onRequestDeleteQuiz={(q) => setDeleteModal({ type: 'quiz', id: q.id, name: q.question_ru })}
+          onNotify={(msg) => setStatusMessage(msg)}
+          onError={(msg) => setErrorMessage(msg)}
+        />
       )}
 
       {/* ==================================================================== */}
@@ -3393,10 +2952,22 @@ export const AdminView: React.FC = () => {
                     : 'text-ash hover:text-white'
                 }`}
               >
-                <span>Работы галереи</span>
+                <span>{lang === 'ru' ? 'Творчество и мемы' : 'Gallery & Memes'}</span>
                 <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-white/[0.08]">
                   {moderationStatusFilter === 'pending' ? pendingCreations.length : allCreationsList.length}
                 </span>
+              </button>
+
+              <button
+                onClick={() => setModerationSection('comments')}
+                className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-all cursor-pointer uppercase shrink-0 ${
+                  moderationSection === 'comments'
+                    ? 'bg-white/[0.1] text-white border border-white/20'
+                    : 'text-ash hover:text-white'
+                }`}
+              >
+                <MessageSquare className="w-3.5 h-3.5" />
+                <span>{lang === 'ru' ? 'Комментарии' : 'Comments'}</span>
               </button>
 
               <button
@@ -3407,14 +2978,14 @@ export const AdminView: React.FC = () => {
                     : 'text-ash hover:text-white'
                 }`}
               >
-                <span>Жалобы</span>
+                <span>{lang === 'ru' ? 'Жалобы' : 'Reports'}</span>
                 <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-[#821c2c]/60 text-white">
                   {pendingReports.length}
                 </span>
               </button>
             </div>
 
-            {moderationSection !== 'reports' && (
+            {(moderationSection === 'posts' || moderationSection === 'creations') && (
               <div className="flex items-center gap-1.5 shrink-0">
                 <button
                   type="button"
@@ -3551,7 +3122,7 @@ export const AdminView: React.FC = () => {
 
                       {post.media_url && (
                         <div className="rounded-lg overflow-hidden max-h-60 border border-white/10 bg-black">
-                          <img src={post.media_url} alt={post.title} className="max-h-60 object-contain" />
+                          <img src={post.media_url} alt={post.title} loading="lazy" className="max-h-60 object-contain" />
                         </div>
                       )}
                     </div>
@@ -3601,11 +3172,31 @@ export const AdminView: React.FC = () => {
                           </h3>
                         </div>
 
-                        <div className="flex items-center gap-2 font-mono text-xs shrink-0">
+                        <div className="flex flex-wrap items-center gap-2 font-mono text-xs shrink-0">
+                          <select
+                            value={creationCategoryOverrides[creation.id] ?? (creation.category === 'meme' ? 'meme' : 'art')}
+                            onChange={(e) =>
+                              setCreationCategoryOverrides((prev) => ({
+                                ...prev,
+                                [creation.id]: e.target.value === 'meme' ? 'meme' : 'art',
+                              }))
+                            }
+                            aria-label="Категория публикации"
+                            className="px-2.5 py-1.5 rounded-lg bg-[#16151a] border border-white/[0.14] text-white text-[11px] focus:outline-none focus:border-white/30"
+                          >
+                            <option value="art">Творчество (15 XP)</option>
+                            <option value="meme">Мемы (5 XP)</option>
+                          </select>
                           {creation.status !== 'approved' && (
                             <button
                               type="button"
-                              onClick={() => handleModerateCreation(creation.id, 'approved')}
+                              onClick={() =>
+                                handleModerateCreation(
+                                  creation.id,
+                                  'approved',
+                                  creationCategoryOverrides[creation.id] ?? (creation.category === 'meme' ? 'meme' : 'art')
+                                )
+                              }
                               className="px-3 py-1.5 rounded-lg bg-[#1a3820] hover:bg-[#234b2b] border border-[#388548] text-[#6ee7b7] cursor-pointer font-semibold"
                             >
                               Одобрить
@@ -3614,7 +3205,13 @@ export const AdminView: React.FC = () => {
                           {creation.status !== 'rejected' && (
                             <button
                               type="button"
-                              onClick={() => handleModerateCreation(creation.id, 'rejected')}
+                              onClick={() =>
+                                handleModerateCreation(
+                                  creation.id,
+                                  'rejected',
+                                  creationCategoryOverrides[creation.id] ?? (creation.category === 'meme' ? 'meme' : 'art')
+                                )
+                              }
                               className="px-3 py-1.5 rounded-lg bg-[#3d1820] hover:bg-[#4d1f2a] border border-[#8a2a38] text-white cursor-pointer"
                             >
                               Отклонить
@@ -3647,11 +3244,11 @@ export const AdminView: React.FC = () => {
                       {creation.media_url && (
                         <div className="rounded-lg overflow-hidden max-h-72 border border-white/10 bg-black flex items-center justify-center p-2">
                           {creation.media_type === 'image' ? (
-                            <img src={creation.media_url} alt={creation.title} className="max-h-72 object-contain" />
+                            <img src={creation.media_url} alt={creation.title} loading="lazy" className="max-h-72 object-contain" />
                           ) : creation.media_type === 'video' ? (
                             <video src={creation.media_url} controls className="max-h-72 w-full" />
                           ) : (
-                            <audio src={creation.media_url} controls className="w-full max-w-md my-4" />
+                            <audio src={creation.media_url} controls preload="none" className="w-full max-w-md my-4" />
                           )}
                         </div>
                       )}
@@ -3715,13 +3312,68 @@ export const AdminView: React.FC = () => {
               )}
             </div>
           )}
+
+          {/* Comments Moderation Subtab */}
+          {moderationSection === 'comments' && (
+            <AdminCommentsSubtab
+              lang={lang}
+              onNotify={(msg) => setStatusMessage(msg)}
+              onError={(msg) => setErrorMessage(msg)}
+            />
+          )}
         </motion.div>
+      )}
+
+      {/* ==================================================================== */}
+      {/* ADMIN-ONLY NEW TABS: USER RESET, NEWS, PROMOS, SHOP, + SHARED RULES  */}
+      {/* ==================================================================== */}
+      {isAdmin && activeTab === 'user_reset' && (
+        <AdminUserResetTab
+          usersList={usersList}
+          lang={lang}
+          onResetComplete={() => fetchAdminUsers(userSearch, userSort)}
+          onNotify={(msg) => setStatusMessage(msg)}
+          onError={(msg) => setErrorMessage(msg)}
+        />
+      )}
+
+      {isAdmin && activeTab === 'news' && (
+        <AdminNewsTab
+          lang={lang}
+          onNotify={(msg) => setStatusMessage(msg)}
+          onError={(msg) => setErrorMessage(msg)}
+        />
+      )}
+
+      {isAdmin && activeTab === 'promos' && (
+        <AdminPromosTab
+          lang={lang}
+          onNotify={(msg) => setStatusMessage(msg)}
+          onError={(msg) => setErrorMessage(msg)}
+        />
+      )}
+
+      {isAdmin && activeTab === 'shop' && (
+        <AdminShopTab
+          lang={lang}
+          onNotify={(msg) => setStatusMessage(msg)}
+          onError={(msg) => setErrorMessage(msg)}
+        />
+      )}
+
+      {activeTab === 'rules' && (
+        <AdminRulesTab
+          lang={lang}
+          readOnly={!isAdmin}
+          onNotify={(msg) => setStatusMessage(msg)}
+          onError={(msg) => setErrorMessage(msg)}
+        />
       )}
 
       {/* ==================================================================== */}
       {/* TAB: LEADERBOARD MANAGEMENT (SAFE GAME-ONLY RESETS) */}
       {/* ==================================================================== */}
-      {activeTab === 'leaderboard' && (
+      {isAdmin && activeTab === 'leaderboard' && (
         <motion.div
           key="leaderboard"
           initial={{ opacity: 0, y: 10 }}
@@ -3958,6 +3610,9 @@ export const AdminView: React.FC = () => {
                 { id: 'all', label: lang === 'ru' ? 'Все игры' : 'All Games' },
                 { id: 'guess-track', label: lang === 'ru' ? 'Угадай трек' : 'Guess Track' },
                 { id: 'daily-quiz', label: lang === 'ru' ? 'Викторина' : 'Daily Quiz' },
+                { id: 'guess-lyrics', label: lang === 'ru' ? 'Строчка' : 'Lyrics' },
+                { id: 'reverse-track', label: lang === 'ru' ? 'Реверс' : 'Reverse' },
+                { id: 'speed-track', label: '0.5x / 2.5x' },
               ] as const).map((g) => (
                 <button
                   type="button"
@@ -4027,6 +3682,7 @@ export const AdminView: React.FC = () => {
                         <img
                           src={entry.avatar_url || '/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg'}
                           alt={entry.nickname}
+                          loading="lazy"
                           className="w-full h-full object-cover"
                         />
                       </div>
@@ -4052,11 +3708,16 @@ export const AdminView: React.FC = () => {
                         </div>
                         <div className="font-mono text-[10px] text-ash/75 mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5">
                           <span>
-                            XP: <strong className="text-ivory">{entry.rank_xp}</strong>
+                            {lang === 'ru' ? 'Уровень' : 'Lvl'}: <strong className="text-white">L{entry.level}</strong>
                           </span>
                           <span>
-                            {lang === 'ru' ? 'Уровень' : 'Lvl'}: <strong className="text-bone">{entry.level}</strong>
+                            Total XP: <strong className="text-ivory">{entry.total_xp ?? entry.rank_xp}</strong>
                           </span>
+                          {lbTimeframe !== 'all' || lbGameFilter !== 'all' ? (
+                            <span>
+                              {lang === 'ru' ? 'В фильтре' : 'Scoped XP'}: <strong className="text-bone">{entry.rank_xp}</strong>
+                            </span>
+                          ) : null}
                           <span>
                             {lang === 'ru' ? 'Очки' : 'Score'}: <strong className="text-bone">{entry.game_score}</strong>
                           </span>
@@ -4106,7 +3767,7 @@ export const AdminView: React.FC = () => {
                                     ? `Удалить все игровые результаты и сбросить рейтинговый XP пользователя @${entry.nickname}. Учётная запись, пароль и профиль НЕ будут удалены.`
                                     : `Remove all leaderboard results and reset ranking XP for @${entry.nickname}. Account, password, and profile will NOT be deleted.`
                                   : lang === 'ru'
-                                    ? `Сбросить результаты игры «${lbGameFilter === 'guess-track' ? 'Угадай трек' : 'Викторина'}» пользователя @${entry.nickname}. Аккаунт сохранится.`
+                                    ? `Сбросить результаты выбранной игры (${lbGameFilter}) пользователя @${entry.nickname}. Аккаунт сохранится.`
                                     : `Reset ${lbGameFilter} scores for @${entry.nickname}. Account remains intact.`,
                             })
                           }
@@ -4137,7 +3798,7 @@ export const AdminView: React.FC = () => {
           <div
             role="dialog"
             aria-modal="true"
-            className="fixed inset-0 z-50 flex items-center justify-center p-4"
+            className="fixed inset-0 z-[110] flex items-center justify-center p-4"
           >
             <motion.div
               initial={{ opacity: 0 }}
@@ -4225,7 +3886,7 @@ export const AdminView: React.FC = () => {
           <div
             role="dialog"
             aria-modal="true"
-            className="fixed inset-0 z-50 flex items-center justify-center p-4"
+            className="fixed inset-0 z-[110] flex items-center justify-center p-4"
           >
             <motion.div
               initial={{ opacity: 0 }}
@@ -4342,296 +4003,28 @@ export const AdminView: React.FC = () => {
       </AnimatePresence>
 
       {/* ==================================================================== */}
-      {/* USER DETAILS, ACHIEVEMENTS & COLLECTION MANAGEMENT MODAL */}
+      {/* FULL USER PROFILE, PROGRESS, ACHIEVEMENTS & SHIELDS EDITOR MODAL     */}
       {/* ==================================================================== */}
       <AnimatePresence>
         {userDetailsModal && (
-          <div
-            role="dialog"
-            aria-modal="true"
-            className="fixed inset-0 z-50 flex items-center justify-center p-4"
-          >
-            <motion.div
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              onClick={() => setUserDetailsModal(null)}
-              className="absolute inset-0 bg-black/85 backdrop-blur-sm"
-            />
-
-            <motion.div
-              initial={{ opacity: 0, scale: 0.96, y: 12 }}
-              animate={{ opacity: 1, scale: 1, y: 0 }}
-              exit={{ opacity: 0, scale: 0.96, y: 12 }}
-              className="relative w-full max-w-3xl max-h-[88vh] bg-[#121016] border border-white/15 rounded-xl shadow-2xl flex flex-col overflow-hidden z-10"
-            >
-              {/* Modal Header */}
-              <div className="p-5 border-b border-white/[0.08] flex items-center justify-between gap-4 bg-[#16131c]">
-                <div className="flex items-center gap-3.5 min-w-0">
-                  <div className="w-12 h-12 rounded-full bg-[#221d2b] border border-white/15 flex items-center justify-center font-title text-lg text-ivory uppercase overflow-hidden shrink-0">
-                    {userDetailsModal.user.avatar_url ? (
-                      <img src={userDetailsModal.user.avatar_url} alt="" className="w-full h-full object-cover" />
-                    ) : (
-                      (userDetailsModal.user.display_name || userDetailsModal.user.nickname || 'A')[0]
-                    )}
-                  </div>
-                  <div className="min-w-0">
-                    <h3 className="font-serif text-xl text-ivory truncate">
-                      {userDetailsModal.user.display_name || userDetailsModal.user.nickname}
-                    </h3>
-                    <div className="font-mono text-[11px] text-ash/75 flex flex-wrap items-center gap-2">
-                      <span>{formatHandle(userDetailsModal.user.nickname)}</span>
-                      <span>·</span>
-                      <span>{userDetailsModal.user.email || '—'}</span>
-                      <span>·</span>
-                      <span className="uppercase text-bone">{userDetailsModal.user.role_id}</span>
-                    </div>
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setUserDetailsModal(null)}
-                  className="p-1.5 rounded-lg text-ash hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
-
-              {/* Sub-tabs */}
-              <div className="px-5 pt-3 border-b border-white/[0.06] flex items-center gap-2 bg-[#141219]">
-                {[
-                  { id: 'overview' as const, label: lang === 'ru' ? 'Обзор профиля' : 'Overview' },
-                  {
-                    id: 'achievements' as const,
-                    label: `${lang === 'ru' ? 'Достижения' : 'Achievements'} (${userDetailsModal.achievements.filter((a) => a.is_unlocked).length}/${userDetailsModal.achievements.length})`,
-                  },
-                  {
-                    id: 'items' as const,
-                    label: `${lang === 'ru' ? 'Коллекция' : 'Shop Items'} (${userDetailsModal.items.filter((i) => i.is_owned).length}/${userDetailsModal.items.length})`,
-                  },
-                ].map((tab) => (
-                  <button
-                    key={tab.id}
-                    type="button"
-                    onClick={() => setUserDetailsTab(tab.id)}
-                    className={`px-3.5 py-2.5 font-mono text-[11px] uppercase tracking-wider border-b-2 transition-colors cursor-pointer ${
-                      userDetailsTab === tab.id
-                        ? 'border-[#821c2c] text-ivory'
-                        : 'border-transparent text-ash hover:text-white'
-                    }`}
-                  >
-                    {tab.label}
-                  </button>
-                ))}
-              </div>
-
-              {/* Modal Body */}
-              <div className="p-5 overflow-y-auto space-y-5 flex-1">
-                {userDetailsTab === 'overview' && (
-                  <div className="space-y-5">
-                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                      <div className="p-3.5 rounded-lg bg-[#181620] border border-white/[0.07]">
-                        <div className="font-mono text-[10px] uppercase text-ash/70">
-                          {lang === 'ru' ? 'Уровень' : 'Level'}
-                        </div>
-                        <div className="font-title text-2xl text-ivory mt-0.5">
-                          {userDetailsModal.user.level || 1}
-                        </div>
-                      </div>
-                      <div className="p-3.5 rounded-lg bg-[#181620] border border-white/[0.07]">
-                        <div className="font-mono text-[10px] uppercase text-ash/70">
-                          {lang === 'ru' ? 'Баланс XP' : 'Spendable XP'}
-                        </div>
-                        <div className="font-title text-2xl text-amber-300 mt-0.5">
-                          {userDetailsModal.user.xp || 0}
-                        </div>
-                      </div>
-                      <div className="p-3.5 rounded-lg bg-[#181620] border border-white/[0.07]">
-                        <div className="font-mono text-[10px] uppercase text-ash/70">
-                          {lang === 'ru' ? 'Всего XP' : 'Total XP'}
-                        </div>
-                        <div className="font-title text-2xl text-ivory mt-0.5">
-                          {userDetailsModal.user.total_xp ?? userDetailsModal.user.xp ?? 0}
-                        </div>
-                      </div>
-                      <div className="p-3.5 rounded-lg bg-[#181620] border border-white/[0.07]">
-                        <div className="font-mono text-[10px] uppercase text-ash/70">
-                          {lang === 'ru' ? 'Серия дней' : 'Streak'}
-                        </div>
-                        <div className="font-title text-2xl text-ivory mt-0.5">
-                          {userDetailsModal.user.daily_streak || 0}
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 font-mono text-xs">
-                      <div className="p-3 rounded-lg bg-[#181620] border border-white/[0.06]">
-                        <div className="text-[10px] text-ash/70 uppercase">{lang === 'ru' ? 'Игр сыграно' : 'Games'}</div>
-                        <div className="text-white mt-1">{userDetailsModal.user.games_played || 0}</div>
-                      </div>
-                      <div className="p-3 rounded-lg bg-[#181620] border border-white/[0.06]">
-                        <div className="text-[10px] text-ash/70 uppercase">{lang === 'ru' ? 'Угадай трек (побед)' : 'Track Wins'}</div>
-                        <div className="text-white mt-1">{userDetailsModal.user.guess_track_wins || 0}</div>
-                      </div>
-                      <div className="p-3 rounded-lg bg-[#181620] border border-white/[0.06]">
-                        <div className="text-[10px] text-ash/70 uppercase">{lang === 'ru' ? 'Тем на форуме' : 'Posts'}</div>
-                        <div className="text-white mt-1">{userDetailsModal.user.posts_count || 0}</div>
-                      </div>
-                      <div className="p-3 rounded-lg bg-[#181620] border border-white/[0.06]">
-                        <div className="text-[10px] text-ash/70 uppercase">{lang === 'ru' ? 'Работ в галерее' : 'Creations'}</div>
-                        <div className="text-white mt-1">{userDetailsModal.user.creations_count || 0}</div>
-                      </div>
-                    </div>
-
-                    <div className="p-4 rounded-lg bg-[#181620] border border-white/[0.06] space-y-2 text-xs font-mono">
-                      <div className="flex justify-between gap-4">
-                        <span className="text-ash/70">{lang === 'ru' ? 'Дата регистрации:' : 'Registered:'}</span>
-                        <span className="text-ivory">{formatAdminDate(userDetailsModal.user.registered_at)}</span>
-                      </div>
-                      <div className="flex justify-between gap-4">
-                        <span className="text-ash/70">{lang === 'ru' ? 'Неудачных попыток входа:' : 'Failed logins:'}</span>
-                        <span className="text-ivory">{userDetailsModal.user.failed_login_attempts || 0}</span>
-                      </div>
-                      {userDetailsModal.user.custom_status && (
-                        <div className="flex justify-between gap-4">
-                          <span className="text-ash/70">{lang === 'ru' ? 'Статус:' : 'Status:'}</span>
-                          <span className="text-ivory text-right">{userDetailsModal.user.custom_status}</span>
-                        </div>
-                      )}
-                      {userDetailsModal.user.bio && (
-                        <div className="pt-2 border-t border-white/[0.06]">
-                          <div className="text-ash/70 mb-1">{lang === 'ru' ? 'О себе:' : 'Bio:'}</div>
-                          <p className="text-bone font-sans text-xs leading-relaxed">{userDetailsModal.user.bio}</p>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                )}
-
-                {userDetailsTab === 'achievements' && (
-                  <div className="space-y-2.5">
-                    {user.role_id !== 'admin' && (
-                      <div className="p-3 rounded-lg bg-amber-950/30 border border-amber-800/50 font-mono text-[11px] text-amber-200">
-                        {lang === 'ru'
-                          ? 'Выдача и отзыв достижений доступны только главному администратору.'
-                          : 'Granting and revoking achievements is restricted to administrators.'}
-                      </div>
-                    )}
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                      {userDetailsModal.achievements.map((ach) => {
-                        const rCfg = RARITY_CONFIG[ach.rarity as keyof typeof RARITY_CONFIG] || RARITY_CONFIG.common;
-                        return (
-                          <div
-                            key={ach.id}
-                            className={`p-3 rounded-lg border flex items-center justify-between gap-3 ${
-                              ach.is_unlocked
-                                ? 'bg-[#1a1622] border-[#821c2c]/50'
-                                : 'bg-[#15131a] border-white/[0.06] opacity-75'
-                            }`}
-                          >
-                            <div className="min-w-0">
-                              <div className="flex items-center gap-2">
-                                <Award className={`w-3.5 h-3.5 shrink-0 ${ach.is_unlocked ? 'text-amber-300' : 'text-ash/50'}`} />
-                                <span className="font-sans text-xs text-ivory font-medium truncate">
-                                  {lang === 'ru' ? ach.title_ru : ach.title_en}
-                                </span>
-                              </div>
-                              <div className="font-mono text-[10px] mt-1 flex items-center gap-2">
-                                <span className={rCfg.textClass}>{lang === 'ru' ? rCfg.labelRu : rCfg.labelEn}</span>
-                                <span className="text-ash/50">·</span>
-                                <span className="text-ash/70">{ach.category}</span>
-                              </div>
-                            </div>
-                            {user.role_id === 'admin' && (
-                              <button
-                                type="button"
-                                disabled={togglingAssetId === ach.id}
-                                onClick={() => handleToggleUserAchievement(userDetailsModal.user.id, ach.id, Boolean(ach.is_unlocked))}
-                                className={`px-2.5 py-1 rounded font-mono text-[10px] uppercase border transition-colors cursor-pointer shrink-0 disabled:opacity-50 ${
-                                  ach.is_unlocked
-                                    ? 'border-red-900/70 text-red-300 hover:bg-red-950/60'
-                                    : 'border-emerald-800/70 text-emerald-300 hover:bg-emerald-950/60'
-                                }`}
-                              >
-                                {ach.is_unlocked
-                                  ? lang === 'ru' ? 'Отозвать' : 'Revoke'
-                                  : lang === 'ru' ? 'Выдать' : 'Grant'}
-                              </button>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-                )}
-
-                {userDetailsTab === 'items' && (
-                  <div className="space-y-2.5">
-                    {user.role_id !== 'admin' && (
-                      <div className="p-3 rounded-lg bg-amber-950/30 border border-amber-800/50 font-mono text-[11px] text-amber-200">
-                        {lang === 'ru'
-                          ? 'Выдача и отзыв предметов кастомизации доступны только администратору.'
-                          : 'Granting and revoking shop items is restricted to administrators.'}
-                      </div>
-                    )}
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                      {userDetailsModal.items.map((it) => {
-                        const rCfg = RARITY_CONFIG[it.rarity as keyof typeof RARITY_CONFIG] || RARITY_CONFIG.common;
-                        const catLabel = CATEGORY_LABELS[it.category as keyof typeof CATEGORY_LABELS];
-                        return (
-                          <div
-                            key={it.id}
-                            className={`p-3 rounded-lg border flex items-center justify-between gap-3 ${
-                              it.is_owned
-                                ? 'bg-[#1a1622] border-amber-700/40'
-                                : 'bg-[#15131a] border-white/[0.06] opacity-75'
-                            }`}
-                          >
-                            <div className="min-w-0">
-                              <div className="flex items-center gap-2">
-                                <Package className={`w-3.5 h-3.5 shrink-0 ${it.is_owned ? 'text-amber-300' : 'text-ash/50'}`} />
-                                <span className="font-sans text-xs text-ivory font-medium truncate">
-                                  {lang === 'ru' ? it.name_ru : it.name_en}
-                                </span>
-                                {it.is_equipped && (
-                                  <span className="font-mono text-[9px] uppercase px-1.5 py-0.5 rounded bg-emerald-950/70 text-emerald-300 border border-emerald-800/60">
-                                    {lang === 'ru' ? 'Надето' : 'Equipped'}
-                                  </span>
-                                )}
-                              </div>
-                              <div className="font-mono text-[10px] mt-1 flex items-center gap-2">
-                                <span className={rCfg.textClass}>{lang === 'ru' ? rCfg.labelRu : rCfg.labelEn}</span>
-                                <span className="text-ash/50">·</span>
-                                <span className="text-ash/70">{catLabel ? (lang === 'ru' ? catLabel.ru : catLabel.en) : it.category}</span>
-                                <span className="text-ash/50">·</span>
-                                <span className="text-ash/70">{it.cost_xp} XP</span>
-                              </div>
-                            </div>
-                            {user.role_id === 'admin' && (
-                              <button
-                                type="button"
-                                disabled={togglingAssetId === it.id}
-                                onClick={() => handleToggleUserItem(userDetailsModal.user.id, it.id, Boolean(it.is_owned))}
-                                className={`px-2.5 py-1 rounded font-mono text-[10px] uppercase border transition-colors cursor-pointer shrink-0 disabled:opacity-50 ${
-                                  it.is_owned
-                                    ? 'border-red-900/70 text-red-300 hover:bg-red-950/60'
-                                    : 'border-emerald-800/70 text-emerald-300 hover:bg-emerald-950/60'
-                                }`}
-                              >
-                                {it.is_owned
-                                  ? lang === 'ru' ? 'Отозвать' : 'Revoke'
-                                  : lang === 'ru' ? 'Выдать' : 'Grant'}
-                              </button>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-                )}
-              </div>
-            </motion.div>
-          </div>
+          <AdminUserEditorModal
+            details={userDetailsModal}
+            currentAdminId={user.id}
+            lang={lang}
+            onClose={() => setUserDetailsModal(null)}
+            onReloadDetails={openUserDetails}
+            onSaved={async (meta) => {
+              if (meta?.token) {
+                setStoredToken(meta.token);
+              }
+              if (meta?.userId === user.id) {
+                await refresh();
+              }
+              await fetchAdminUsers(userSearch, userSort);
+            }}
+            onNotify={(msg) => setStatusMessage(msg)}
+            onError={(msg) => setErrorMessage(msg)}
+          />
         )}
       </AnimatePresence>
     </div>

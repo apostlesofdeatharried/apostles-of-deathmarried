@@ -667,8 +667,8 @@ export const ArchiveView: React.FC = () => {
                         className="w-full h-full aspect-square"
                       />
                       <div className="absolute inset-0 bg-gradient-to-t from-black/85 via-transparent to-transparent opacity-60 pointer-events-none" />
-                      <div className="absolute bottom-3 left-3 right-3 flex items-center justify-between">
-                        <span className="font-mono text-[10px] tracking-wider text-bone bg-black/80 px-2 py-0.5 rounded border border-white/[0.1]">
+                      <div className="absolute bottom-3 left-3 right-3 flex items-center justify-between gap-2">
+                        <span className="font-mono text-[10px] tracking-wider text-bone bg-black/80 px-2 py-0.5 rounded border border-white/[0.1] min-w-0 truncate">
                           LP · {album.release_date || album.release_year}
                         </span>
                         <button
@@ -676,7 +676,7 @@ export const ArchiveView: React.FC = () => {
                             e.stopPropagation();
                             handlePlayAlbum(album);
                           }}
-                          className="w-9 h-9 rounded-full bg-white/10 hover:bg-white/25 text-white flex items-center justify-center backdrop-blur-sm transition-transform hover:scale-105 cursor-pointer"
+                          className="w-9 h-9 rounded-full bg-white/10 hover:bg-white/25 text-white flex items-center justify-center backdrop-blur-sm transition-transform hover:scale-105 cursor-pointer shrink-0"
                           aria-label={`Play ${album.title}`}
                         >
                           <Play className="w-3.5 h-3.5 fill-current ml-0.5" />
@@ -732,8 +732,8 @@ export const ArchiveView: React.FC = () => {
                         className="w-full h-full aspect-square"
                       />
                       <div className="absolute inset-0 bg-gradient-to-t from-black/85 via-transparent to-transparent opacity-60 pointer-events-none" />
-                      <div className="absolute bottom-3 left-3 right-3 flex items-center justify-between">
-                        <span className="font-mono text-[10px] tracking-wider text-bone bg-black/80 px-2 py-0.5 rounded border border-white/[0.1]">
+                      <div className="absolute bottom-3 left-3 right-3 flex items-center justify-between gap-2">
+                        <span className="font-mono text-[10px] tracking-wider text-bone bg-black/80 px-2 py-0.5 rounded border border-white/[0.1] min-w-0 truncate">
                           EP · {ep.release_year}
                         </span>
                         <button
@@ -741,7 +741,7 @@ export const ArchiveView: React.FC = () => {
                             e.stopPropagation();
                             handlePlayAlbum(ep);
                           }}
-                          className="w-9 h-9 rounded-full bg-white/10 hover:bg-white/25 text-white flex items-center justify-center backdrop-blur-sm transition-transform hover:scale-105 cursor-pointer"
+                          className="w-9 h-9 rounded-full bg-white/10 hover:bg-white/25 text-white flex items-center justify-center backdrop-blur-sm transition-transform hover:scale-105 cursor-pointer shrink-0"
                           aria-label={`Play ${ep.title}`}
                         >
                           <Play className="w-3.5 h-3.5 fill-current ml-0.5" />
@@ -844,7 +844,7 @@ export const ArchiveView: React.FC = () => {
       {/* SELECTED SINGLE DETAIL MODAL */}
       {selectedSingle && (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/85 backdrop-blur-sm animate-fadeIn"
+          className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/85 backdrop-blur-sm animate-fadeIn"
           role="dialog"
           aria-modal="true"
           aria-label={selectedSingle.title}
@@ -939,7 +939,7 @@ export const ArchiveView: React.FC = () => {
       {/* Lyrics Modal */}
       {selectedLyricsTrack && (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/85 backdrop-blur-sm animate-fadeIn"
+          className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/85 backdrop-blur-sm animate-fadeIn"
           role="dialog"
           aria-modal="true"
           aria-label={selectedLyricsTrack.title}
@@ -984,7 +984,7 @@ export const ArchiveView: React.FC = () => {
       {/* Admin Add Album Modal */}
       {newAlbumModal && (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/85 backdrop-blur-sm animate-fadeIn"
+          className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/85 backdrop-blur-sm animate-fadeIn"
           role="dialog"
           aria-modal="true"
           aria-label={t('newAlbumBtn')}
@@ -1083,7 +1083,7 @@ export const ArchiveView: React.FC = () => {
       {/* Streaming Platform Notice Modal */}
       {streamingToast && (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-fadeIn"
+          className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-fadeIn"
           role="dialog"
           aria-modal="true"
           aria-label={streamingToast.title}

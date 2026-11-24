@@ -77,6 +77,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
             <img
               src="/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg"
               alt="Velvet Rose"
+              loading="lazy"
               className="w-full h-full object-contain scale-[1.35] filter contrast-[1.18] brightness-[0.96] saturate-[0.95] transition-all duration-1000"
             />
           </div>

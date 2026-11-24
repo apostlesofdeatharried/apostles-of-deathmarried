@@ -3,8 +3,10 @@ import { useI18n } from '../context/I18nContext.js';
 import { useAuth, authFetch } from '../context/AuthContext.js';
 import { Post, PostCategory, Comment } from '../types/index.js';
 import { safeJson } from '../utils/logic.js';
+import { prepareAndUploadMedia } from '../utils/mediaCompression.js';
 import { formatHandle, renderEquippedBadge, renderEquippedTitle } from '../utils/cosmetics.js';
 import { RulesModal, hasAcceptedRules } from '../components/RulesModal.js';
+import { dispatchAchievementUnlocked } from '../components/AchievementToast.js';
 import {
   MessageSquare,
   Clock,
@@ -26,6 +28,8 @@ import {
   Unlock,
   Pin,
   Edit2,
+  UserCheck,
+  UserPlus,
 } from 'lucide-react';
 
 const formatCommunityDate = (dateStr?: string) => {
@@ -54,6 +58,7 @@ export const CommunityView: React.FC = () => {
   const [submittingComment, setSubmittingComment] = useState(false);
   const [replyToCommentId, setReplyToCommentId] = useState<string | null>(null);
   const [userReaction, setUserReaction] = useState<string | null>(null);
+  const [followBusy, setFollowBusy] = useState(false);
 
   // Create Post Modal
   const [createModalOpen, setCreateModalOpen] = useState(false);
@@ -227,17 +232,17 @@ export const CommunityView: React.FC = () => {
   const handleUploadPostMedia = async (file: File) => {
     setUploadingMedia(true);
     setCreateError(null);
-    const formData = new FormData();
-    formData.append('file', file);
     try {
-      const res = await authFetch('/api/upload', { method: 'POST', body: formData });
-      const data = await safeJson<{ url?: string; error?: string }>(res, {});
-      if (res.ok && data.url) {
-        setNewPostMediaUrl(data.url);
-        setNewPostMediaType('image');
-      } else {
-        setCreateError(data.error || t('fileUploadError'));
-      }
+      const data = await prepareAndUploadMedia(file, {
+        imageMode: 'artwork',
+        authFetch,
+        lang,
+        allowAudio: false,
+        allowVideo: false,
+        allowImage: true,
+      });
+      setNewPostMediaUrl(data.url);
+      setNewPostMediaType('image');
     } catch (e: any) {
       setCreateError(e?.message || t('fileUploadError'));
     } finally {
@@ -407,6 +412,46 @@ export const CommunityView: React.FC = () => {
     }
   };
 
+  const handleToggleFollowAuthor = async () => {
+    if (!activePost) return;
+    if (!user) {
+      openAuth('login');
+      return;
+    }
+    if (user.id === activePost.user_id || followBusy) return;
+    setFollowBusy(true);
+    try {
+      const res = await authFetch(`/api/profiles/${encodeURIComponent(activePost.author_nickname)}/follow`, {
+        method: 'POST',
+      });
+      const data = await safeJson<{
+        following?: boolean;
+        followers_count?: number;
+        newly_unlocked_achievements?: any[];
+      }>(res, {});
+      if (res.ok) {
+        setActivePost((curr) =>
+          curr
+            ? {
+                ...curr,
+                author_is_following: Boolean(data.following),
+                author_followers_count:
+                  typeof data.followers_count === 'number'
+                    ? data.followers_count
+                    : curr.author_followers_count,
+              }
+            : null
+        );
+        if (data.newly_unlocked_achievements?.length) {
+          dispatchAchievementUnlocked(data.newly_unlocked_achievements);
+        }
+        refresh();
+      }
+    } finally {
+      setFollowBusy(false);
+    }
+  };
+
   const submitCommentNow = async () => {
     if (!user || !activePost || !newComment.trim()) return;
 
@@ -542,6 +587,7 @@ export const CommunityView: React.FC = () => {
           }
           setDeleteTarget(null);
           showToast(lang === 'ru' ? 'Пост удалён' : 'Post deleted');
+          refresh();
           fetchPosts();
         } else {
           showError(data?.error || (lang === 'ru' ? 'Ошибка удаления поста' : 'Failed to delete post'));
@@ -552,6 +598,7 @@ export const CommunityView: React.FC = () => {
         if (res.ok) {
           setDeleteTarget(null);
           showToast(lang === 'ru' ? 'Комментарий удалён' : 'Comment deleted');
+          refresh();
           if (activePost) {
             await loadPostThread(activePost.id);
           }
@@ -663,6 +710,7 @@ export const CommunityView: React.FC = () => {
                   <img
                     src={activePost.author_avatar || '/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg'}
                     alt={activePost.author_name}
+                    loading="lazy"
                     className="w-full h-full object-cover"
                   />
                 </button>
@@ -706,6 +754,32 @@ export const CommunityView: React.FC = () => {
                         <Lock className="w-2.5 h-2.5" />
                         {t('lockBtn')}
                       </span>
+                    )}
+                    {(!user || user.id !== activePost.user_id) && (
+                      <button
+                        type="button"
+                        disabled={followBusy}
+                        onClick={handleToggleFollowAuthor}
+                        className={`ml-1 inline-flex items-center gap-1 px-2 py-0.5 rounded border text-[10px] transition-colors cursor-pointer disabled:opacity-50 ${
+                          activePost.author_is_following
+                            ? 'bg-white/[0.08] border-white/20 text-[#ded8ce] hover:bg-white/[0.14]'
+                            : 'bg-[#821c2c]/30 border-[#a4283c]/70 text-[#f5c6cb] hover:bg-[#821c2c]/50'
+                        }`}
+                      >
+                        {activePost.author_is_following ? (
+                          <UserCheck className="w-3 h-3" />
+                        ) : (
+                          <UserPlus className="w-3 h-3" />
+                        )}
+                        <span>
+                          {activePost.author_is_following
+                            ? lang === 'ru' ? 'Вы подписаны' : 'Following'
+                            : lang === 'ru' ? 'Подписаться' : 'Follow'}
+                        </span>
+                        {typeof activePost.author_followers_count === 'number' && (
+                          <span className="opacity-75 tabular-nums">({activePost.author_followers_count})</span>
+                        )}
+                      </button>
                     )}
                   </div>
                 </div>
@@ -809,6 +883,7 @@ export const CommunityView: React.FC = () => {
                   <img
                     src={activePost.media_url}
                     alt={activePost.title}
+                    loading="lazy"
                     className="w-full h-full object-contain"
                   />
                 </div>
@@ -931,6 +1006,7 @@ export const CommunityView: React.FC = () => {
                               <img
                                 src={cm.author_avatar || '/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg'}
                                 alt={cm.author_name}
+                                loading="lazy"
                                 className="w-full h-full object-cover"
                               />
                             </button>
@@ -1012,6 +1088,7 @@ export const CommunityView: React.FC = () => {
                                     <img
                                       src={reply.author_avatar || '/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg'}
                                       alt={reply.author_name}
+                                      loading="lazy"
                                       className="w-full h-full object-cover"
                                     />
                                   </button>
@@ -1256,6 +1333,7 @@ export const CommunityView: React.FC = () => {
                         <img
                           src={post.author_avatar || '/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg'}
                           alt={post.author_name}
+                          loading="lazy"
                           className="w-full h-full object-cover"
                         />
                       </div>
@@ -1280,7 +1358,7 @@ export const CommunityView: React.FC = () => {
         <div
           role="dialog"
           aria-modal="true"
-          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fadeIn"
+          className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fadeIn"
         >
           <div className="relative w-full max-w-lg bg-[#0c0b0e] border border-white/[0.12] rounded-xl p-6 space-y-5 shadow-2xl">
             <div className="flex items-center justify-between border-b border-white/[0.08] pb-3">
@@ -1411,7 +1489,7 @@ export const CommunityView: React.FC = () => {
         <div
           role="dialog"
           aria-modal="true"
-          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fadeIn"
+          className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fadeIn"
         >
           <div className="relative w-full max-w-lg bg-[#0c0b0e] border border-white/[0.12] rounded-xl p-6 space-y-5 shadow-2xl">
             <div className="flex items-center justify-between border-b border-white/[0.08] pb-3">
@@ -1499,7 +1577,7 @@ export const CommunityView: React.FC = () => {
         <div
           role="dialog"
           aria-modal="true"
-          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fadeIn"
+          className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fadeIn"
         >
           <div className="relative w-full max-w-md bg-[#121016] border border-red-900/60 rounded-xl p-6 space-y-4 shadow-2xl">
             <div className="flex items-center gap-3">
@@ -1549,7 +1627,7 @@ export const CommunityView: React.FC = () => {
         <div
           role="dialog"
           aria-modal="true"
-          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fadeIn"
+          className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fadeIn"
         >
           <div className="relative w-full max-w-md bg-[#0c0b0e] border border-white/[0.12] rounded-xl p-6 space-y-4 shadow-2xl">
             <div className="flex items-center justify-between border-b border-white/[0.08] pb-3">

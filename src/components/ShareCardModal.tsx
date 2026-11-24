@@ -180,6 +180,7 @@ export const ShareCardModal: React.FC<ShareCardModalProps> = ({ isOpen, context,
             <img
               src={dataUrl}
               alt="Предпросмотр карточки"
+              loading="lazy"
               className="max-h-[42dvh] w-auto max-w-full object-contain mx-auto rounded-lg border border-white/[0.1] shadow-xl"
             />
           )}

@@ -249,7 +249,7 @@ const dictionary: Translations = {
   // Footer & Misc
   streamNoticeHeader: { ru: 'ДОСТУПНО НА СТРИМИНГОВЫХ СЕРВИСАХ', en: 'AVAILABLE ON STREAMING SERVICES' },
   reportSuccess: { ru: 'Жалоба передана модераторам.', en: 'Report dispatched to moderators.' },
-  fileUploadError: { ru: 'Ошибка загрузки файла. Допустимы файлы до 100 МБ.', en: 'Upload failed. Files up to 100MB are accepted.' },
+  fileUploadError: { ru: 'Ошибка загрузки файла. Аудио: MP3/OGG/M4A до 12 МБ, изображения автоматически сжимаются в WebP.', en: 'Upload failed. Audio: MP3/OGG/M4A up to 12 MB; images are auto-compressed to WebP.' },
   channel: { ru: 'Telegram-канал', en: 'Telegram Channel' },
   bot: { ru: 'Архивный бот', en: 'Archive Bot' },
   emailContact: { ru: 'Почта', en: 'Email' },

@@ -68,6 +68,7 @@ interface DailyTrackRound {
   snippet_duration: number;
   speed_mode?: 0.5 | 2.5;
   options: { id: string; title: string }[];
+  completed?: boolean;
   already_completed?: boolean;
   previous_attempt?: GuessResultState | null;
 }
@@ -90,6 +91,7 @@ interface DailyLyricsRound {
   round_token: string;
   prompt_line: string;
   options: { id: string; text: string }[];
+  completed?: boolean;
   already_completed?: boolean;
   previous_attempt?: LyricsResultState | null;
 }
@@ -219,6 +221,7 @@ export const GamesView: React.FC = () => {
   const [lyricsRound, setLyricsRound] = useState<DailyLyricsRound | null>(null);
   const [selectedLyricOption, setSelectedLyricOption] = useState<string | null>(null);
   const [lyricsResult, setLyricsResult] = useState<LyricsResultState | null>(null);
+  const [lyricsCompleted, setLyricsCompleted] = useState(false);
   const [lyricsLoading, setLyricsLoading] = useState(false);
   const [lyricsSubmitting, setLyricsSubmitting] = useState(false);
   const [lyricsError, setLyricsError] = useState<string | null>(null);
@@ -229,6 +232,7 @@ export const GamesView: React.FC = () => {
   const [reverseRound, setReverseRound] = useState<DailyTrackRound | null>(null);
   const [selectedReverseOption, setSelectedReverseOption] = useState<string | null>(null);
   const [reverseResult, setReverseResult] = useState<GuessResultState | null>(null);
+  const [reverseCompleted, setReverseCompleted] = useState(false);
   const [reverseLoading, setReverseLoading] = useState(false);
   const [reverseAudioDecoding, setReverseAudioDecoding] = useState(false);
   const [reversePlaying, setReversePlaying] = useState(false);
@@ -243,6 +247,7 @@ export const GamesView: React.FC = () => {
   const [speedRound, setSpeedRound] = useState<DailyTrackRound | null>(null);
   const [selectedSpeedOption, setSelectedSpeedOption] = useState<string | null>(null);
   const [speedResult, setSpeedResult] = useState<GuessResultState | null>(null);
+  const [speedCompleted, setSpeedCompleted] = useState(false);
   const [speedLoading, setSpeedLoading] = useState(false);
   const [speedAudioDecoding, setSpeedAudioDecoding] = useState(false);
   const [speedPlaying, setSpeedPlaying] = useState(false);
@@ -333,10 +338,12 @@ export const GamesView: React.FC = () => {
         setGuessRound(data);
         setGuessStartTime(Date.now());
 
-        if (data.already_completed && data.previous_attempt) {
+        if (data.completed || data.already_completed) {
           setGuessCompleted(true);
-          setGuessResult(data.previous_attempt);
-          setSelectedGuessOption(data.previous_attempt.selected_track_id || null);
+          if (data.previous_attempt) {
+            setGuessResult(data.previous_attempt);
+            setSelectedGuessOption(data.previous_attempt.selected_track_id || null);
+          }
         } else if (!user && data.challenge_date) {
           const guestSaved = readGuestAttempt<GuessResultState>(GUEST_STORAGE_KEYS.guess, data.challenge_date);
           if (guestSaved) {
@@ -377,7 +384,7 @@ export const GamesView: React.FC = () => {
           setQuizQuestions([]);
         } else {
           setQuizQuestions(data.questions || []);
-          setAlreadyCompletedDaily(Boolean(data.already_completed));
+          setAlreadyCompletedDaily(Boolean(data.completed || data.already_completed));
           setPreviousScore(data.previous_score || 0);
           setPreviousXp(data.previous_xp || 0);
           setQuizStartTime(Date.now());
@@ -396,6 +403,7 @@ export const GamesView: React.FC = () => {
     setLyricsLoading(true);
     setLyricsError(null);
     setLyricsResult(null);
+    setLyricsCompleted(false);
     setSelectedLyricOption(null);
 
     try {
@@ -403,12 +411,16 @@ export const GamesView: React.FC = () => {
       const data = await safeJson<DailyLyricsRound & { error?: string }>(res, null as any);
       if (res.ok && data) {
         setLyricsRound(data);
-        if (data.already_completed && data.previous_attempt) {
-          setLyricsResult(data.previous_attempt);
-          setSelectedLyricOption(data.previous_attempt.selected_option_id || null);
+        if (data.completed || data.already_completed) {
+          setLyricsCompleted(true);
+          if (data.previous_attempt) {
+            setLyricsResult(data.previous_attempt);
+            setSelectedLyricOption(data.previous_attempt.selected_option_id || null);
+          }
         } else if (!user && data.challenge_date) {
           const guestSaved = readGuestAttempt<LyricsResultState>(GUEST_STORAGE_KEYS.lyrics, data.challenge_date);
           if (guestSaved) {
+            setLyricsCompleted(true);
             setLyricsResult(guestSaved.result);
             setSelectedLyricOption(guestSaved.selected || null);
           }
@@ -429,6 +441,7 @@ export const GamesView: React.FC = () => {
     setReverseLoading(true);
     setReverseError(null);
     setReverseResult(null);
+    setReverseCompleted(false);
     setSelectedReverseOption(null);
     stopWebAudioPlayback();
 
@@ -438,12 +451,16 @@ export const GamesView: React.FC = () => {
       if (res.ok && data) {
         setReverseRound(data);
         setReverseDuration(Math.min(5, Math.max(1, Number(data.snippet_duration) || 5)));
-        if (data.already_completed && data.previous_attempt) {
-          setReverseResult(data.previous_attempt);
-          setSelectedReverseOption(data.previous_attempt.selected_track_id || null);
+        if (data.completed || data.already_completed) {
+          setReverseCompleted(true);
+          if (data.previous_attempt) {
+            setReverseResult(data.previous_attempt);
+            setSelectedReverseOption(data.previous_attempt.selected_track_id || null);
+          }
         } else if (!user && data.challenge_date) {
           const guestSaved = readGuestAttempt<GuessResultState>(GUEST_STORAGE_KEYS.reverse, data.challenge_date);
           if (guestSaved) {
+            setReverseCompleted(true);
             setReverseResult(guestSaved.result);
             setSelectedReverseOption(guestSaved.selected || null);
           }
@@ -464,6 +481,7 @@ export const GamesView: React.FC = () => {
     setSpeedLoading(true);
     setSpeedError(null);
     setSpeedResult(null);
+    setSpeedCompleted(false);
     setSelectedSpeedOption(null);
     stopWebAudioPlayback();
 
@@ -473,12 +491,16 @@ export const GamesView: React.FC = () => {
       if (res.ok && data) {
         setSpeedRound(data);
         setSpeedDuration(Math.min(5, Math.max(1, Number(data.snippet_duration) || 5)));
-        if (data.already_completed && data.previous_attempt) {
-          setSpeedResult(data.previous_attempt);
-          setSelectedSpeedOption(data.previous_attempt.selected_track_id || null);
+        if (data.completed || data.already_completed) {
+          setSpeedCompleted(true);
+          if (data.previous_attempt) {
+            setSpeedResult(data.previous_attempt);
+            setSelectedSpeedOption(data.previous_attempt.selected_track_id || null);
+          }
         } else if (!user && data.challenge_date) {
           const guestSaved = readGuestAttempt<GuessResultState>(GUEST_STORAGE_KEYS.speed, data.challenge_date);
           if (guestSaved) {
+            setSpeedCompleted(true);
             setSpeedResult(guestSaved.result);
             setSelectedSpeedOption(guestSaved.selected || null);
           }
@@ -615,7 +637,7 @@ export const GamesView: React.FC = () => {
     if (!audio || audio.src !== resolvedTargetSrc) {
       destroySnippetAudio();
       audio = new Audio(guessRound.audio_url);
-      audio.preload = 'metadata';
+      audio.preload = 'none';
       snippetAudioRef.current = audio;
     }
 
@@ -781,7 +803,7 @@ export const GamesView: React.FC = () => {
   // SUBMIT / VERIFY HANDLERS
   // -------------------------------------------------------------------------
   const handleVerifyGuess = async (selectedId: string) => {
-    if (!guessRound || guessResult || guessSubmitting) return;
+    if (!guessRound || guessCompleted || guessResult || guessSubmitting) return;
     setGuessSubmitting(true);
     setGuessError(null);
     setSelectedGuessOption(selectedId);
@@ -827,7 +849,10 @@ export const GamesView: React.FC = () => {
       } else {
         setSelectedGuessOption(null);
         setGuessError(data?.error || 'Не удалось проверить ответ.');
-        if (data?.already_completed) await loadGuessRound();
+        if (res.status === 409 || data?.already_completed) {
+          setGuessCompleted(true);
+          await loadGuessRound();
+        }
       }
     } catch (e: any) {
       setSelectedGuessOption(null);
@@ -838,7 +863,7 @@ export const GamesView: React.FC = () => {
   };
 
   const handleSubmitQuiz = async () => {
-    if (quizSubmitting || Object.keys(quizAnswers).length < quizQuestions.length) return;
+    if (quizSubmitting || quizSubmitted || alreadyCompletedDaily || Object.keys(quizAnswers).length < quizQuestions.length) return;
     setQuizSubmitting(true);
     setQuizError(null);
     const elapsedSeconds = Math.max(1, Math.round((Date.now() - quizStartTime) / 1000));
@@ -867,6 +892,10 @@ export const GamesView: React.FC = () => {
         if (user) refresh();
       } else {
         setQuizError(data?.error || 'Не удалось отправить ответы.');
+        if (res.status === 409 || data?.already_completed) {
+          setAlreadyCompletedDaily(true);
+          await loadDailyQuiz();
+        }
       }
     } catch (e: any) {
       setQuizError(e?.message || 'Ошибка соединения');
@@ -876,7 +905,7 @@ export const GamesView: React.FC = () => {
   };
 
   const handleVerifyLyrics = async (optionId: string) => {
-    if (!lyricsRound || lyricsResult || lyricsSubmitting) return;
+    if (!lyricsRound || lyricsCompleted || lyricsResult || lyricsSubmitting) return;
     setLyricsSubmitting(true);
     setLyricsError(null);
     setSelectedLyricOption(optionId);
@@ -909,6 +938,7 @@ export const GamesView: React.FC = () => {
           track: data.track,
         };
         setLyricsResult(resObj);
+        setLyricsCompleted(true);
         if (!user && lyricsRound.challenge_date) {
           saveGuestAttempt(GUEST_STORAGE_KEYS.lyrics, lyricsRound.challenge_date, optionId, resObj);
         }
@@ -918,7 +948,10 @@ export const GamesView: React.FC = () => {
       } else {
         setSelectedLyricOption(null);
         setLyricsError(data?.error || 'Не удалось проверить ответ.');
-        if (data?.already_completed) await loadLyricsRound();
+        if (res.status === 409 || data?.already_completed) {
+          setLyricsCompleted(true);
+          await loadLyricsRound();
+        }
       }
     } catch (e: any) {
       setSelectedLyricOption(null);
@@ -929,7 +962,7 @@ export const GamesView: React.FC = () => {
   };
 
   const handleVerifyReverse = async (selectedId: string) => {
-    if (!reverseRound || reverseResult || reverseSubmitting) return;
+    if (!reverseRound || reverseCompleted || reverseResult || reverseSubmitting) return;
     setReverseSubmitting(true);
     setReverseError(null);
     setSelectedReverseOption(selectedId);
@@ -962,6 +995,7 @@ export const GamesView: React.FC = () => {
           track: data.track,
         };
         setReverseResult(resObj);
+        setReverseCompleted(true);
         if (!user && reverseRound.challenge_date) {
           saveGuestAttempt(GUEST_STORAGE_KEYS.reverse, reverseRound.challenge_date, selectedId, resObj);
         }
@@ -971,7 +1005,10 @@ export const GamesView: React.FC = () => {
       } else {
         setSelectedReverseOption(null);
         setReverseError(data?.error || 'Не удалось проверить ответ.');
-        if (data?.already_completed) await loadReverseRound();
+        if (res.status === 409 || data?.already_completed) {
+          setReverseCompleted(true);
+          await loadReverseRound();
+        }
       }
     } catch (e: any) {
       setSelectedReverseOption(null);
@@ -982,7 +1019,7 @@ export const GamesView: React.FC = () => {
   };
 
   const handleVerifySpeed = async (selectedId: string) => {
-    if (!speedRound || speedResult || speedSubmitting) return;
+    if (!speedRound || speedCompleted || speedResult || speedSubmitting) return;
     setSpeedSubmitting(true);
     setSpeedError(null);
     setSelectedSpeedOption(selectedId);
@@ -1016,6 +1053,7 @@ export const GamesView: React.FC = () => {
           track: data.track,
         };
         setSpeedResult(resObj);
+        setSpeedCompleted(true);
         if (!user && speedRound.challenge_date) {
           saveGuestAttempt(GUEST_STORAGE_KEYS.speed, speedRound.challenge_date, selectedId, resObj);
         }
@@ -1025,7 +1063,10 @@ export const GamesView: React.FC = () => {
       } else {
         setSelectedSpeedOption(null);
         setSpeedError(data?.error || 'Не удалось проверить ответ.');
-        if (data?.already_completed) await loadSpeedRound();
+        if (res.status === 409 || data?.already_completed) {
+          setSpeedCompleted(true);
+          await loadSpeedRound();
+        }
       }
     } catch (e: any) {
       setSelectedSpeedOption(null);
@@ -1248,9 +1289,9 @@ export const GamesView: React.FC = () => {
                       <button
                         type="button"
                         key={opt.id}
-                        disabled={!!guessResult || guessSubmitting}
+                        disabled={guessCompleted || !!guessResult || guessSubmitting}
                         onClick={() => handleVerifyGuess(opt.id)}
-                        className={`p-3.5 rounded-lg border text-left transition-all cursor-pointer disabled:cursor-default ${btnStyle}`}
+                        className={`p-3.5 rounded-lg border text-left transition-all cursor-pointer disabled:cursor-default disabled:opacity-65 ${btnStyle}`}
                       >
                         <span className="font-display text-base sm:text-lg tracking-wide font-normal line-clamp-2 block">
                           {opt.title}
@@ -1643,9 +1684,9 @@ export const GamesView: React.FC = () => {
                       <button
                         key={opt.id}
                         type="button"
-                        disabled={!!lyricsResult || lyricsSubmitting}
+                        disabled={lyricsCompleted || !!lyricsResult || lyricsSubmitting}
                         onClick={() => handleVerifyLyrics(opt.id)}
-                        className={`w-full p-3.5 rounded-lg border text-left text-sm transition-all cursor-pointer disabled:cursor-default flex items-center justify-between gap-2 ${style}`}
+                        className={`w-full p-3.5 rounded-lg border text-left text-sm transition-all cursor-pointer disabled:cursor-default disabled:opacity-65 flex items-center justify-between gap-2 ${style}`}
                       >
                         <span className="leading-snug">{opt.text}</span>
                         {lyricsResult && opt.id === lyricsResult.correct_option_id && (
@@ -1831,9 +1872,9 @@ export const GamesView: React.FC = () => {
                       <button
                         type="button"
                         key={opt.id}
-                        disabled={!!reverseResult || reverseSubmitting}
+                        disabled={reverseCompleted || !!reverseResult || reverseSubmitting}
                         onClick={() => handleVerifyReverse(opt.id)}
-                        className={`p-3.5 rounded-lg border text-left transition-all cursor-pointer disabled:cursor-default ${btnStyle}`}
+                        className={`p-3.5 rounded-lg border text-left transition-all cursor-pointer disabled:cursor-default disabled:opacity-65 ${btnStyle}`}
                       >
                         <span className="font-display text-base sm:text-lg tracking-wide font-normal line-clamp-2 block">
                           {opt.title}
@@ -2022,9 +2063,9 @@ export const GamesView: React.FC = () => {
                       <button
                         type="button"
                         key={opt.id}
-                        disabled={!!speedResult || speedSubmitting}
+                        disabled={speedCompleted || !!speedResult || speedSubmitting}
                         onClick={() => handleVerifySpeed(opt.id)}
-                        className={`p-3.5 rounded-lg border text-left transition-all cursor-pointer disabled:cursor-default ${btnStyle}`}
+                        className={`p-3.5 rounded-lg border text-left transition-all cursor-pointer disabled:cursor-default disabled:opacity-65 ${btnStyle}`}
                       >
                         <span className="font-display text-base sm:text-lg tracking-wide font-normal line-clamp-2 block">
                           {opt.title}
@@ -2163,7 +2204,11 @@ export const GamesView: React.FC = () => {
               <span className="col-span-2 sm:col-span-1">{t('rank')}</span>
               <span className="col-span-6 sm:col-span-7">{t('apostle')}</span>
               <span className="col-span-2 text-center">{t('level')}</span>
-              <span className="col-span-2 text-right">{t('xp')}</span>
+              <span className="col-span-2 text-right">
+                {timeframe === 'all' && leaderboardGame === 'all'
+                  ? lang === 'ru' ? 'Всего XP' : 'Total XP'
+                  : t('xp')}
+              </span>
             </div>
 
             {leadersLoading ? (
@@ -2206,25 +2251,18 @@ export const GamesView: React.FC = () => {
                           <img
                             src={lead.avatar_url || '/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg'}
                             alt={lead.nickname}
+                            loading="lazy"
                             className="w-full h-full object-cover"
                           />
                         </div>
 
                         <div className="min-w-0 flex flex-col">
-                          <div className="flex items-center gap-1.5 min-w-0">
+                          <div className="flex flex-wrap items-center gap-1.5 min-w-0">
                             <span className={`truncate font-medium ${lead.equipped_name_style || 'text-white'}`}>
                               {lead.display_name || lead.nickname}
                             </span>
-                            {lead.equipped_badge && (
-                              <span className="hidden sm:inline-flex">
-                                {renderEquippedBadge(lead.equipped_badge, lang, true)}
-                              </span>
-                            )}
-                            {lead.equipped_title && (
-                              <span className="hidden md:inline-flex">
-                                {renderEquippedTitle(lead.equipped_title, lang, true)}
-                              </span>
-                            )}
+                            {lead.equipped_badge && renderEquippedBadge(lead.equipped_badge, lang, true)}
+                            {lead.equipped_title && renderEquippedTitle(lead.equipped_title, lang, true)}
                           </div>
                           <span className="text-[10px] text-[#736c64] truncate">
                             {formatHandle(lead.nickname)}
@@ -2239,8 +2277,12 @@ export const GamesView: React.FC = () => {
                         )}
                       </div>
 
-                      <span className="col-span-2 text-center text-[#8e877e]">L{lead.level}</span>
-                      <span className="col-span-2 text-right font-semibold text-[#ded8ce]">{lead.xp}</span>
+                      <span className="col-span-2 text-center font-bold text-[#f2eee9]">L{lead.level}</span>
+                      <span className="col-span-2 text-right font-semibold text-[#ded8ce] tabular-nums">
+                        {timeframe === 'all' && leaderboardGame === 'all'
+                          ? lead.total_xp ?? lead.xp
+                          : lead.xp}
+                      </span>
                     </button>
                   );
                 })}

@@ -87,6 +87,7 @@ export const Navbar: React.FC<NavbarProps> = ({ currentTab, onSelectTab }) => {
                 <img
                   src="/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg"
                   alt="Rose"
+                  loading="lazy"
                   className="w-full h-full object-cover scale-105 group-hover:scale-115 transition-transform duration-500"
                 />
               </div>
@@ -185,6 +186,7 @@ export const Navbar: React.FC<NavbarProps> = ({ currentTab, onSelectTab }) => {
                     <img
                       src={user.avatar_url || '/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg'}
                       alt={user.nickname}
+                      loading="lazy"
                       className="w-full h-full object-cover"
                     />
                   </div>

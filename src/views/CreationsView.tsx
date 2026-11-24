@@ -3,8 +3,10 @@ import { useI18n } from '../context/I18nContext.js';
 import { useAuth, authFetch } from '../context/AuthContext.js';
 import { Creation } from '../types/index.js';
 import { safeJson } from '../utils/logic.js';
+import { prepareAndUploadMedia, AUDIO_ACCEPT_ATTR } from '../utils/mediaCompression.js';
 import { formatHandle } from '../utils/cosmetics.js';
 import { RulesModal, hasAcceptedRules } from '../components/RulesModal.js';
+import { dispatchAchievementUnlocked } from '../components/AchievementToast.js';
 import {
   Sparkles,
   Search,
@@ -27,6 +29,9 @@ import {
   Bookmark,
   CornerDownRight,
   Reply,
+  Smile,
+  UserCheck,
+  UserPlus,
 } from 'lucide-react';
 
 export const CreationsView: React.FC = () => {
@@ -49,7 +54,7 @@ export const CreationsView: React.FC = () => {
   // Publish modal state
   const [publishModalOpen, setPublishModalOpen] = useState(false);
   const [newTitle, setNewTitle] = useState('');
-  const [newCategory, setNewCategory] = useState<Creation['category']>('artwork');
+  const [newCategory, setNewCategory] = useState<Creation['category'] | ''>('');
   const [newDesc, setNewDesc] = useState('');
   const [newMediaUrl, setNewMediaUrl] = useState('');
   const [newMediaType, setNewMediaType] = useState<'image' | 'audio' | 'video'>('image');
@@ -60,12 +65,16 @@ export const CreationsView: React.FC = () => {
   // Edit modal state
   const [editModalOpen, setEditModalOpen] = useState(false);
   const [editTitle, setEditTitle] = useState('');
-  const [editCategory, setEditCategory] = useState<Creation['category']>('artwork');
+  const [editCategory, setEditCategory] = useState<Creation['category']>('art');
   const [editDesc, setEditDesc] = useState('');
   const [editMediaUrl, setEditMediaUrl] = useState('');
   const [editMediaType, setEditMediaType] = useState<'image' | 'audio' | 'video'>('image');
   const [submittingEdit, setSubmittingEdit] = useState(false);
   const [editError, setEditError] = useState<string | null>(null);
+
+  // Moderation & follow state
+  const [moderateCategory, setModerateCategory] = useState<'art' | 'meme'>('art');
+  const [followBusy, setFollowBusy] = useState(false);
 
   // Delete confirmation modal state
   const [deleteTarget, setDeleteTarget] = useState<{ type: 'creation' | 'comment'; id: string; label: string } | null>(null);
@@ -139,6 +148,7 @@ export const CreationsView: React.FC = () => {
     if (initialCreation) {
       setActiveCreation(initialCreation);
       setUserReaction(initialCreation.user_reaction ?? null);
+      setModerateCategory(initialCreation.category === 'meme' ? 'meme' : 'art');
     }
     setReplyToCommentId(null);
     try {
@@ -151,7 +161,10 @@ export const CreationsView: React.FC = () => {
         error?: string;
       }>(res, {});
       if (res.ok) {
-        if (data.creation) setActiveCreation(data.creation);
+        if (data.creation) {
+          setActiveCreation(data.creation);
+          setModerateCategory(data.creation.category === 'meme' ? 'meme' : 'art');
+        }
         setCreationComments(data.comments || []);
         setUserReaction(data.userReaction ?? data.creation?.user_reaction ?? null);
         setIsFavorited(Boolean(data.favorited));
@@ -186,29 +199,23 @@ export const CreationsView: React.FC = () => {
   const handleFileUpload = async (file: File) => {
     setUploading(true);
     setUploadError(null);
-    const formData = new FormData();
-    formData.append('file', file);
     try {
-      const res = await authFetch('/api/upload', {
-        method: 'POST',
-        body: formData,
+      const data = await prepareAndUploadMedia(file, {
+        imageMode: 'artwork',
+        authFetch,
+        lang,
       });
-      const data = await safeJson<{ url?: string; error?: string }>(res, {});
-      if (res.ok && data.url) {
-        setNewMediaUrl(data.url);
-        if (file.type.startsWith('audio/') || file.name.match(/\.(mp3|wav|ogg|flac|m4a)$/i)) {
-          setNewMediaType('audio');
-        } else if (file.type.startsWith('video/') || file.name.match(/\.(mp4|webm|mov)$/i)) {
-          setNewMediaType('video');
-        } else {
-          setNewMediaType('image');
-        }
+      setNewMediaUrl(data.url);
+      if (data.is_audio) {
+        setNewMediaType('audio');
+      } else if (data.is_video) {
+        setNewMediaType('video');
       } else {
-        setUploadError(data.error || 'Ошибка загрузки файла');
+        setNewMediaType('image');
       }
-    } catch (e) {
+    } catch (e: any) {
       console.error(e);
-      setUploadError('Ошибка сети при загрузке');
+      setUploadError(e?.message || (lang === 'ru' ? 'Ошибка загрузки файла' : 'File upload failed'));
     } finally {
       setUploading(false);
     }
@@ -218,6 +225,10 @@ export const CreationsView: React.FC = () => {
     e.preventDefault();
     if (!user) {
       openAuth('login');
+      return;
+    }
+    if (!newCategory) {
+      setUploadError(lang === 'ru' ? 'Выберите категорию: Творчество или Мемы.' : 'Select a category: Creative or Memes.');
       return;
     }
     if (!newTitle.trim() || !newMediaUrl.trim()) {
@@ -243,13 +254,14 @@ export const CreationsView: React.FC = () => {
       if (res.ok) {
         setPublishModalOpen(false);
         setNewTitle('');
+        setNewCategory('');
         setNewDesc('');
         setNewMediaUrl('');
         setSelectedCategory('all');
         setToastMessage(
           data.status === 'pending'
-            ? (lang === 'ru' ? 'Работа отправлена на модерацию' : 'Creation submitted for review')
-            : (lang === 'ru' ? 'Работа опубликована' : 'Creation published')
+            ? (lang === 'ru' ? 'Отправлено на модерацию' : 'Submitted for review')
+            : (lang === 'ru' ? 'Публикация добавлена' : 'Creation published')
         );
         setTimeout(() => setToastMessage(null), 4000);
         fetchCreations();
@@ -264,21 +276,77 @@ export const CreationsView: React.FC = () => {
     }
   };
 
-  const handleModerateCreation = async (creationId: string, status: 'approved' | 'rejected') => {
+  const handleModerateCreation = async (
+    creationId: string,
+    status: 'approved' | 'rejected',
+    categoryOverride?: 'art' | 'meme'
+  ) => {
     try {
       const res = await authFetch(`/api/admin/creations/${creationId}/moderate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status }),
+        body: JSON.stringify({
+          status,
+          ...(categoryOverride ? { category: categoryOverride } : {}),
+        }),
       });
       if (res.ok) {
         fetchCreations();
+        refresh();
         if (activeCreation && activeCreation.id === creationId) {
-          setActiveCreation((prev) => prev ? { ...prev, status } : null);
+          setActiveCreation((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  status,
+                  ...(categoryOverride ? { category: categoryOverride } : {}),
+                }
+              : null
+          );
         }
       }
     } catch (e) {
       console.error(e);
+    }
+  };
+
+  const handleToggleFollowAuthor = async () => {
+    if (!activeCreation) return;
+    if (!user) {
+      openAuth('login');
+      return;
+    }
+    if (user.id === activeCreation.user_id || followBusy) return;
+    setFollowBusy(true);
+    try {
+      const res = await authFetch(`/api/profiles/${encodeURIComponent(activeCreation.author_nickname)}/follow`, {
+        method: 'POST',
+      });
+      const data = await safeJson<{
+        following?: boolean;
+        followers_count?: number;
+        newly_unlocked_achievements?: any[];
+      }>(res, {});
+      if (res.ok) {
+        setActiveCreation((prev) =>
+          prev
+            ? {
+                ...prev,
+                author_is_following: Boolean(data.following),
+                author_followers_count:
+                  typeof data.followers_count === 'number'
+                    ? data.followers_count
+                    : prev.author_followers_count,
+              }
+            : null
+        );
+        if (data.newly_unlocked_achievements?.length) {
+          dispatchAchievementUnlocked(data.newly_unlocked_achievements);
+        }
+        refresh();
+      }
+    } finally {
+      setFollowBusy(false);
     }
   };
 
@@ -490,14 +558,16 @@ export const CreationsView: React.FC = () => {
         if (res.ok) {
           setDeleteTarget(null);
           setActiveCreation(null);
-          setToastMessage(lang === 'ru' ? 'Работа удалена' : 'Creation deleted');
+          setToastMessage(lang === 'ru' ? 'Публикация удалена' : 'Creation deleted');
           setTimeout(() => setToastMessage(null), 3000);
           fetchCreations();
+          refresh();
         }
       } else if (deleteTarget.type === 'comment') {
         const res = await authFetch(`/api/community/comments/${deleteTarget.id}`, { method: 'DELETE' });
         if (res.ok) {
           setDeleteTarget(null);
+          refresh();
           if (activeCreation) openCreationDetail(activeCreation);
         }
       }
@@ -508,12 +578,19 @@ export const CreationsView: React.FC = () => {
     }
   };
 
-  const categoryLabels: { [key: string]: { labelRu: string; labelEn: string; icon: any } } = {
-    artwork: { labelRu: 'Артворки', labelEn: 'Artworks', icon: Brush },
-    covers: { labelRu: 'Каверы', labelEn: 'Covers', icon: Music },
-    beats: { labelRu: 'Биты', labelEn: 'Beats', icon: Sparkles },
-    video: { labelRu: 'Видеомонтаж', labelEn: 'Video Edits', icon: Video },
-    lyrics: { labelRu: 'Лирика', labelEn: 'Lyrics', icon: FileText },
+  const filterTabs = [
+    { key: 'art', labelRu: 'Творчество', labelEn: 'Creative', icon: Brush },
+    { key: 'meme', labelRu: 'Мемы', labelEn: 'Memes', icon: Smile },
+  ] as const;
+
+  const categoryLabels: { [key: string]: { labelRu: string; labelEn: string } } = {
+    art: { labelRu: 'Творчество', labelEn: 'Creative' },
+    meme: { labelRu: 'Мемы', labelEn: 'Memes' },
+    artwork: { labelRu: 'Творчество · Арт', labelEn: 'Artworks' },
+    covers: { labelRu: 'Творчество · Кавер', labelEn: 'Covers' },
+    beats: { labelRu: 'Творчество · Бит', labelEn: 'Beats' },
+    video: { labelRu: 'Творчество · Видео', labelEn: 'Video Edits' },
+    lyrics: { labelRu: 'Творчество · Лирика', labelEn: 'Lyrics' },
   };
 
   return (
@@ -537,7 +614,13 @@ export const CreationsView: React.FC = () => {
         </div>
 
         <button
-          onClick={() => requireRulesThen(() => setPublishModalOpen(true))}
+          onClick={() =>
+            requireRulesThen(() => {
+              setUploadError(null);
+              setNewCategory('');
+              setPublishModalOpen(true);
+            })
+          }
           className="flex items-center gap-2 font-mono text-xs tracking-wider uppercase px-5 py-2.5 bg-white/[0.08] hover:bg-white/[0.16] border border-white/[0.15] text-white rounded-lg transition-colors cursor-pointer"
         >
           <Plus className="w-4 h-4" />
@@ -559,14 +642,14 @@ export const CreationsView: React.FC = () => {
           >
             {t('categoryAll')}
           </button>
-          {Object.entries(categoryLabels).map(([key, item]) => {
+          {filterTabs.map((item) => {
             const Icon = item.icon;
             return (
               <button
-                key={key}
-                onClick={() => setSelectedCategory(key)}
+                key={item.key}
+                onClick={() => setSelectedCategory(item.key)}
                 className={`shrink-0 flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg whitespace-nowrap transition-all cursor-pointer ${
-                  selectedCategory === key
+                  selectedCategory === item.key
                     ? 'bg-white/[0.1] text-white border border-white/20'
                     : 'bg-[#100f13] text-[#8e877e] border border-white/[0.06] hover:text-white'
                 }`}
@@ -614,6 +697,7 @@ export const CreationsView: React.FC = () => {
                   <img
                     src={creation.media_url}
                     alt={creation.title}
+                    loading="lazy"
                     className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
                   />
                 ) : creation.media_type === 'video' ? (
@@ -668,6 +752,7 @@ export const CreationsView: React.FC = () => {
                       <img
                         src={creation.author_avatar || '/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg'}
                         alt={creation.author_name}
+                        loading="lazy"
                         className="w-full h-full object-cover"
                       />
                     </div>
@@ -725,53 +810,91 @@ export const CreationsView: React.FC = () => {
         <div
           role="dialog"
           aria-modal="true"
-          className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/85 backdrop-blur-md animate-fadeIn"
+          className="fixed inset-0 z-[110] flex items-center justify-center p-3 sm:p-4 bg-black/85 backdrop-blur-md animate-fadeIn"
         >
           <div className="relative w-full max-w-3xl bg-[#0c0b0e] border border-white/[0.12] rounded-xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
             {/* Top Bar */}
-            <div className="flex items-center justify-between px-6 py-4 border-b border-white/[0.08] bg-[#111015]">
-              <button
-                type="button"
-                onClick={() => {
-                  setActiveCreation(null);
-                  goToProfile(activeCreation.author_nickname);
-                }}
-                className="flex items-center gap-3 text-left hover:underline cursor-pointer"
-              >
-                <div className={`w-8 h-8 rounded-full overflow-hidden bg-black ${activeCreation.author_frame || 'border border-white/10'}`}>
-                  <img
-                    src={activeCreation.author_avatar || '/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg'}
-                    alt={activeCreation.author_name}
-                    className="w-full h-full object-cover"
-                  />
-                </div>
-                <div>
-                  <div className="flex items-center gap-1.5">
-                    <h3 className={`text-xs font-semibold ${activeCreation.author_name_style || 'text-white'}`}>
-                      {activeCreation.author_name || activeCreation.author_nickname}
-                    </h3>
-                    <span className="text-[10px] font-mono text-[#8e877e]">
-                      {formatHandle(activeCreation.author_nickname)}
+            <div className="flex flex-wrap items-center justify-between gap-3 px-6 py-4 border-b border-white/[0.08] bg-[#111015]">
+              <div className="flex flex-wrap items-center gap-3 min-w-0">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setActiveCreation(null);
+                    goToProfile(activeCreation.author_nickname);
+                  }}
+                  className="flex items-center gap-3 text-left hover:underline cursor-pointer"
+                >
+                  <div className={`w-8 h-8 rounded-full overflow-hidden bg-black ${activeCreation.author_frame || 'border border-white/10'}`}>
+                    <img
+                      src={activeCreation.author_avatar || '/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg'}
+                      alt={activeCreation.author_name}
+                      loading="lazy"
+                      className="w-full h-full object-cover"
+                    />
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-1.5">
+                      <h3 className={`text-xs font-semibold ${activeCreation.author_name_style || 'text-white'}`}>
+                        {activeCreation.author_name || activeCreation.author_nickname}
+                      </h3>
+                      <span className="text-[10px] font-mono text-[#8e877e]">
+                        {formatHandle(activeCreation.author_nickname)}
+                      </span>
+                    </div>
+                    <span className="text-[10px] font-mono text-[#736c64]">
+                      {formatCreationDate(activeCreation.created_at)}
                     </span>
                   </div>
-                  <span className="text-[10px] font-mono text-[#736c64]">
-                    {formatCreationDate(activeCreation.created_at)}
-                  </span>
-                </div>
-              </button>
+                </button>
 
-              <div className="flex items-center gap-2.5">
+                {(!user || user.id !== activeCreation.user_id) && (
+                  <button
+                    type="button"
+                    disabled={followBusy}
+                    onClick={handleToggleFollowAuthor}
+                    className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md font-mono text-[11px] border transition-colors cursor-pointer disabled:opacity-50 ${
+                      activeCreation.author_is_following
+                        ? 'bg-white/[0.08] border-white/20 text-[#ded8ce] hover:bg-white/[0.14]'
+                        : 'bg-[#821c2c]/30 border-[#a4283c]/70 text-[#f5c6cb] hover:bg-[#821c2c]/50'
+                    }`}
+                  >
+                    {activeCreation.author_is_following ? (
+                      <UserCheck className="w-3 h-3" />
+                    ) : (
+                      <UserPlus className="w-3 h-3" />
+                    )}
+                    <span>
+                      {activeCreation.author_is_following
+                        ? lang === 'ru' ? 'Вы подписаны' : 'Following'
+                        : lang === 'ru' ? 'Подписаться' : 'Follow'}
+                    </span>
+                    {typeof activeCreation.author_followers_count === 'number' && (
+                      <span className="opacity-75 tabular-nums">({activeCreation.author_followers_count})</span>
+                    )}
+                  </button>
+                )}
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2.5">
                 {/* Moderation actions for staff */}
                 {isStaff && activeCreation.status === 'pending' && (
-                  <div className="flex items-center gap-1 font-mono text-xs">
+                  <div className="flex items-center gap-1.5 font-mono text-xs">
+                    <select
+                      value={moderateCategory}
+                      onChange={(e) => setModerateCategory(e.target.value === 'meme' ? 'meme' : 'art')}
+                      className="px-2 py-1 rounded bg-[#16151a] border border-white/[0.14] text-white text-[11px] focus:outline-none"
+                    >
+                      <option value="art">Творчество</option>
+                      <option value="meme">Мемы</option>
+                    </select>
                     <button
-                      onClick={() => handleModerateCreation(activeCreation.id, 'approved')}
+                      onClick={() => handleModerateCreation(activeCreation.id, 'approved', moderateCategory)}
                       className="px-2.5 py-1 rounded bg-[#1a3820] border border-[#388548] text-white hover:bg-[#22482a] cursor-pointer"
                     >
                       {t('approveAction')}
                     </button>
                     <button
-                      onClick={() => handleModerateCreation(activeCreation.id, 'rejected')}
+                      onClick={() => handleModerateCreation(activeCreation.id, 'rejected', moderateCategory)}
                       className="px-2.5 py-1 rounded bg-[#3d1820] border border-[#8a2a38] text-white hover:bg-[#4d1f2a] cursor-pointer"
                     >
                       {t('rejectAction')}
@@ -816,6 +939,7 @@ export const CreationsView: React.FC = () => {
                   <img
                     src={activeCreation.media_url}
                     alt={activeCreation.title}
+                    loading="lazy"
                     className="max-h-96 w-full object-contain"
                   />
                 ) : activeCreation.media_type === 'audio' ? (
@@ -823,7 +947,7 @@ export const CreationsView: React.FC = () => {
                     <div className="w-16 h-16 rounded-full bg-white/[0.08] border border-white/20 flex items-center justify-center mx-auto text-white">
                       <Music className="w-8 h-8" />
                     </div>
-                    <audio src={activeCreation.media_url} controls preload="metadata" className="w-full" />
+                    <audio src={activeCreation.media_url} controls preload="none" className="w-full" />
                   </div>
                 ) : (
                   <video src={activeCreation.media_url} controls preload="metadata" className="max-h-96 w-full" />
@@ -1046,7 +1170,7 @@ export const CreationsView: React.FC = () => {
         <div
           role="dialog"
           aria-modal="true"
-          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fadeIn"
+          className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fadeIn"
         >
           <div className="relative w-full max-w-lg bg-[#0c0b0e] border border-white/[0.12] rounded-xl p-6 space-y-5 shadow-2xl">
             <div className="flex items-center justify-between border-b border-white/[0.08] pb-3">
@@ -1070,18 +1194,23 @@ export const CreationsView: React.FC = () => {
             <form onSubmit={handlePublish} className="space-y-4 font-sans text-xs">
               <div>
                 <label className="block font-mono text-[#8e877e] mb-1 uppercase tracking-wider">
-                  {t('workCategory')}
+                  {t('workCategory')} *
                 </label>
                 <select
+                  required
                   value={newCategory}
                   onChange={(e) => setNewCategory(e.target.value as any)}
                   className="w-full bg-[#151419] border border-white/[0.08] rounded-lg p-2.5 text-xs text-white focus:outline-none focus:border-white/25"
                 >
-                  <option value="artwork">{t('categoryArtwork')}</option>
-                  <option value="covers">{t('categoryCover')}</option>
-                  <option value="beats">{t('categoryBeat')}</option>
-                  <option value="video">{t('categoryEdit')}</option>
-                  <option value="lyrics">{t('categoryLyrics')}</option>
+                  <option value="">
+                    {lang === 'ru' ? 'Выберите категорию...' : 'Select a category...'}
+                  </option>
+                  <option value="art">
+                    {lang === 'ru' ? 'Творчество (+15 XP после одобрения)' : 'Creative (+15 XP on approval)'}
+                  </option>
+                  <option value="meme">
+                    {lang === 'ru' ? 'Мемы (+5 XP после одобрения)' : 'Memes (+5 XP on approval)'}
+                  </option>
                 </select>
               </div>
 
@@ -1122,7 +1251,7 @@ export const CreationsView: React.FC = () => {
                     <span>{uploading ? (lang === 'ru' ? 'Загрузка...' : 'Uploading...') : t('uploadFile')}</span>
                     <input
                       type="file"
-                      accept="image/*,audio/*,video/*"
+                      accept={`image/*,video/*,${AUDIO_ACCEPT_ATTR}`}
                       className="hidden"
                       onChange={(e) => {
                         const file = e.target.files?.[0];
@@ -1152,12 +1281,12 @@ export const CreationsView: React.FC = () => {
                 </button>
                 <button
                   type="submit"
-                  disabled={isSubmitting || !newTitle.trim() || !newMediaUrl.trim()}
+                  disabled={isSubmitting || !newCategory || !newTitle.trim() || !newMediaUrl.trim()}
                   className="px-5 py-2 font-mono text-xs uppercase tracking-wider rounded-lg bg-white/[0.1] hover:bg-white/[0.2] border border-white/[0.15] text-white disabled:opacity-40 cursor-pointer"
                 >
                   {isSubmitting
-                    ? (lang === 'ru' ? 'Публикация...' : 'Publishing...')
-                    : `${t('postTopic')} (+50 XP)`}
+                    ? (lang === 'ru' ? 'Отправка...' : 'Publishing...')
+                    : t('postTopic')}
                 </button>
               </div>
             </form>
@@ -1170,7 +1299,7 @@ export const CreationsView: React.FC = () => {
         <div
           role="dialog"
           aria-modal="true"
-          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fadeIn"
+          className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fadeIn"
         >
           <div className="relative w-full max-w-lg bg-[#0c0b0e] border border-white/[0.12] rounded-xl p-6 space-y-5 shadow-2xl">
             <div className="flex items-center justify-between border-b border-white/[0.08] pb-3">
@@ -1202,6 +1331,8 @@ export const CreationsView: React.FC = () => {
                   onChange={(e) => setEditCategory(e.target.value as any)}
                   className="w-full bg-[#151419] border border-white/[0.08] rounded-lg p-2.5 text-xs text-white focus:outline-none focus:border-white/25"
                 >
+                  <option value="art">{lang === 'ru' ? 'Творчество' : 'Creative'}</option>
+                  <option value="meme">{lang === 'ru' ? 'Мемы' : 'Memes'}</option>
                   <option value="artwork">{t('categoryArtwork')}</option>
                   <option value="covers">{t('categoryCover')}</option>
                   <option value="beats">{t('categoryBeat')}</option>
@@ -1274,7 +1405,7 @@ export const CreationsView: React.FC = () => {
         <div
           role="dialog"
           aria-modal="true"
-          className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fadeIn"
+          className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fadeIn"
         >
           <div className="relative w-full max-w-md bg-[#121016] border border-red-900/60 rounded-xl p-6 space-y-4 shadow-2xl">
             <div className="flex items-center gap-3">

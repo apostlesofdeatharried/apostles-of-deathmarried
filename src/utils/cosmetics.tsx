@@ -26,6 +26,14 @@ import {
   Layers,
 } from 'lucide-react';
 import { ItemRarity, ShopCategory } from '../types/index.js';
+import {
+  type CustomShieldStyle,
+  sanitizeCssColor,
+  parseCustomShieldValue,
+  buildCustomShieldValue,
+} from './logic.js';
+
+export { type CustomShieldStyle, sanitizeCssColor, parseCustomShieldValue, buildCustomShieldValue };
 
 export const RARITY_CONFIG: Record<
   ItemRarity,
@@ -364,6 +372,10 @@ export function getEquippedTitleLabel(
   lang: 'ru' | 'en' = 'ru'
 ): string | null {
   if (!titleValue) return null;
+  const custom = parseCustomShieldValue(titleValue);
+  if (custom) {
+    return lang === 'ru' ? custom.ru : custom.en;
+  }
   const meta = TITLE_META[titleValue];
   return meta ? (lang === 'ru' ? meta.labelRu : meta.labelEn) : titleValue;
 }
@@ -374,6 +386,27 @@ export function renderEquippedTitle(
   compact: boolean = false
 ): React.ReactNode {
   if (!titleValue) return null;
+  const custom = parseCustomShieldValue(titleValue);
+  if (custom) {
+    const label = lang === 'ru' ? custom.ru : custom.en;
+    return (
+      <span
+        className={`inline-flex items-center gap-1.5 rounded-[5px] border font-mono tracking-[0.06em] leading-none shrink-0 select-none font-medium ${
+          compact ? 'text-[10px] px-1.5 py-[3px]' : 'text-[11px] px-2 py-[4px]'
+        }`}
+        style={{
+          backgroundColor: custom.bg,
+          borderColor: custom.border,
+          color: custom.text,
+          boxShadow: `0 0 12px ${custom.glow}, inset 0 1px 0 rgba(255,255,255,0.06)`,
+        }}
+        title={label}
+      >
+        <span aria-hidden="true" className="w-1.5 h-1.5 rotate-45 bg-current opacity-85 shrink-0" />
+        <span>{label}</span>
+      </span>
+    );
+  }
   const meta = TITLE_META[titleValue];
   const label = meta ? (lang === 'ru' ? meta.labelRu : meta.labelEn) : titleValue;
   const styleClass = meta ? meta.styleClass : 'bg-white/[0.03] border-white/[0.12] text-[#b8b0a4]';

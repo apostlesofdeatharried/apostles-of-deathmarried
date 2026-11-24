@@ -9,7 +9,6 @@ import bcrypt from 'bcryptjs';
 import { db, initDatabase, closeDatabase } from './server/db.js';
 import {
   ensureCloudDatabaseRestored,
-  syncCloudDatabase,
   pushDatabaseBackupNow,
   getCloudSyncStatus,
   isSupabaseConfigured,
@@ -44,6 +43,10 @@ import {
   getStreakBonusPercent,
   applyStreakBonusXp,
   parsePrivacySettings,
+  fisherYatesShuffle,
+  buildCustomShieldValue,
+  parseCustomShieldValue,
+  sanitizeCssColor,
 } from './src/utils/logic.js';
 import {
   DAILY_SNIPPET_DURATION_SECONDS,
@@ -161,28 +164,28 @@ app.use('/api', (req: Request, res: Response, next: NextFunction) => {
 const STATELESS_POST_PATHS = new Set(['/api/upload/signed-url']);
 const MUTATING_HTTP_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
-// Cloud database freshness check (before reads/writes) & write-through snapshot sync middleware
+let coldStartRestorePromise: Promise<void> | null = null;
+function triggerColdStartRestoreOnce(): Promise<void> {
+  if (!coldStartRestorePromise) {
+    coldStartRestorePromise = ensureCloudDatabaseRestored().catch((err) => {
+      console.warn('[CloudSync] Cold-start restore warning:', err instanceof Error ? err.message : err);
+    });
+  }
+  return coldStartRestorePromise;
+}
+
+// Cold-start-only restore + write-through backup on mutations.
 // CRITICAL: DB backup upload to Supabase Storage ONLY runs after successful mutating requests (POST/PUT/PATCH/DELETE).
-// GET requests are strictly read-only and NEVER upload apostles.db.
+// GET requests NEVER download or upload apostles.db (cold-start restore runs once only when local DB did not exist).
 app.use(async (req: Request, res: Response, next: NextFunction) => {
   if (req.path.startsWith('/api') || req.path.startsWith('/uploads')) {
-    const isMutation =
-      MUTATING_HTTP_METHODS.has(req.method) && !STATELESS_POST_PATHS.has(req.path);
-
     if (isSupabaseConfigured()) {
-      if (isMutation) {
-        // Always download the latest cache-busted apostles.db (?t=Date.now()) directly before mutating
-        // so a warm Vercel Lambda NEVER overwrites newer cloud data with a stale /tmp/apostles.db.
-        const pullResult = await syncCloudDatabase({ force: true });
-        if (pullResult.error && !pullResult.notFound) {
-          console.error('[CloudSync] Aborting mutation because fresh DB pull failed:', pullResult.error);
-          res.status(503).json({
-            error: `Не удалось получить актуальную базу данных из Supabase Storage перед сохранением: ${pullResult.error}`,
-            cloud_sync_error: pullResult.error,
-          });
-          return;
-        }
+      await triggerColdStartRestoreOnce();
 
+      const isMutation =
+        MUTATING_HTTP_METHODS.has(req.method) && !STATELESS_POST_PATHS.has(req.path);
+
+      if (isMutation) {
         // Flush checkpointed SQLite snapshot to Supabase Storage BEFORE sending the HTTP 2xx response.
         // If cloud upload fails, return HTTP 500 with the exact error instead of a false 200 OK.
         const originalJson = res.json.bind(res);
@@ -218,18 +221,6 @@ app.use(async (req: Request, res: Response, next: NextFunction) => {
           }
           return originalJson(body);
         }) as Response['json'];
-      } else if (req.method === 'GET' && req.path.startsWith('/api')) {
-        // Strictly read-only pull: on Vercel, always fetch fresh cache-busted snapshot (?t=Date.now())
-        // so any warm Lambda returns newly saved changes immediately, while NEVER uploading on GET.
-        try {
-          await syncCloudDatabase({ force: isVercel, minIntervalMs: isVercel ? 0 : 5000 });
-        } catch (err) {
-          console.warn('[CloudSync] Read-only sync warning:', err instanceof Error ? err.message : err);
-        }
-      } else if (req.method === 'GET') {
-        try {
-          await ensureCloudDatabaseRestored();
-        } catch {}
       }
     }
   }
@@ -338,15 +329,53 @@ const storage = multer.diskStorage({
   },
 });
 
+const UPLOAD_AUDIO_EXTENSIONS = new Set(['.mp3', '.ogg', '.m4a']);
+const MAX_AUDIO_UPLOAD_BYTES = 12 * 1024 * 1024; // 12 MB
+
+function validateUploadPolicy(
+  filename: string,
+  mimetype: string,
+  size?: number
+): { ok: boolean; status?: number; error?: string; kind: 'audio' | 'image' | 'video' | null } {
+  const classified = classifyMediaUpload(filename, mimetype);
+  if (!classified.allowed) {
+    return {
+      ok: false,
+      status: 400,
+      error: 'Disallowed file type. Only audio (MP3, OGG, M4A), images (JPG, PNG, WEBP, GIF), and video (MP4, WEBM, MOV) are accepted.',
+      kind: null,
+    };
+  }
+  if (classified.kind === 'audio') {
+    if (!UPLOAD_AUDIO_EXTENSIONS.has(classified.normalizedExt)) {
+      return {
+        ok: false,
+        status: 400,
+        error: 'Разрешены только аудиофайлы форматов MP3, OGG и M4A (до 12 МБ).',
+        kind: null,
+      };
+    }
+    if (typeof size === 'number' && size > MAX_AUDIO_UPLOAD_BYTES) {
+      return {
+        ok: false,
+        status: 413,
+        error: 'Аудиофайл превышает максимальный размер 12 МБ.',
+        kind: null,
+      };
+    }
+  }
+  return { ok: true, kind: classified.kind };
+}
+
 const upload = multer({
   storage,
-  limits: { fileSize: 100 * 1024 * 1024 }, // 100MB max for high-res WAV & video uploads
+  limits: { fileSize: 100 * 1024 * 1024 }, // 100MB max for video; audio is capped at 12MB below
   fileFilter: (_req, file, cb) => {
-    const classified = classifyMediaUpload(file.originalname, file.mimetype);
-    if (classified.allowed) {
+    const policy = validateUploadPolicy(file.originalname, file.mimetype);
+    if (policy.ok) {
       cb(null, true);
     } else {
-      cb(new Error('Disallowed file type. Only audio (MP3, WAV, FLAC, OGG, M4A), images (JPG, PNG, WEBP, GIF), and video (MP4, WEBM, MOV) are accepted.'));
+      cb(new Error(policy.error || 'Disallowed file type.'));
     }
   },
 });
@@ -441,6 +470,8 @@ function hydrateSessionUserRow(row: any) {
     ...safeRow,
     email_verified: Number(safeRow.email_verified || 0),
     accepted_rules: Number(safeRow.accepted_rules || 0),
+    notify_follows: safeRow.notify_follows === 0 ? 0 : 1,
+    notify_news: safeRow.notify_news ? 1 : 0,
     favorite_track: safeRow.favorite_track || null,
     display_name: safeRow.display_name && String(safeRow.display_name).trim()
       ? safeRow.display_name
@@ -468,7 +499,8 @@ function resolveUserFromToken(token: string) {
       SELECT u.id as user_id, u.id, u.nickname, u.email, u.email_verified, u.accepted_rules, u.role_id, u.is_banned,
              u.password_changed_at, u.created_at as registered_at,
              p.display_name, p.avatar_url, p.bio, p.custom_status, p.favorite_track, p.level, p.xp, p.total_xp,
-             p.daily_streak, p.is_private, p.equipped_frame, p.equipped_banner,
+             p.daily_streak, p.is_private, p.notify_follows, p.notify_news,
+             p.equipped_frame, p.equipped_banner,
              p.equipped_name_style, p.equipped_badge, p.equipped_title, p.equipped_theme, p.equipped_effect,
              p.featured_achievements_json, p.username_changed_at
       FROM users u
@@ -502,7 +534,8 @@ function resolveUserFromToken(token: string) {
     SELECT s.user_id, s.expires_at, u.id, u.nickname, u.email, u.email_verified, u.accepted_rules, u.role_id, u.is_banned,
            u.password_changed_at, u.created_at as registered_at,
            p.display_name, p.avatar_url, p.bio, p.custom_status, p.favorite_track, p.level, p.xp, p.total_xp,
-           p.daily_streak, p.is_private, p.equipped_frame, p.equipped_banner,
+           p.daily_streak, p.is_private, p.notify_follows, p.notify_news,
+           p.equipped_frame, p.equipped_banner,
            p.equipped_name_style, p.equipped_badge, p.equipped_title, p.equipped_theme, p.equipped_effect,
            p.featured_achievements_json, p.username_changed_at
     FROM sessions s
@@ -1050,7 +1083,7 @@ app.post('/api/auth/bind-admin', requireAdmin, (req: AuthRequest, res: Response)
 });
 
 // Delete uploaded file from storage, Supabase bucket, and database
-app.post('/api/admin/delete-file', requireAdminOrMod, async (req: AuthRequest, res: Response) => {
+app.post('/api/admin/delete-file', requireAdmin, async (req: AuthRequest, res: Response) => {
   const { url } = req.body || {};
   if (!url || typeof url !== 'string') {
     res.status(400).json({ error: 'Valid URL is required.' });
@@ -1153,8 +1186,192 @@ app.get('/api/auth/me', (req: Request, res: Response) => {
 });
 
 // ----------------------------------------------------------------------------
-// API: NOTIFICATIONS & COMMUNITY RULES ACCEPTANCE
+// UNIFIED XP GRANT / ROLLBACK, ANTI-SPAM & NOTIFICATION HELPERS
 // ----------------------------------------------------------------------------
+
+function awardXpWithRef(params: {
+  userId: string;
+  amount: number;
+  source: string;
+  details: string;
+  referenceKey: string;
+}): { awarded: boolean; amount: number; xp: number; totalXp: number; level: number } {
+  const safeAmount = Math.max(0, Math.round(Number(params.amount) || 0));
+  const prof = db.prepare('SELECT xp, total_xp, level FROM profiles WHERE user_id = ?').get(params.userId) as
+    | { xp: number; total_xp: number; level: number }
+    | undefined;
+  if (!prof || safeAmount <= 0) {
+    const currTotal = Number(prof?.total_xp || 0);
+    return {
+      awarded: false,
+      amount: 0,
+      xp: Number(prof?.xp || 0),
+      totalXp: currTotal,
+      level: calculateLevelFromXp(currTotal).level,
+    };
+  }
+
+  const refKey = String(params.referenceKey || '').trim();
+  const insertRes = db.prepare(`
+    INSERT OR IGNORE INTO xp_transactions (id, user_id, amount, source, details, reference_key)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run('xpt_' + crypto.randomUUID().slice(0, 8), params.userId, safeAmount, params.source, params.details, refKey || null);
+
+  if (insertRes.changes !== 1) {
+    const currTotal = Number(prof.total_xp || 0);
+    return {
+      awarded: false,
+      amount: 0,
+      xp: Number(prof.xp || 0),
+      totalXp: currTotal,
+      level: calculateLevelFromXp(currTotal).level,
+    };
+  }
+
+  const nextXp = Number(prof.xp || 0) + safeAmount;
+  const nextTotalXp = Number(prof.total_xp || 0) + safeAmount;
+  const { level } = calculateLevelFromXp(nextTotalXp);
+
+  db.prepare(`
+    UPDATE profiles
+    SET xp = ?, total_xp = ?, level = ?, updated_at = datetime('now')
+    WHERE user_id = ?
+  `).run(nextXp, nextTotalXp, level, params.userId);
+
+  return { awarded: true, amount: safeAmount, xp: nextXp, totalXp: nextTotalXp, level };
+}
+
+function revokeXpWithRef(params: {
+  userId: string;
+  amount: number;
+  source?: string;
+  details: string;
+  referenceKey: string;
+}): { revoked: boolean; amount: number; xp: number; totalXp: number; level: number } {
+  const safeAmount = Math.max(0, Math.round(Number(params.amount) || 0));
+  const prof = db.prepare('SELECT xp, total_xp, level FROM profiles WHERE user_id = ?').get(params.userId) as
+    | { xp: number; total_xp: number; level: number }
+    | undefined;
+  if (!prof || safeAmount <= 0) {
+    const currTotal = Number(prof?.total_xp || 0);
+    return {
+      revoked: false,
+      amount: 0,
+      xp: Number(prof?.xp || 0),
+      totalXp: currTotal,
+      level: calculateLevelFromXp(currTotal).level,
+    };
+  }
+
+  const refKey = String(params.referenceKey || '').trim();
+  const insertRes = db.prepare(`
+    INSERT OR IGNORE INTO xp_transactions (id, user_id, amount, source, details, reference_key)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(
+    'xpt_' + crypto.randomUUID().slice(0, 8),
+    params.userId,
+    -safeAmount,
+    params.source || 'xp_rollback',
+    params.details,
+    refKey || null
+  );
+
+  if (insertRes.changes !== 1) {
+    const currTotal = Number(prof.total_xp || 0);
+    return {
+      revoked: false,
+      amount: 0,
+      xp: Number(prof.xp || 0),
+      totalXp: currTotal,
+      level: calculateLevelFromXp(currTotal).level,
+    };
+  }
+
+  const nextXp = Math.max(0, Number(prof.xp || 0) - safeAmount);
+  const nextTotalXp = Math.max(0, Number(prof.total_xp || 0) - safeAmount);
+  const { level } = calculateLevelFromXp(nextTotalXp);
+
+  db.prepare(`
+    UPDATE profiles
+    SET xp = ?, total_xp = ?, level = ?, updated_at = datetime('now')
+    WHERE user_id = ?
+  `).run(nextXp, nextTotalXp, level, params.userId);
+
+  return { revoked: true, amount: safeAmount, xp: nextXp, totalXp: nextTotalXp, level };
+}
+
+function getMoscowDayStartSqliteUtc(): string {
+  const mskDate = getMoscowDateString();
+  const utcStartMs = Date.parse(`${mskDate}T00:00:00.000Z`) - 3 * 60 * 60 * 1000;
+  return new Date(utcStartMs).toISOString().slice(0, 19).replace('T', ' ');
+}
+
+function canEarnDiscussionXp(userId: string, content: string): boolean {
+  const nonWhitespaceLen = String(content || '').replace(/\s+/g, '').length;
+  if (nonWhitespaceLen < 15) return false;
+
+  const recentReward = db.prepare(`
+    SELECT 1 FROM xp_transactions
+    WHERE user_id = ?
+      AND source IN ('community_post', 'comment')
+      AND amount > 0
+      AND datetime(created_at) > datetime('now', '-60 seconds')
+    LIMIT 1
+  `).get(userId);
+  if (recentReward) return false;
+
+  const dayStartUtc = getMoscowDayStartSqliteUtc();
+  const dailyRow = db.prepare(`
+    SELECT COUNT(*) as cnt FROM xp_transactions
+    WHERE user_id = ?
+      AND source IN ('community_post', 'comment')
+      AND amount > 0
+      AND datetime(created_at) >= datetime(?)
+  `).get(userId, dayStartUtc) as { cnt?: number } | undefined;
+
+  return Number(dailyRow?.cnt || 0) < 3;
+}
+
+function createNotificationRecord(params: {
+  recipientUserId: string;
+  actor: { id: string; nickname: string; display_name?: string };
+  type: 'reply' | 'new_post' | 'new_creation' | 'new_comment' | 'news';
+  targetType: 'post' | 'creation' | 'album' | 'single' | 'news';
+  targetId: string;
+  targetTitle: string;
+  targetLink: string;
+  excerpt: string;
+  allowSelf?: boolean;
+}) {
+  if (!params.recipientUserId) return;
+  if (!params.allowSelf && params.recipientUserId === params.actor.id) return;
+  try {
+    const cleanExcerpt = String(params.excerpt || '').replace(/\s+/g, ' ').trim().slice(0, 140);
+    const cleanTitle = String(params.targetTitle || '').trim().slice(0, 120);
+    const actorName = (params.actor.display_name || params.actor.nickname || 'Участник').trim().slice(0, 60);
+    db.prepare(`
+      INSERT INTO notifications (
+        id, user_id, actor_id, actor_nickname, actor_name, type,
+        target_type, target_id, target_title, target_link, excerpt, is_read
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+    `).run(
+      'ntf_' + crypto.randomUUID().slice(0, 10),
+      params.recipientUserId,
+      params.actor.id,
+      params.actor.nickname,
+      actorName,
+      params.type,
+      params.targetType,
+      params.targetId,
+      cleanTitle,
+      params.targetLink,
+      cleanExcerpt
+    );
+  } catch (err) {
+    console.error('[Notifications] Failed to create notification:', err);
+  }
+}
 
 function createReplyNotification(params: {
   recipientUserId: string;
@@ -1165,31 +1382,46 @@ function createReplyNotification(params: {
   targetLink: string;
   excerpt: string;
 }) {
-  if (!params.recipientUserId || params.recipientUserId === params.actor.id) return;
+  createNotificationRecord({ ...params, type: 'reply' });
+}
+
+function notifyFollowers(params: {
+  author: { id: string; nickname: string; display_name?: string };
+  type: 'new_post' | 'new_creation' | 'new_comment';
+  targetType: 'post' | 'creation' | 'album' | 'single';
+  targetId: string;
+  targetTitle: string;
+  targetLink: string;
+  excerpt: string;
+  excludeUserIds?: Set<string>;
+}) {
   try {
-    const cleanExcerpt = String(params.excerpt || '').replace(/\s+/g, ' ').trim().slice(0, 140);
-    const cleanTitle = String(params.targetTitle || '').trim().slice(0, 120);
-    const actorName = (params.actor.display_name || params.actor.nickname || 'Участник').trim().slice(0, 60);
-    db.prepare(`
-      INSERT INTO notifications (
-        id, user_id, actor_id, actor_nickname, actor_name, type,
-        target_type, target_id, target_title, target_link, excerpt, is_read
-      )
-      VALUES (?, ?, ?, ?, ?, 'reply', ?, ?, ?, ?, ?, 0)
-    `).run(
-      'ntf_' + crypto.randomUUID().slice(0, 10),
-      params.recipientUserId,
-      params.actor.id,
-      params.actor.nickname,
-      actorName,
-      params.targetType,
-      params.targetId,
-      cleanTitle,
-      params.targetLink,
-      cleanExcerpt
-    );
+    const followers = db.prepare(`
+      SELECT f.follower_id
+      FROM follows f
+      JOIN users u ON u.id = f.follower_id
+      JOIN profiles p ON p.user_id = u.id
+      WHERE f.following_id = ?
+        AND u.is_banned = 0
+        AND COALESCE(p.notify_follows, 1) = 1
+    `).all(params.author.id) as Array<{ follower_id: string }>;
+
+    for (const row of followers) {
+      if (row.follower_id === params.author.id) continue;
+      if (params.excludeUserIds?.has(row.follower_id)) continue;
+      createNotificationRecord({
+        recipientUserId: row.follower_id,
+        actor: params.author,
+        type: params.type,
+        targetType: params.targetType,
+        targetId: params.targetId,
+        targetTitle: params.targetTitle,
+        targetLink: params.targetLink,
+        excerpt: params.excerpt,
+      });
+    }
   } catch (err) {
-    console.error('[Notifications] Failed to create notification:', err);
+    console.error('[Notifications] Failed to notify followers:', err);
   }
 }
 
@@ -1215,6 +1447,102 @@ app.get('/api/notifications', requireAuth, (req: AuthRequest, res: Response) => 
   });
 });
 
+app.get('/api/notifications/preferences', requireAuth, (req: AuthRequest, res: Response) => {
+  const row = db
+    .prepare('SELECT notify_follows, notify_news FROM profiles WHERE user_id = ?')
+    .get(req.user!.id) as { notify_follows?: number; notify_news?: number } | undefined;
+  res.json({
+    notify_follows: row?.notify_follows === 0 ? false : true,
+    notify_news: Boolean(row?.notify_news),
+  });
+});
+
+app.put('/api/notifications/preferences', requireAuth, (req: AuthRequest, res: Response) => {
+  const { notify_follows, notify_news } = req.body || {};
+  const nextFollows = notify_follows !== undefined ? (notify_follows ? 1 : 0) : null;
+  const nextNews = notify_news !== undefined ? (notify_news ? 1 : 0) : null;
+
+  db.prepare(`
+    UPDATE profiles SET
+      notify_follows = COALESCE(?, notify_follows),
+      notify_news = COALESCE(?, notify_news),
+      updated_at = datetime('now')
+    WHERE user_id = ?
+  `).run(nextFollows, nextNews, req.user!.id);
+
+  const row = db
+    .prepare('SELECT notify_follows, notify_news FROM profiles WHERE user_id = ?')
+    .get(req.user!.id) as { notify_follows?: number; notify_news?: number } | undefined;
+
+  res.json({
+    ok: true,
+    notify_follows: row?.notify_follows === 0 ? false : true,
+    notify_news: Boolean(row?.notify_news),
+  });
+});
+
+app.get('/api/admin/news', requireAdmin, (_req: AuthRequest, res: Response) => {
+  const news = db.prepare(`
+    SELECT sn.*, u.nickname as author_nickname
+    FROM site_news sn
+    LEFT JOIN users u ON u.id = sn.created_by
+    ORDER BY datetime(sn.created_at) DESC
+    LIMIT 100
+  `).all();
+  const subRow = db.prepare(`
+    SELECT COUNT(*) as cnt
+    FROM users u
+    JOIN profiles p ON p.user_id = u.id
+    WHERE u.is_banned = 0 AND COALESCE(p.notify_news, 0) = 1
+  `).get() as { cnt?: number } | undefined;
+  res.json({ news, subscribers_count: Number(subRow?.cnt || 0) });
+});
+
+app.post('/api/admin/news/broadcast', requireAdmin, (req: AuthRequest, res: Response) => {
+  const cleanTitle = String(req.body?.title || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+  const cleanMessage = String(req.body?.message || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+  const rawLink = String(req.body?.link || '/').trim();
+  const safeLink = rawLink.startsWith('/') ? rawLink.slice(0, 200) : '/';
+
+  if (!cleanTitle || !cleanMessage) {
+    res.status(400).json({ error: 'Укажите заголовок и текст новости.' });
+    return;
+  }
+
+  const subscribers = db.prepare(`
+    SELECT u.id
+    FROM users u
+    JOIN profiles p ON p.user_id = u.id
+    WHERE u.is_banned = 0 AND COALESCE(p.notify_news, 0) = 1
+  `).all() as Array<{ id: string }>;
+
+  const newsId = 'news_' + crypto.randomUUID().slice(0, 8);
+  let sentCount = 0;
+
+  db.transaction(() => {
+    for (const sub of subscribers) {
+      createNotificationRecord({
+        recipientUserId: sub.id,
+        actor: req.user!,
+        type: 'news',
+        targetType: 'news',
+        targetId: newsId,
+        targetTitle: cleanTitle,
+        targetLink: safeLink,
+        excerpt: cleanMessage,
+        allowSelf: true,
+      });
+      sentCount += 1;
+    }
+    db.prepare(`
+      INSERT INTO site_news (id, title, message, link, sent_count, created_by)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(newsId, cleanTitle, cleanMessage, safeLink, sentCount, req.user!.id);
+  })();
+
+  res.json({ ok: true, id: newsId, sent_count: sentCount });
+});
+
 app.post('/api/notifications/read', requireAuth, (req: AuthRequest, res: Response) => {
   const userId = req.user!.id;
   const { id, all } = req.body || {};
@@ -1238,6 +1566,101 @@ app.post('/api/notifications/read', requireAuth, (req: AuthRequest, res: Respons
 app.post('/api/rules/accept', requireAuth, (req: AuthRequest, res: Response) => {
   db.prepare("UPDATE users SET accepted_rules = 1, updated_at = datetime('now') WHERE id = ?").run(req.user!.id);
   res.json({ ok: true, accepted_rules: 1 });
+});
+
+const DEFAULT_COMMUNITY_RULES_FALLBACK = {
+  intro_ru:
+    'Тут общаются слушатели и авторы вокруг музыки deathmarried. Чтобы всем было комфортно, держимся четырёх простых правил:',
+  intro_en:
+    'Listeners and creators gather here around deathmarried music. To keep the space welcoming, we follow four simple rules:',
+  footer_ru:
+    'За нарушения модераторы могут скрыть или удалить публикацию, а при повторах — ограничить доступ к аккаунту.',
+  footer_en:
+    'Moderators may hide or remove content that breaks the rules, and repeated violations can lead to account restrictions.',
+  items: [
+    {
+      title_ru: 'Без 18+ и NSFW',
+      title_en: 'No 18+ or NSFW',
+      body_ru: 'Никакой порнографии, эротики и откровенного контента — ни в текстах, ни в картинках, ни в ссылках.',
+      body_en: 'No pornography, erotica, or explicit adult content in text, images, or external links.',
+    },
+    {
+      title_ru: 'Без насилия, крови и жести',
+      title_en: 'No violence or gore',
+      body_ru: 'Запрещены шок-контент, реальная кровь, расчленёнка, угрозы и любые призывы к причинению вреда.',
+      body_en: 'Shock content, real gore, threats, and any calls to violence or self-harm are strictly forbidden.',
+    },
+    {
+      title_ru: 'Без оскорблений и травли',
+      title_en: 'No harassment or hate',
+      body_ru: 'Спорить о музыке и вкусах — нормально. Переходить на личности, унижать участников или разжигать ненависть — нет.',
+      body_en: 'Debating music and taste is welcome; personal attacks, bullying, and hate speech are not.',
+    },
+    {
+      title_ru: 'Без спама и рекламы',
+      title_en: 'No spam or promotion',
+      body_ru: 'Никакого флуда, реферальных ссылок, рекламы чужих каналов/магазинов, ботов и скама.',
+      body_en: 'No flooding, referral links, unsolicited promotion of external channels/stores, bots, or scams.',
+    },
+  ],
+};
+
+app.get('/api/rules', (_req: Request, res: Response) => {
+  try {
+    const row = db.prepare("SELECT value FROM app_meta WHERE key = 'community_rules_json'").get() as
+      | { value?: string }
+      | undefined;
+    if (row?.value) {
+      const parsed = JSON.parse(row.value);
+      if (parsed && typeof parsed === 'object' && Array.isArray(parsed.items)) {
+        res.json({ rules: parsed });
+        return;
+      }
+    }
+  } catch {}
+  res.json({ rules: DEFAULT_COMMUNITY_RULES_FALLBACK });
+});
+
+app.put('/api/admin/rules', requireAdmin, (req: AuthRequest, res: Response) => {
+  const payload = req.body?.rules ?? req.body;
+  if (!payload || typeof payload !== 'object' || !Array.isArray(payload.items) || payload.items.length === 0) {
+    res.status(400).json({ error: 'Нужен минимум один пункт правил.' });
+    return;
+  }
+
+  const cleanItems = payload.items
+    .map((item: any) => ({
+      title_ru: String(item?.title_ru || '').trim().slice(0, 140),
+      title_en: String(item?.title_en || item?.title_ru || '').trim().slice(0, 140),
+      body_ru: String(item?.body_ru || '').trim().slice(0, 1000),
+      body_en: String(item?.body_en || item?.body_ru || '').trim().slice(0, 1000),
+    }))
+    .filter((it: any) => it.title_ru && it.body_ru)
+    .slice(0, 25);
+
+  if (cleanItems.length === 0) {
+    res.status(400).json({ error: 'Заполните заголовок и текст хотя бы одного правила.' });
+    return;
+  }
+
+  const normalized = {
+    intro_ru: String(payload.intro_ru || DEFAULT_COMMUNITY_RULES_FALLBACK.intro_ru).trim().slice(0, 800),
+    intro_en: String(payload.intro_en || payload.intro_ru || DEFAULT_COMMUNITY_RULES_FALLBACK.intro_en)
+      .trim()
+      .slice(0, 800),
+    footer_ru: String(payload.footer_ru || DEFAULT_COMMUNITY_RULES_FALLBACK.footer_ru).trim().slice(0, 800),
+    footer_en: String(payload.footer_en || payload.footer_ru || DEFAULT_COMMUNITY_RULES_FALLBACK.footer_en)
+      .trim()
+      .slice(0, 800),
+    items: cleanItems,
+  };
+
+  db.prepare(`
+    INSERT INTO app_meta (key, value) VALUES ('community_rules_json', ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `).run(JSON.stringify(normalized));
+
+  res.json({ ok: true, rules: normalized });
 });
 
 // ----------------------------------------------------------------------------
@@ -1303,49 +1726,66 @@ app.post('/api/archive/:releaseType/:releaseId/comments', requireAuth, (req: Aut
 
   const id = 'cm_' + crypto.randomUUID().slice(0, 8);
   let newlyUnlocked: UnlockedAchievementInfo[] = [];
+  let xpAwardedAmount = 0;
 
   db.transaction(() => {
+    const eligibleXp = canEarnDiscussionXp(req.user!.id, cleanContent);
+    xpAwardedAmount = eligibleXp ? 5 : 0;
+
     db.prepare(`
-      INSERT INTO comments (id, user_id, album_id, single_id, content, parent_id, is_hidden)
-      VALUES (?, ?, ?, ?, ?, ?, 0)
+      INSERT INTO comments (id, user_id, album_id, single_id, content, parent_id, is_hidden, xp_awarded, xp_awarded_amount)
+      VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
     `).run(
       id,
       req.user!.id,
       releaseType === 'album' ? releaseId : null,
       releaseType === 'single' ? releaseId : null,
       cleanContent,
-      parentComment ? parentComment.id : null
+      parentComment ? parentComment.id : null,
+      xpAwardedAmount > 0 ? 1 : 0,
+      xpAwardedAmount
     );
 
-    db.prepare(`
-      UPDATE profiles SET xp = xp + 5, total_xp = total_xp + 5, updated_at = datetime('now')
-      WHERE user_id = ?
-    `).run(req.user!.id);
-    const updated = db.prepare('SELECT total_xp FROM profiles WHERE user_id = ?').get(req.user!.id) as any;
-    const { level } = calculateLevelFromXp(updated.total_xp);
-    db.prepare('UPDATE profiles SET level = ? WHERE user_id = ?').run(level, req.user!.id);
+    if (xpAwardedAmount > 0) {
+      awardXpWithRef({
+        userId: req.user!.id,
+        amount: xpAwardedAmount,
+        source: 'comment',
+        details: `Комментарий к релизу «${String(targetRelease.title).slice(0, 36)}»`,
+        referenceKey: `award:comment:${id}`,
+      });
+    }
 
-    db.prepare(`
-      INSERT INTO xp_transactions (id, user_id, amount, source, details)
-      VALUES (?, ?, 5, 'comment', ?)
-    `).run('xpt_' + crypto.randomUUID().slice(0, 8), req.user!.id, `Комментарий к релизу «${String(targetRelease.title).slice(0, 36)}»`);
-
+    const excluded = new Set<string>();
+    const targetLink = `/archive?${releaseType}=${encodeURIComponent(releaseId)}`;
     if (parentComment && parentComment.user_id && parentComment.user_id !== req.user!.id) {
+      excluded.add(parentComment.user_id);
       createReplyNotification({
         recipientUserId: parentComment.user_id,
         actor: req.user!,
         targetType: releaseType,
         targetId: releaseId,
         targetTitle: targetRelease.title,
-        targetLink: `/archive?${releaseType}=${encodeURIComponent(releaseId)}`,
+        targetLink,
         excerpt: cleanContent,
       });
     }
 
+    notifyFollowers({
+      author: req.user!,
+      type: 'new_comment',
+      targetType: releaseType,
+      targetId: releaseId,
+      targetTitle: targetRelease.title,
+      targetLink,
+      excerpt: cleanContent,
+      excludeUserIds: excluded,
+    });
+
     newlyUnlocked = evaluateUserAchievements(req.user!.id);
   })();
 
-  res.json({ ok: true, id, newly_unlocked_achievements: newlyUnlocked });
+  res.json({ ok: true, id, xp_earned: xpAwardedAmount, newly_unlocked_achievements: newlyUnlocked });
 });
 
 app.get('/api/archive/albums', (_req: Request, res: Response) => {
@@ -1440,7 +1880,7 @@ app.get('/api/archive/singles/:id', (req: Request, res: Response) => {
 });
 
 // Admin album management
-app.post('/api/archive/albums', requireAdminOrMod, (req: AuthRequest, res: Response) => {
+app.post('/api/archive/albums', requireAdmin, (req: AuthRequest, res: Response) => {
   const { title, format_type, release_year, release_date, cover_url, description, source_url, streaming_links, sort_order } = req.body || {};
   if (typeof title !== 'string' || !title.trim()) {
     res.status(400).json({ error: 'Album title is required.' });
@@ -1486,7 +1926,7 @@ app.post('/api/archive/albums', requireAdminOrMod, (req: AuthRequest, res: Respo
   res.json({ ok: true, id });
 });
 
-app.put('/api/archive/albums/:id', requireAdminOrMod, (req: AuthRequest, res: Response) => {
+app.put('/api/archive/albums/:id', requireAdmin, (req: AuthRequest, res: Response) => {
   const existingAlbum = db.prepare('SELECT id FROM albums WHERE id = ?').get(req.params.id);
   if (!existingAlbum) {
     res.status(404).json({ error: 'Album not found' });
@@ -1548,7 +1988,7 @@ app.put('/api/archive/albums/:id', requireAdminOrMod, (req: AuthRequest, res: Re
   res.json({ ok: true, id: req.params.id, album: updatedAlbum });
 });
 
-app.delete('/api/archive/albums/:id', requireAdminOrMod, (req: AuthRequest, res: Response) => {
+app.delete('/api/archive/albums/:id', requireAdmin, (req: AuthRequest, res: Response) => {
   const albumId = req.params.id;
   const existingAlbum = db.prepare('SELECT id FROM albums WHERE id = ?').get(albumId);
   if (!existingAlbum) {
@@ -1577,7 +2017,7 @@ app.delete('/api/archive/albums/:id', requireAdminOrMod, (req: AuthRequest, res:
 });
 
 // Admin tracks management
-app.post('/api/archive/tracks', requireAdminOrMod, (req: AuthRequest, res: Response) => {
+app.post('/api/archive/tracks', requireAdmin, (req: AuthRequest, res: Response) => {
   const { album_id, single_id, title, track_number, duration_seconds, audio_url, lyrics, external_url } = req.body || {};
   if (typeof title !== 'string' || !title.trim()) {
     res.status(400).json({ error: 'Track title is required.' });
@@ -1648,7 +2088,7 @@ app.post('/api/archive/tracks', requireAdminOrMod, (req: AuthRequest, res: Respo
   });
 });
 
-app.put('/api/archive/tracks/:id', requireAdminOrMod, (req: AuthRequest, res: Response) => {
+app.put('/api/archive/tracks/:id', requireAdmin, (req: AuthRequest, res: Response) => {
   const existingTrack = db.prepare('SELECT album_id, audio_url FROM tracks WHERE id = ?').get(req.params.id) as any;
   if (!existingTrack) {
     res.status(404).json({ error: 'Track not found' });
@@ -1730,7 +2170,7 @@ app.put('/api/archive/tracks/:id', requireAdminOrMod, (req: AuthRequest, res: Re
   });
 });
 
-app.delete('/api/archive/tracks/:id', requireAdminOrMod, (req: AuthRequest, res: Response) => {
+app.delete('/api/archive/tracks/:id', requireAdmin, (req: AuthRequest, res: Response) => {
   const track = db.prepare('SELECT id, album_id FROM tracks WHERE id = ?').get(req.params.id) as any;
   if (!track) {
     res.status(404).json({ error: 'Track not found' });
@@ -1757,7 +2197,7 @@ app.delete('/api/archive/tracks/:id', requireAdminOrMod, (req: AuthRequest, res:
 });
 
 // Admin singles management
-app.post('/api/archive/singles', requireAdminOrMod, (req: AuthRequest, res: Response) => {
+app.post('/api/archive/singles', requireAdmin, (req: AuthRequest, res: Response) => {
   const { title, release_year, release_date, cover_url, description, duration_seconds, audio_url, lyrics, streaming_links, sort_order } = req.body || {};
   if (typeof title !== 'string' || !title.trim()) {
     res.status(400).json({ error: 'Single title is required.' });
@@ -1804,7 +2244,7 @@ app.post('/api/archive/singles', requireAdminOrMod, (req: AuthRequest, res: Resp
   res.json({ ok: true, id });
 });
 
-app.put('/api/archive/singles/:id', requireAdminOrMod, (req: AuthRequest, res: Response) => {
+app.put('/api/archive/singles/:id', requireAdmin, (req: AuthRequest, res: Response) => {
   const existingSingle = db.prepare('SELECT id FROM singles WHERE id = ?').get(req.params.id);
   if (!existingSingle) {
     res.status(404).json({ error: 'Single not found' });
@@ -1871,7 +2311,7 @@ app.put('/api/archive/singles/:id', requireAdminOrMod, (req: AuthRequest, res: R
   res.json({ ok: true, id: req.params.id, single: savedSingle });
 });
 
-app.delete('/api/archive/singles/:id', requireAdminOrMod, (req: AuthRequest, res: Response) => {
+app.delete('/api/archive/singles/:id', requireAdmin, (req: AuthRequest, res: Response) => {
   const singleId = req.params.id;
   const existingSingle = db.prepare('SELECT id FROM singles WHERE id = ?').get(singleId);
   if (!existingSingle) {
@@ -1895,7 +2335,7 @@ app.delete('/api/archive/singles/:id', requireAdminOrMod, (req: AuthRequest, res
 });
 
 // Admin media storage inventory (audio tracks + uploaded cover images)
-app.get('/api/admin/audio-files', requireAdminOrMod, (_req: Request, res: Response) => {
+app.get('/api/admin/audio-files', requireAdmin, (_req: Request, res: Response) => {
   const audioFiles = db.prepare(`
     SELECT af.id, af.filename, af.mime_type, af.byte_size, af.storage_path, af.created_at,
            u.nickname as uploader_name, t.title as attached_track_title
@@ -2433,18 +2873,23 @@ app.get('/api/games/guess-track/round', (req: Request, res: Response) => {
   } | null = null;
 
   if (user) {
+    const completion = db.prepare(`
+      SELECT * FROM game_completions WHERE user_id = ? AND game_type = 'guess-track' AND cycle_id = ?
+    `).get(user.id, slotKey) as any;
     const attempt = db.prepare(`
       SELECT * FROM daily_track_attempts WHERE user_id = ? AND challenge_date = ?
     `).get(user.id, slotKey) as any;
-    if (attempt) {
+
+    if (completion || attempt) {
       alreadyCompleted = true;
+      const trackId = attempt?.track_id || daily.track.id;
       previousAttempt = {
-        correct: Boolean(attempt.is_correct),
-        selected_track_id: attempt.selected_track_id,
-        correct_track_id: attempt.track_id,
-        score: Number(attempt.score) || 0,
-        xp_earned: Number(attempt.xp_earned) || 0,
-        track: getTrackRevealInfo(attempt.track_id) || { id: daily.track.id, title: daily.track.title },
+        correct: Boolean(attempt ? attempt.is_correct : completion?.is_correct),
+        selected_track_id: attempt?.selected_track_id || '',
+        correct_track_id: trackId,
+        score: Number(attempt?.score ?? completion?.score) || 0,
+        xp_earned: Number(attempt?.xp_earned ?? completion?.xp_earned) || 0,
+        track: getTrackRevealInfo(trackId) || { id: daily.track.id, title: daily.track.title },
       };
     }
   }
@@ -2460,6 +2905,7 @@ app.get('/api/games/guess-track/round', (req: Request, res: Response) => {
     snippet_start_ratio: daily.snippet_start_ratio,
     snippet_duration: daily.snippet_duration_seconds,
     options: daily.options,
+    completed: alreadyCompleted,
     already_completed: alreadyCompleted,
     previous_attempt: previousAttempt,
   });
@@ -2507,13 +2953,19 @@ app.post('/api/games/guess-track/verify', (req: AuthRequest, res: Response) => {
   }
 
   if (user) {
+    const existingCompletion = db.prepare(`
+      SELECT id FROM game_completions WHERE user_id = ? AND game_type = 'guess-track' AND cycle_id = ?
+    `).get(user.id, slotKey);
     const existingAttempt = db.prepare(`
       SELECT id FROM daily_track_attempts WHERE user_id = ? AND challenge_date = ?
     `).get(user.id, slotKey);
-    if (existingAttempt) {
-      res.status(400).json({
+    if (existingCompletion || existingAttempt) {
+      res.status(409).json({
         error: 'Вы уже прошли текущий раунд «Угадай трек». Обновление в 00:00 и 12:00 МСК!',
+        completed: true,
         already_completed: true,
+        xp_earned: 0,
+        next_reset_at: nextResetAt,
       });
       return;
     }
@@ -2551,8 +3003,19 @@ app.post('/api/games/guess-track/verify', (req: AuthRequest, res: Response) => {
   };
 
   if (user) {
+    let duplicateCompletion = false;
     try {
       db.transaction(() => {
+        const gcInsert = db.prepare(`
+          INSERT OR IGNORE INTO game_completions (id, user_id, game_type, cycle_id, is_correct, score, xp_earned)
+          VALUES (?, ?, 'guess-track', ?, ?, ?, ?)
+        `).run('gc_' + crypto.randomUUID().slice(0, 8), user.id, slotKey, isCorrect ? 1 : 0, score, xpEarned);
+
+        if (gcInsert.changes !== 1) {
+          duplicateCompletion = true;
+          return;
+        }
+
         // Ensure current 12-hour track challenge row is persisted in the DB snapshot synced to Supabase
         db.prepare(`
           INSERT OR IGNORE INTO daily_track_challenges
@@ -2569,7 +3032,6 @@ app.post('/api/games/guess-track/verify', (req: AuthRequest, res: Response) => {
           JSON.stringify(daily.options)
         );
 
-        // Enforce strictly 1 rewarded attempt per user per 12-hour UTC window
         db.prepare(`
           INSERT INTO daily_track_attempts
             (id, user_id, challenge_date, track_id, selected_track_id, is_correct, score, xp_earned, time_spent)
@@ -2586,7 +3048,6 @@ app.post('/api/games/guess-track/verify', (req: AuthRequest, res: Response) => {
           safeTimeSpent
         );
 
-        // Record game attempt
         db.prepare(`
           INSERT INTO game_attempts (id, user_id, game_id, score, xp_earned, details_json)
           VALUES (?, ?, 'guess-track', ?, ?, ?)
@@ -2598,48 +3059,45 @@ app.post('/api/games/guess-track/verify', (req: AuthRequest, res: Response) => {
           JSON.stringify({ isCorrect, correctTrackId, challengeDate: slotKey, streakBonusPercent })
         );
 
-        // Record XP transaction in Russian
         const txDetails = isCorrect
           ? (streakBonusPercent > 0 ? `Верный ответ (серия +${streakBonusPercent}%)` : 'Верный ответ')
           : (streakBonusPercent > 0 ? `Участие в раунде (серия +${streakBonusPercent}%)` : 'Участие в раунде');
 
-        db.prepare(`
-          INSERT INTO xp_transactions (id, user_id, amount, source, details)
-          VALUES (?, ?, ?, 'guess_track', ?)
-        `).run(
-          'xpt_' + crypto.randomUUID().slice(0, 8),
-          user.id,
-          xpEarned,
-          txDetails
-        );
-
-        const prev = db.prepare('SELECT total_xp FROM profiles WHERE user_id = ?').get(user.id) as any;
-        const nextTotalXp = (prev?.total_xp || 0) + xpEarned;
-        const { level } = calculateLevelFromXp(nextTotalXp);
+        awardXpWithRef({
+          userId: user.id,
+          amount: xpEarned,
+          source: 'guess_track',
+          details: txDetails,
+          referenceKey: `game:guess-track:${slotKey}:${user.id}`,
+        });
 
         db.prepare(`
           UPDATE profiles SET
-            xp = xp + ?,
-            total_xp = ?,
-            level = ?,
             daily_streak = ?,
             last_active_date = ?,
             updated_at = datetime('now')
           WHERE user_id = ?
-        `).run(xpEarned, nextTotalXp, level, nextStreak, todayMoscowDate, user.id);
+        `).run(nextStreak, todayMoscowDate, user.id);
 
-        // Evaluate all eligible achievements server-side
         newlyUnlockedAchievements = evaluateUserAchievements(user.id);
       })();
     } catch (err: any) {
       if (String(err?.message || '').includes('UNIQUE')) {
-        res.status(400).json({
-          error: 'Вы уже прошли текущий раунд «Угадай трек». Новый трек обновляется каждые 12 часов (в 00:00 и 12:00 UTC)!',
-          already_completed: true,
-        });
-        return;
+        duplicateCompletion = true;
+      } else {
+        throw err;
       }
-      throw err;
+    }
+
+    if (duplicateCompletion) {
+      res.status(409).json({
+        error: 'Вы уже прошли текущий раунд «Угадай трек». Обновление в 00:00 и 12:00 МСК!',
+        completed: true,
+        already_completed: true,
+        xp_earned: 0,
+        next_reset_at: nextResetAt,
+      });
+      return;
     }
   }
 
@@ -2673,6 +3131,7 @@ app.get('/api/games/quiz/daily', (req: Request, res: Response) => {
       disabled: true,
       message: 'Зайдите позже, добавляются новые вопросы',
       questions: [],
+      completed: false,
       already_completed: false,
       previous_score: 0,
       previous_xp: 0,
@@ -2689,13 +3148,16 @@ app.get('/api/games/quiz/daily', (req: Request, res: Response) => {
   let previousXp = 0;
 
   if (user) {
+    const completion = db.prepare(`
+      SELECT * FROM game_completions WHERE user_id = ? AND game_type = 'daily-quiz' AND cycle_id = ?
+    `).get(user.id, cycleId) as any;
     const attempt = db.prepare(`
       SELECT * FROM quiz_attempts WHERE user_id = ? AND challenge_date = ?
     `).get(user.id, cycleId) as any;
-    if (attempt) {
+    if (completion || attempt) {
       alreadyCompleted = true;
-      previousScore = attempt.score;
-      previousXp = attempt.xp_earned;
+      previousScore = Number(attempt?.score ?? completion?.score) || 0;
+      previousXp = Number(attempt?.xp_earned ?? completion?.xp_earned) || 0;
     }
   }
 
@@ -2713,6 +3175,7 @@ app.get('/api/games/quiz/daily', (req: Request, res: Response) => {
   res.json({
     disabled: false,
     questions: sanitized,
+    completed: alreadyCompleted,
     already_completed: alreadyCompleted,
     previous_score: previousScore,
     previous_xp: previousXp,
@@ -2754,12 +3217,21 @@ app.post('/api/games/quiz/submit', (req: AuthRequest, res: Response) => {
   }
 
   if (user) {
+    const existingCompletion = db.prepare(`
+      SELECT id FROM game_completions WHERE user_id = ? AND game_type = 'daily-quiz' AND cycle_id = ?
+    `).get(user.id, cycleId);
     const existingAttempt = db.prepare(`
       SELECT id FROM quiz_attempts WHERE user_id = ? AND challenge_date = ?
     `).get(user.id, cycleId);
 
-    if (existingAttempt) {
-      res.status(400).json({ error: 'Вы уже прошли викторину в этом раунде. Обновление в 00:00 и 12:00 МСК!' });
+    if (existingCompletion || existingAttempt) {
+      res.status(409).json({
+        error: 'Вы уже прошли викторину в этом раунде. Обновление в 00:00 и 12:00 МСК!',
+        completed: true,
+        already_completed: true,
+        xp_earned: 0,
+        next_reset_at: nextResetAt,
+      });
       return;
     }
   }
@@ -2820,8 +3292,25 @@ app.post('/api/games/quiz/submit', (req: AuthRequest, res: Response) => {
     streakBonusXp = boosted.bonusXp;
     streakBonusPercent = boosted.bonusPercent;
 
+    let duplicateCompletion = false;
     try {
       db.transaction(() => {
+        const gcInsert = db.prepare(`
+          INSERT OR IGNORE INTO game_completions (id, user_id, game_type, cycle_id, is_correct, score, xp_earned)
+          VALUES (?, ?, 'daily-quiz', ?, ?, ?, ?)
+        `).run(
+          'gc_' + crypto.randomUUID().slice(0, 8),
+          user.id,
+          cycleId,
+          correctCount > 0 ? 1 : 0,
+          baseScore,
+          totalXp
+        );
+        if (gcInsert.changes !== 1) {
+          duplicateCompletion = true;
+          return;
+        }
+
         db.prepare(`
           INSERT OR IGNORE INTO daily_challenges (id, challenge_date, questions_json)
           VALUES (?, ?, ?)
@@ -2852,33 +3341,41 @@ app.post('/api/games/quiz/submit', (req: AuthRequest, res: Response) => {
             ? `Результат ${correctCount}/${total} (серия +${streakBonusPercent}%)`
             : `Результат ${correctCount}/${total}`;
 
-        db.prepare(`
-          INSERT INTO xp_transactions (id, user_id, amount, source, details)
-          VALUES (?, ?, ?, 'daily_quiz', ?)
-        `).run('xpt_' + crypto.randomUUID().slice(0, 8), user.id, totalXp, txDetails);
-
-        const nextTotalXp = (prev?.total_xp || 0) + totalXp;
-        const { level } = calculateLevelFromXp(nextTotalXp);
+        awardXpWithRef({
+          userId: user.id,
+          amount: totalXp,
+          source: 'daily_quiz',
+          details: txDetails,
+          referenceKey: `game:daily-quiz:${cycleId}:${user.id}`,
+        });
 
         db.prepare(`
           UPDATE profiles SET
-            xp = xp + ?,
-            total_xp = ?,
-            level = ?,
             daily_streak = ?,
             last_active_date = ?,
             updated_at = datetime('now')
           WHERE user_id = ?
-        `).run(totalXp, nextTotalXp, level, nextStreak, todayMoscowDate, user.id);
+        `).run(nextStreak, todayMoscowDate, user.id);
 
         newlyUnlockedAchievements = evaluateUserAchievements(user.id);
       })();
     } catch (err: any) {
       if (String(err?.message || '').includes('UNIQUE')) {
-        res.status(400).json({ error: 'Вы уже прошли викторину в этом раунде. Обновление в 00:00 и 12:00 МСК!' });
-        return;
+        duplicateCompletion = true;
+      } else {
+        throw err;
       }
-      throw err;
+    }
+
+    if (duplicateCompletion) {
+      res.status(409).json({
+        error: 'Вы уже прошли викторину в этом раунде. Обновление в 00:00 и 12:00 МСК!',
+        completed: true,
+        already_completed: true,
+        xp_earned: 0,
+        next_reset_at: nextResetAt,
+      });
+      return;
     }
   }
 
@@ -2901,7 +3398,7 @@ app.post('/api/games/quiz/submit', (req: AuthRequest, res: Response) => {
   });
 });
 
-// Shared helper to record Stage 5 mini-game attempts (guess-lyrics, reverse-track, speed-track)
+// Shared helper to record Stage 5/6 mini-game attempts (guess-lyrics, reverse-track, speed-track) with atomic game_completions lock
 function recordMiniGameAttempt(params: {
   userId: string;
   gameId: 'guess-lyrics' | 'reverse-track' | 'speed-track';
@@ -2913,6 +3410,7 @@ function recordMiniGameAttempt(params: {
   correctValue: string;
   details: Record<string, unknown>;
 }): {
+  duplicate?: boolean;
   xpEarned: number;
   streakBonusXp: number;
   streakBonusPercent: number;
@@ -2929,8 +3427,19 @@ function recordMiniGameAttempt(params: {
   const xpEarned = boosted.totalXp;
   const score = isCorrect ? 100 : 0;
   let newlyUnlockedAchievements: UnlockedAchievementInfo[] = [];
+  let duplicate = false;
 
   db.transaction(() => {
+    const gcInsert = db.prepare(`
+      INSERT OR IGNORE INTO game_completions (id, user_id, game_type, cycle_id, is_correct, score, xp_earned)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run('gc_' + crypto.randomUUID().slice(0, 8), userId, gameId, cycleId, isCorrect ? 1 : 0, score, xpEarned);
+
+    if (gcInsert.changes !== 1) {
+      duplicate = true;
+      return;
+    }
+
     db.prepare(`
       INSERT INTO daily_mini_game_attempts
         (id, user_id, game_id, cycle_id, is_correct, score, xp_earned, selected_value, correct_value, details_json)
@@ -2964,27 +3473,35 @@ function recordMiniGameAttempt(params: {
       ? (boosted.bonusPercent > 0 ? `Верный ответ (серия +${boosted.bonusPercent}%)` : 'Верный ответ')
       : (boosted.bonusPercent > 0 ? `Участие в раунде (серия +${boosted.bonusPercent}%)` : 'Участие в раунде');
 
-    db.prepare(`
-      INSERT INTO xp_transactions (id, user_id, amount, source, details)
-      VALUES (?, ?, ?, ?, ?)
-    `).run('xpt_' + crypto.randomUUID().slice(0, 8), userId, xpEarned, xpSource, txDetails);
-
-    const nextTotalXp = (prev?.total_xp || 0) + xpEarned;
-    const { level } = calculateLevelFromXp(nextTotalXp);
+    awardXpWithRef({
+      userId,
+      amount: xpEarned,
+      source: xpSource,
+      details: txDetails,
+      referenceKey: `game:${gameId}:${cycleId}:${userId}`,
+    });
 
     db.prepare(`
       UPDATE profiles SET
-        xp = xp + ?,
-        total_xp = ?,
-        level = ?,
         daily_streak = ?,
         last_active_date = ?,
         updated_at = datetime('now')
       WHERE user_id = ?
-    `).run(xpEarned, nextTotalXp, level, nextStreak, todayMoscowDate, userId);
+    `).run(nextStreak, todayMoscowDate, userId);
 
     newlyUnlockedAchievements = evaluateUserAchievements(userId);
   })();
+
+  if (duplicate) {
+    return {
+      duplicate: true,
+      xpEarned: 0,
+      streakBonusXp: 0,
+      streakBonusPercent: 0,
+      nextStreak,
+      newlyUnlockedAchievements: [],
+    };
+  }
 
   return {
     xpEarned,
@@ -3028,22 +3545,25 @@ app.get('/api/games/guess-lyrics/round', (req: Request, res: Response) => {
   let alreadyCompleted = false;
   let previousAttempt: any = null;
   if (user) {
+    const completion = db.prepare(`
+      SELECT * FROM game_completions WHERE user_id = ? AND game_type = 'guess-lyrics' AND cycle_id = ?
+    `).get(user.id, cycleId) as any;
     const row = db.prepare(`
       SELECT * FROM daily_mini_game_attempts WHERE user_id = ? AND game_id = 'guess-lyrics' AND cycle_id = ?
     `).get(user.id, cycleId) as any;
-    if (row) {
+    if (completion || row) {
       alreadyCompleted = true;
       let parsedDetails: any = {};
       try {
-        parsedDetails = JSON.parse(row.details_json || '{}');
+        parsedDetails = JSON.parse(row?.details_json || '{}');
       } catch {}
       previousAttempt = {
-        correct: Boolean(row.is_correct),
-        selected_option_id: row.selected_value,
-        correct_option_id: row.correct_value || round.correct_option_id,
+        correct: Boolean(row ? row.is_correct : completion?.is_correct),
+        selected_option_id: row?.selected_value || '',
+        correct_option_id: row?.correct_value || round.correct_option_id,
         correct_line: parsedDetails.correctLine || round.correct_line,
-        score: Number(row.score) || 0,
-        xp_earned: Number(row.xp_earned) || 0,
+        score: Number(row?.score ?? completion?.score) || 0,
+        xp_earned: Number(row?.xp_earned ?? completion?.xp_earned) || 0,
         track: parsedDetails.track || {
           id: round.track.id,
           title: round.track.title,
@@ -3062,6 +3582,7 @@ app.get('/api/games/guess-lyrics/round', (req: Request, res: Response) => {
     round_token: `lyrics:${cycleId}`,
     prompt_line: round.prompt_line,
     options: round.options,
+    completed: alreadyCompleted,
     already_completed: alreadyCompleted,
     previous_attempt: previousAttempt,
   });
@@ -3099,13 +3620,19 @@ app.post('/api/games/guess-lyrics/verify', (req: AuthRequest, res: Response) => 
   }
 
   if (user) {
+    const existingGc = db.prepare(`
+      SELECT id FROM game_completions WHERE user_id = ? AND game_type = 'guess-lyrics' AND cycle_id = ?
+    `).get(user.id, cycleId);
     const existing = db.prepare(`
       SELECT id FROM daily_mini_game_attempts WHERE user_id = ? AND game_id = 'guess-lyrics' AND cycle_id = ?
     `).get(user.id, cycleId);
-    if (existing) {
-      res.status(400).json({
+    if (existingGc || existing) {
+      res.status(409).json({
         error: 'Вы уже прошли текущий раунд «Угадай строчку». Обновление в 00:00 и 12:00 МСК!',
+        completed: true,
         already_completed: true,
+        xp_earned: 0,
+        next_reset_at: nextResetAt,
       });
       return;
     }
@@ -3144,6 +3671,16 @@ app.post('/api/games/guess-lyrics/verify', (req: AuthRequest, res: Response) => 
           track: trackInfo,
         },
       });
+      if (saved.duplicate) {
+        res.status(409).json({
+          error: 'Вы уже прошли текущий раунд «Угадай строчку». Обновление в 00:00 и 12:00 МСК!',
+          completed: true,
+          already_completed: true,
+          xp_earned: 0,
+          next_reset_at: nextResetAt,
+        });
+        return;
+      }
       xpEarned = saved.xpEarned;
       streakBonusXp = saved.streakBonusXp;
       streakBonusPercent = saved.streakBonusPercent;
@@ -3151,7 +3688,13 @@ app.post('/api/games/guess-lyrics/verify', (req: AuthRequest, res: Response) => 
       newlyUnlockedAchievements = saved.newlyUnlockedAchievements;
     } catch (err: any) {
       if (String(err?.message || '').includes('UNIQUE')) {
-        res.status(400).json({ error: 'Вы уже прошли этот раунд.', already_completed: true });
+        res.status(409).json({
+          error: 'Вы уже прошли этот раунд.',
+          completed: true,
+          already_completed: true,
+          xp_earned: 0,
+          next_reset_at: nextResetAt,
+        });
         return;
       }
       throw err;
@@ -3215,21 +3758,24 @@ app.get('/api/games/reverse-track/round', (req: Request, res: Response) => {
   let alreadyCompleted = false;
   let previousAttempt: any = null;
   if (user) {
+    const completion = db.prepare(`
+      SELECT * FROM game_completions WHERE user_id = ? AND game_type = 'reverse-track' AND cycle_id = ?
+    `).get(user.id, cycleId) as any;
     const row = db.prepare(`
       SELECT * FROM daily_mini_game_attempts WHERE user_id = ? AND game_id = 'reverse-track' AND cycle_id = ?
     `).get(user.id, cycleId) as any;
-    if (row) {
+    if (completion || row) {
       alreadyCompleted = true;
-      const trackReveal = getTrackRevealInfo(row.correct_value || round.track.id) || {
+      const trackReveal = getTrackRevealInfo(row?.correct_value || round.track.id) || {
         id: round.track.id,
         title: round.track.title,
       };
       previousAttempt = {
-        correct: Boolean(row.is_correct),
-        selected_track_id: row.selected_value,
-        correct_track_id: row.correct_value || round.track.id,
-        score: Number(row.score) || 0,
-        xp_earned: Number(row.xp_earned) || 0,
+        correct: Boolean(row ? row.is_correct : completion?.is_correct),
+        selected_track_id: row?.selected_value || '',
+        correct_track_id: row?.correct_value || round.track.id,
+        score: Number(row?.score ?? completion?.score) || 0,
+        xp_earned: Number(row?.xp_earned ?? completion?.xp_earned) || 0,
         track: trackReveal,
       };
     }
@@ -3246,6 +3792,7 @@ app.get('/api/games/reverse-track/round', (req: Request, res: Response) => {
     snippet_start_ratio: round.snippet_start_ratio,
     snippet_duration: round.snippet_duration_seconds,
     options: round.options,
+    completed: alreadyCompleted,
     already_completed: alreadyCompleted,
     previous_attempt: previousAttempt,
   });
@@ -3283,13 +3830,19 @@ app.post('/api/games/reverse-track/verify', (req: AuthRequest, res: Response) =>
   }
 
   if (user) {
+    const existingGc = db.prepare(`
+      SELECT id FROM game_completions WHERE user_id = ? AND game_type = 'reverse-track' AND cycle_id = ?
+    `).get(user.id, cycleId);
     const existing = db.prepare(`
       SELECT id FROM daily_mini_game_attempts WHERE user_id = ? AND game_id = 'reverse-track' AND cycle_id = ?
     `).get(user.id, cycleId);
-    if (existing) {
-      res.status(400).json({
+    if (existingGc || existing) {
+      res.status(409).json({
         error: 'Вы уже прошли текущий раунд «Задом наперёд». Обновление в 00:00 и 12:00 МСК!',
+        completed: true,
         already_completed: true,
+        xp_earned: 0,
+        next_reset_at: nextResetAt,
       });
       return;
     }
@@ -3324,6 +3877,16 @@ app.post('/api/games/reverse-track/verify', (req: AuthRequest, res: Response) =>
         correctValue: correctTrackId,
         details: { isCorrect, correctTrackId },
       });
+      if (saved.duplicate) {
+        res.status(409).json({
+          error: 'Вы уже прошли текущий раунд «Задом наперёд». Обновление в 00:00 и 12:00 МСК!',
+          completed: true,
+          already_completed: true,
+          xp_earned: 0,
+          next_reset_at: nextResetAt,
+        });
+        return;
+      }
       xpEarned = saved.xpEarned;
       streakBonusXp = saved.streakBonusXp;
       streakBonusPercent = saved.streakBonusPercent;
@@ -3331,7 +3894,13 @@ app.post('/api/games/reverse-track/verify', (req: AuthRequest, res: Response) =>
       newlyUnlockedAchievements = saved.newlyUnlockedAchievements;
     } catch (err: any) {
       if (String(err?.message || '').includes('UNIQUE')) {
-        res.status(400).json({ error: 'Вы уже прошли этот раунд.', already_completed: true });
+        res.status(409).json({
+          error: 'Вы уже прошли этот раунд.',
+          completed: true,
+          already_completed: true,
+          xp_earned: 0,
+          next_reset_at: nextResetAt,
+        });
         return;
       }
       throw err;
@@ -3397,21 +3966,24 @@ app.get('/api/games/speed-track/round', (req: Request, res: Response) => {
   let alreadyCompleted = false;
   let previousAttempt: any = null;
   if (user) {
+    const completion = db.prepare(`
+      SELECT * FROM game_completions WHERE user_id = ? AND game_type = 'speed-track' AND cycle_id = ?
+    `).get(user.id, cycleId) as any;
     const row = db.prepare(`
       SELECT * FROM daily_mini_game_attempts WHERE user_id = ? AND game_id = 'speed-track' AND cycle_id = ?
     `).get(user.id, cycleId) as any;
-    if (row) {
+    if (completion || row) {
       alreadyCompleted = true;
-      const trackReveal = getTrackRevealInfo(row.correct_value || round.track.id) || {
+      const trackReveal = getTrackRevealInfo(row?.correct_value || round.track.id) || {
         id: round.track.id,
         title: round.track.title,
       };
       previousAttempt = {
-        correct: Boolean(row.is_correct),
-        selected_track_id: row.selected_value,
-        correct_track_id: row.correct_value || round.track.id,
-        score: Number(row.score) || 0,
-        xp_earned: Number(row.xp_earned) || 0,
+        correct: Boolean(row ? row.is_correct : completion?.is_correct),
+        selected_track_id: row?.selected_value || '',
+        correct_track_id: row?.correct_value || round.track.id,
+        score: Number(row?.score ?? completion?.score) || 0,
+        xp_earned: Number(row?.xp_earned ?? completion?.xp_earned) || 0,
         speed_mode: round.speed_mode,
         track: trackReveal,
       };
@@ -3430,6 +4002,7 @@ app.get('/api/games/speed-track/round', (req: Request, res: Response) => {
     snippet_start_ratio: round.snippet_start_ratio,
     snippet_duration: round.snippet_duration_seconds,
     options: round.options,
+    completed: alreadyCompleted,
     already_completed: alreadyCompleted,
     previous_attempt: previousAttempt,
   });
@@ -3467,13 +4040,19 @@ app.post('/api/games/speed-track/verify', (req: AuthRequest, res: Response) => {
   }
 
   if (user) {
+    const existingGc = db.prepare(`
+      SELECT id FROM game_completions WHERE user_id = ? AND game_type = 'speed-track' AND cycle_id = ?
+    `).get(user.id, cycleId);
     const existing = db.prepare(`
       SELECT id FROM daily_mini_game_attempts WHERE user_id = ? AND game_id = 'speed-track' AND cycle_id = ?
     `).get(user.id, cycleId);
-    if (existing) {
-      res.status(400).json({
+    if (existingGc || existing) {
+      res.status(409).json({
         error: 'Вы уже прошли текущий раунд «0.5x / 2.5x». Обновление в 00:00 и 12:00 МСК!',
+        completed: true,
         already_completed: true,
+        xp_earned: 0,
+        next_reset_at: nextResetAt,
       });
       return;
     }
@@ -3508,6 +4087,16 @@ app.post('/api/games/speed-track/verify', (req: AuthRequest, res: Response) => {
         correctValue: correctTrackId,
         details: { isCorrect, correctTrackId, speedMode: round.speed_mode },
       });
+      if (saved.duplicate) {
+        res.status(409).json({
+          error: 'Вы уже прошли текущий раунд «0.5x / 2.5x». Обновление в 00:00 и 12:00 МСК!',
+          completed: true,
+          already_completed: true,
+          xp_earned: 0,
+          next_reset_at: nextResetAt,
+        });
+        return;
+      }
       xpEarned = saved.xpEarned;
       streakBonusXp = saved.streakBonusXp;
       streakBonusPercent = saved.streakBonusPercent;
@@ -3515,7 +4104,13 @@ app.post('/api/games/speed-track/verify', (req: AuthRequest, res: Response) => {
       newlyUnlockedAchievements = saved.newlyUnlockedAchievements;
     } catch (err: any) {
       if (String(err?.message || '').includes('UNIQUE')) {
-        res.status(400).json({ error: 'Вы уже прошли этот раунд.', already_completed: true });
+        res.status(409).json({
+          error: 'Вы уже прошли этот раунд.',
+          completed: true,
+          already_completed: true,
+          xp_earned: 0,
+          next_reset_at: nextResetAt,
+        });
         return;
       }
       throw err;
@@ -3612,7 +4207,7 @@ function collectUserAchievementMetrics(userId: string): AchievementMetrics | nul
   };
 }
 
-// Helper for unlocking achievements safely (idempotent; awards balanced xp_reward ONCE on initial unlock)
+// Helper for unlocking achievements safely (idempotent; awards balanced xp_reward ONCE via awardXpWithRef)
 function unlockAchievement(userId: string, achievementSlug: string): UnlockedAchievementInfo | null {
   const ach = db
     .prepare('SELECT id, slug, title_ru, title_en, xp_reward, rarity, difficulty_tier, icon FROM achievements WHERE slug = ?')
@@ -3630,25 +4225,13 @@ function unlockAchievement(userId: string, achievementSlug: string): UnlockedAch
 
   const reward = Math.max(0, Number(ach.xp_reward || 0));
   if (reward > 0) {
-    const prev = db.prepare('SELECT xp, total_xp FROM profiles WHERE user_id = ?').get(userId) as
-      | { xp: number; total_xp: number }
-      | undefined;
-    if (prev) {
-      const nextXp = Number(prev.xp || 0) + reward;
-      const nextTotalXp = Number(prev.total_xp || 0) + reward;
-      const { level } = calculateLevelFromXp(nextTotalXp);
-
-      db.prepare(`
-        UPDATE profiles
-        SET xp = ?, total_xp = ?, level = ?, updated_at = datetime('now')
-        WHERE user_id = ?
-      `).run(nextXp, nextTotalXp, level, userId);
-
-      db.prepare(`
-        INSERT INTO xp_transactions (id, user_id, amount, source, details)
-        VALUES (?, ?, ?, 'achievement', ?)
-      `).run('xpt_' + crypto.randomUUID().slice(0, 8), userId, reward, `Достижение «${ach.title_ru}»`);
-    }
+    awardXpWithRef({
+      userId,
+      amount: reward,
+      source: 'achievement',
+      details: `Достижение «${ach.title_ru}»`,
+      referenceKey: `ach:${userId}:${ach.slug}`,
+    });
   }
 
   return ach;
@@ -3705,6 +4288,35 @@ app.post('/api/achievements/track-complete', requireAuth, (req: AuthRequest, res
     return;
   }
 
+  const listenedSeconds = Number(req.body?.listened_seconds);
+  const clientDurationSeconds = Number(req.body?.duration_seconds);
+
+  const trackRow = db.prepare('SELECT audio_url, duration_seconds FROM tracks WHERE id = ?').get(rawTrackId) as
+    | { audio_url?: string; duration_seconds?: number }
+    | undefined;
+  const singleRow = !trackRow
+    ? (db.prepare('SELECT audio_url, duration_seconds FROM singles WHERE id = ?').get(rawTrackId) as
+        | { audio_url?: string; duration_seconds?: number }
+        | undefined)
+    : undefined;
+
+  const dbDuration = Number(trackRow?.duration_seconds || singleRow?.duration_seconds || 0);
+  const dbAudioUrl = String(trackRow?.audio_url || singleRow?.audio_url || '');
+  const resolvedDbDuration = dbAudioUrl ? resolveEffectiveTrackDuration(dbAudioUrl, dbDuration) : dbDuration;
+  const effectiveDuration =
+    resolvedDbDuration > 0
+      ? resolvedDbDuration
+      : (Number.isFinite(clientDurationSeconds) && clientDurationSeconds > 0 ? clientDurationSeconds : 0);
+
+  if (!Number.isFinite(listenedSeconds) || listenedSeconds < 8) {
+    res.json({ ok: false, counted: false, reason: 'threshold_not_met', required_ratio: 0.75 });
+    return;
+  }
+  if (effectiveDuration > 0 && listenedSeconds < effectiveDuration * 0.75) {
+    res.json({ ok: false, counted: false, reason: 'threshold_not_met', required_ratio: 0.75 });
+    return;
+  }
+
   let completions = 1;
   let newlyUnlocked: UnlockedAchievementInfo[] = [];
 
@@ -3726,6 +4338,7 @@ app.post('/api/achievements/track-complete', requireAuth, (req: AuthRequest, res
 
   res.json({
     ok: true,
+    counted: true,
     track_id: rawTrackId,
     completions,
     newly_unlocked_achievements: newlyUnlocked,
@@ -3756,7 +4369,7 @@ app.post('/api/achievements/easter-egg', requireAuth, (req: AuthRequest, res: Re
   });
 });
 
-// 3. Leaderboard (All-Time, Weekly, Monthly + optional Game filter)
+// 3. Leaderboard (All-Time sorted strictly by Level DESC, Total XP DESC; Weekly/Monthly + optional Game filter)
 app.get('/api/games/leaderboard', (req: Request, res: Response) => {
   const rawTimeframe = String(req.query.timeframe || 'all');
   const timeframe = rawTimeframe === 'weekly' || rawTimeframe === 'monthly' ? rawTimeframe : 'all';
@@ -3777,8 +4390,8 @@ app.get('/api/games/leaderboard', (req: Request, res: Response) => {
         : timeframe === 'monthly'
           ? "AND datetime(ga.created_at) >= datetime('now', '-30 days')"
           : '';
-    const leaders = db.prepare(`
-      SELECT u.id, u.nickname, p.display_name, p.avatar_url, p.level,
+    const rawLeaders = db.prepare(`
+      SELECT u.id, u.nickname, p.display_name, p.avatar_url, p.level, p.total_xp,
              p.equipped_frame, p.equipped_banner, p.equipped_name_style, p.equipped_badge, p.equipped_title,
              COALESCE(SUM(ga.xp_earned), 0) as xp,
              COALESCE(SUM(ga.score), 0) as score,
@@ -3790,28 +4403,42 @@ app.get('/api/games/leaderboard', (req: Request, res: Response) => {
       WHERE u.is_banned = 0
       GROUP BY u.id
       HAVING COUNT(ga.id) > 0
-      ORDER BY xp DESC, score DESC, games_played DESC
+      ORDER BY p.level DESC, p.total_xp DESC, xp DESC, score DESC, games_played DESC
       LIMIT 50
-    `).all(gameFilter);
+    `).all(gameFilter) as any[];
+
+    const leaders = rawLeaders
+      .map((row) => ({
+        ...row,
+        total_xp: Number(row.total_xp ?? row.xp ?? 0),
+        level: calculateLevelFromXp(Number(row.total_xp ?? 0)).level,
+      }))
+      .sort((a, b) => {
+        if (b.level !== a.level) return b.level - a.level;
+        if (b.total_xp !== a.total_xp) return b.total_xp - a.total_xp;
+        if (b.xp !== a.xp) return b.xp - a.xp;
+        return Number(b.games_played || 0) - Number(a.games_played || 0);
+      });
+
     res.json({ leaders, timeframe, game: gameFilter });
     return;
   }
 
   let query = `
-    SELECT u.id, u.nickname, p.display_name, p.avatar_url, p.level, p.total_xp as xp, p.daily_streak,
+    SELECT u.id, u.nickname, p.display_name, p.avatar_url, p.level, p.total_xp, p.total_xp as xp, p.daily_streak,
            p.equipped_frame, p.equipped_banner, p.equipped_name_style, p.equipped_badge, p.equipped_title,
            (SELECT COUNT(*) FROM game_attempts WHERE user_id = u.id) as games_played
     FROM users u
     JOIN profiles p ON p.user_id = u.id
     WHERE u.is_banned = 0
       AND (p.total_xp > 0 OR EXISTS (SELECT 1 FROM game_attempts ga WHERE ga.user_id = u.id))
-    ORDER BY p.total_xp DESC, games_played DESC, p.level DESC
-    LIMIT 50
+    ORDER BY p.level DESC, p.total_xp DESC, games_played DESC
+    LIMIT 100
   `;
 
   if (timeframe === 'weekly') {
     query = `
-      SELECT u.id, u.nickname, p.display_name, p.avatar_url, p.level,
+      SELECT u.id, u.nickname, p.display_name, p.avatar_url, p.level, p.total_xp,
              p.equipped_frame, p.equipped_banner, p.equipped_name_style, p.equipped_badge, p.equipped_title,
              COALESCE(SUM(xt.amount), 0) as xp, p.daily_streak,
              (SELECT COUNT(*) FROM game_attempts ga WHERE ga.user_id = u.id AND datetime(ga.created_at) >= datetime('now', '-7 days')) as games_played
@@ -3821,12 +4448,12 @@ app.get('/api/games/leaderboard', (req: Request, res: Response) => {
       WHERE u.is_banned = 0
       GROUP BY u.id
       HAVING xp > 0 OR games_played > 0
-      ORDER BY xp DESC, games_played DESC
+      ORDER BY xp DESC, p.level DESC, p.total_xp DESC, games_played DESC
       LIMIT 50
     `;
   } else if (timeframe === 'monthly') {
     query = `
-      SELECT u.id, u.nickname, p.display_name, p.avatar_url, p.level,
+      SELECT u.id, u.nickname, p.display_name, p.avatar_url, p.level, p.total_xp,
              p.equipped_frame, p.equipped_banner, p.equipped_name_style, p.equipped_badge, p.equipped_title,
              COALESCE(SUM(xt.amount), 0) as xp, p.daily_streak,
              (SELECT COUNT(*) FROM game_attempts ga WHERE ga.user_id = u.id AND datetime(ga.created_at) >= datetime('now', '-30 days')) as games_played
@@ -3836,16 +4463,33 @@ app.get('/api/games/leaderboard', (req: Request, res: Response) => {
       WHERE u.is_banned = 0
       GROUP BY u.id
       HAVING xp > 0 OR games_played > 0
-      ORDER BY xp DESC, games_played DESC
+      ORDER BY xp DESC, p.level DESC, p.total_xp DESC, games_played DESC
       LIMIT 50
     `;
   }
 
   const rawLeaders = db.prepare(query).all() as any[];
-  const leaders = rawLeaders.map((row) => ({
-    ...row,
-    level: timeframe === 'all' ? calculateLevelFromXp(Number(row.xp || 0)).level : row.level,
-  }));
+  const leaders = rawLeaders
+    .map((row) => {
+      const totalXp = Number(row.total_xp ?? row.xp ?? 0);
+      return {
+        ...row,
+        total_xp: totalXp,
+        level: calculateLevelFromXp(totalXp).level,
+      };
+    })
+    .sort((a, b) => {
+      if (timeframe === 'all') {
+        if (b.level !== a.level) return b.level - a.level;
+        if (b.total_xp !== a.total_xp) return b.total_xp - a.total_xp;
+        return Number(b.games_played || 0) - Number(a.games_played || 0);
+      }
+      if (Number(b.xp || 0) !== Number(a.xp || 0)) return Number(b.xp || 0) - Number(a.xp || 0);
+      if (b.level !== a.level) return b.level - a.level;
+      return b.total_xp - a.total_xp;
+    })
+    .slice(0, 50);
+
   res.json({ leaders, timeframe, game: gameFilter });
 });
 
@@ -3866,12 +4510,32 @@ app.post('/api/promo/redeem', requireAuth, promoRateLimit, (req: AuthRequest, re
   }
 
   const promo = db
-    .prepare('SELECT id, code, xp_reward, is_active FROM promo_codes WHERE LOWER(TRIM(code)) = ? LIMIT 1')
-    .get(normalizedCode) as { id: string; code: string; xp_reward: number; is_active: number } | undefined;
+    .prepare('SELECT id, code, xp_reward, is_active, max_uses, expires_at FROM promo_codes WHERE LOWER(TRIM(code)) = ? LIMIT 1')
+    .get(normalizedCode) as
+    | { id: string; code: string; xp_reward: number; is_active: number; max_uses?: number | null; expires_at?: string | null }
+    | undefined;
 
   if (!promo || !promo.is_active) {
     res.status(404).json({ error: 'Неверный промокод.' });
     return;
+  }
+
+  if (promo.expires_at) {
+    const expMs = Date.parse(promo.expires_at);
+    if (!Number.isNaN(expMs) && expMs <= Date.now()) {
+      res.status(410).json({ error: 'Срок действия промокода истёк.' });
+      return;
+    }
+  }
+
+  if (promo.max_uses !== null && promo.max_uses !== undefined && Number(promo.max_uses) > 0) {
+    const useCountRow = db
+      .prepare('SELECT COUNT(*) as cnt FROM promo_code_uses WHERE promo_code_id = ?')
+      .get(promo.id) as { cnt?: number } | undefined;
+    if (Number(useCountRow?.cnt || 0) >= Number(promo.max_uses)) {
+      res.status(410).json({ error: 'Лимит активаций этого промокода исчерпан.' });
+      return;
+    }
   }
 
   const alreadyUsed = db
@@ -3894,23 +4558,16 @@ app.post('/api/promo/redeem', requireAuth, promoRateLimit, (req: AuthRequest, re
         VALUES (?, ?, ?, ?)
       `).run('pcu_' + crypto.randomUUID().slice(0, 10), promo.id, req.user!.id, promo.xp_reward);
 
-      db.prepare(`
-        INSERT INTO xp_transactions (id, user_id, amount, source, details)
-        VALUES (?, ?, ?, 'promo_code', ?)
-      `).run('xpt_' + crypto.randomUUID().slice(0, 8), req.user!.id, promo.xp_reward, `Промокод «${promo.code}»`);
-
-      const prev = db
-        .prepare('SELECT xp, total_xp FROM profiles WHERE user_id = ?')
-        .get(req.user!.id) as { xp: number; total_xp: number } | undefined;
-      updatedXp = Number(prev?.xp || 0) + promo.xp_reward;
-      updatedTotalXp = Number(prev?.total_xp || 0) + promo.xp_reward;
-      updatedLevel = calculateLevelFromXp(updatedTotalXp).level;
-
-      db.prepare(`
-        UPDATE profiles
-        SET xp = ?, total_xp = ?, level = ?, updated_at = datetime('now')
-        WHERE user_id = ?
-      `).run(updatedXp, updatedTotalXp, updatedLevel, req.user!.id);
+      const grantRes = awardXpWithRef({
+        userId: req.user!.id,
+        amount: promo.xp_reward,
+        source: 'promo_code',
+        details: `Промокод «${promo.code}»`,
+        referenceKey: `promo:${promo.id}:${req.user!.id}`,
+      });
+      updatedXp = grantRes.xp;
+      updatedTotalXp = grantRes.totalXp;
+      updatedLevel = grantRes.level;
 
       newlyUnlockedAchievements = evaluateUserAchievements(req.user!.id);
       if (newlyUnlockedAchievements.length > 0) {
@@ -4227,6 +4884,7 @@ app.get('/api/community/posts/:id', (req: Request, res: Response) => {
            pr.equipped_badge as author_badge, pr.equipped_title as author_title,
            c.name_ru as category_name_ru, c.name_en as category_name_en, c.slug as category_slug,
            c.is_official as category_is_official,
+           (SELECT COUNT(*) FROM follows f WHERE f.following_id = p.user_id) as author_followers_count,
            (SELECT COUNT(*) FROM reactions r WHERE r.target_type = 'post' AND r.target_id = p.id AND r.reaction_type = 'rose') as rose_count,
            (SELECT COUNT(*) FROM reactions r WHERE r.target_type = 'post' AND r.target_id = p.id AND r.reaction_type = 'skull') as skull_count
     FROM posts p
@@ -4247,7 +4905,7 @@ app.get('/api/community/posts/:id', (req: Request, res: Response) => {
     return;
   }
 
-  // Increment view count & lightweight unique post_reads counter (no CloudSync spam on GET)
+  // Increment view count & lightweight unique post_reads counter (strictly 0 XP)
   db.prepare('UPDATE posts SET views_count = views_count + 1 WHERE id = ?').run(post.id);
   if (user) {
     try {
@@ -4268,10 +4926,15 @@ app.get('/api/community/posts/:id', (req: Request, res: Response) => {
   `).all(post.id);
 
   let userReaction: 'rose' | 'skull' | null = null;
+  let authorIsFollowing = false;
   if (user) {
     const rx = db.prepare("SELECT reaction_type FROM reactions WHERE target_type = 'post' AND target_id = ? AND user_id = ?").get(post.id, user.id) as any;
     if (rx?.reaction_type === 'rose' || rx?.reaction_type === 'skull') {
       userReaction = rx.reaction_type;
+    }
+    if (user.id !== post.user_id) {
+      const flw = db.prepare('SELECT id FROM follows WHERE follower_id = ? AND following_id = ?').get(user.id, post.user_id);
+      authorIsFollowing = Boolean(flw);
     }
   }
 
@@ -4280,6 +4943,8 @@ app.get('/api/community/posts/:id', (req: Request, res: Response) => {
       ...post,
       rose_count: Number(post.rose_count || 0),
       skull_count: Number(post.skull_count || 0),
+      author_followers_count: Number(post.author_followers_count || 0),
+      author_is_following: authorIsFollowing,
       user_reaction: userReaction,
     },
     comments,
@@ -4316,36 +4981,46 @@ app.post('/api/community/posts', requireAuth, (req: AuthRequest, res: Response) 
     return;
   }
 
-  // Regular user posts need moderation, staff posts are auto-approved
+  // Regular user posts wait in moderation queue with 0 XP until approved; staff posts auto-approve
   const status = isStaff ? 'approved' : 'pending';
   const id = 'post_' + crypto.randomUUID().slice(0, 8);
+  let awardedXp = 0;
 
   db.transaction(() => {
     db.prepare(`
-      INSERT INTO posts (id, user_id, category_id, title, content, media_url, media_type, status)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO posts (id, user_id, category_id, title, content, media_url, media_type, status, xp_awarded, xp_awarded_amount)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0)
     `).run(id, req.user!.id, category_id, cleanTitle, cleanContent, media_url ? String(media_url).trim() : null, media_type || null, status);
 
-    // Award XP for posting (20 XP) & recalculate level
-    db.prepare(`
-      UPDATE profiles SET xp = xp + 20, total_xp = total_xp + 20, updated_at = datetime('now')
-      WHERE user_id = ?
-    `).run(req.user!.id);
-    const updated = db.prepare('SELECT total_xp FROM profiles WHERE user_id = ?').get(req.user!.id) as any;
-    const { level } = calculateLevelFromXp(updated.total_xp);
-    db.prepare('UPDATE profiles SET level = ? WHERE user_id = ?').run(level, req.user!.id);
+    if (status === 'approved') {
+      if (canEarnDiscussionXp(req.user!.id, cleanContent)) {
+        const grant = awardXpWithRef({
+          userId: req.user!.id,
+          amount: 10,
+          source: 'community_post',
+          details: `Тема: «${cleanTitle.slice(0, 40)}»`,
+          referenceKey: `award:post:${id}`,
+        });
+        if (grant.awarded) {
+          awardedXp = grant.amount;
+          db.prepare('UPDATE posts SET xp_awarded = 1, xp_awarded_amount = ? WHERE id = ?').run(grant.amount, id);
+        }
+      }
 
-    let newlyUnlocked: UnlockedAchievementInfo[] = [];
-    db.prepare(`
-      INSERT INTO xp_transactions (id, user_id, amount, source, details)
-      VALUES (?, ?, 20, 'community_post', ?)
-    `).run('xpt_' + crypto.randomUUID().slice(0, 8), req.user!.id, `Тема: «${cleanTitle.slice(0, 40)}»`);
-
-    newlyUnlocked = evaluateUserAchievements(req.user!.id);
-    return newlyUnlocked;
+      evaluateUserAchievements(req.user!.id);
+      notifyFollowers({
+        author: req.user!,
+        type: 'new_post',
+        targetType: 'post',
+        targetId: id,
+        targetTitle: cleanTitle,
+        targetLink: `/community?post=${encodeURIComponent(id)}`,
+        excerpt: cleanContent,
+      });
+    }
   })();
 
-  res.json({ ok: true, id, status });
+  res.json({ ok: true, id, status, xp_earned: awardedXp });
 });
 
 app.put('/api/community/posts/:id', requireAuth, (req: AuthRequest, res: Response) => {
@@ -4397,10 +5072,62 @@ app.post('/api/admin/community/posts/:id/moderate', requireAdminOrMod, (req: Aut
     return;
   }
 
-  db.prepare(`
-    UPDATE posts SET status = ?, rejection_reason = ?, updated_at = datetime('now')
-    WHERE id = ?
-  `).run(status, rejection_reason || null, req.params.id);
+  const existing = db
+    .prepare('SELECT id, user_id, title, content, status, xp_awarded, xp_awarded_amount FROM posts WHERE id = ?')
+    .get(req.params.id) as any;
+  if (!existing) {
+    res.status(404).json({ error: 'Post not found' });
+    return;
+  }
+
+  const authorRow = db
+    .prepare('SELECT u.id, u.nickname, p.display_name FROM users u JOIN profiles p ON p.user_id = u.id WHERE u.id = ?')
+    .get(existing.user_id) as { id: string; nickname: string; display_name?: string } | undefined;
+
+  db.transaction(() => {
+    db.prepare(`
+      UPDATE posts SET status = ?, rejection_reason = ?, updated_at = datetime('now')
+      WHERE id = ?
+    `).run(status, rejection_reason || null, existing.id);
+
+    if (status === 'approved') {
+      if (!existing.xp_awarded && canEarnDiscussionXp(existing.user_id, existing.content)) {
+        const grant = awardXpWithRef({
+          userId: existing.user_id,
+          amount: 10,
+          source: 'community_post',
+          details: `Тема: «${String(existing.title || '').slice(0, 40)}»`,
+          referenceKey: `award:post:${existing.id}`,
+        });
+        if (grant.awarded) {
+          db.prepare('UPDATE posts SET xp_awarded = 1, xp_awarded_amount = ? WHERE id = ?').run(grant.amount, existing.id);
+        }
+      }
+      if (existing.status !== 'approved') {
+        evaluateUserAchievements(existing.user_id);
+        if (authorRow) {
+          notifyFollowers({
+            author: authorRow,
+            type: 'new_post',
+            targetType: 'post',
+            targetId: existing.id,
+            targetTitle: existing.title,
+            targetLink: `/community?post=${encodeURIComponent(existing.id)}`,
+            excerpt: existing.content,
+          });
+        }
+      }
+    } else if (status === 'rejected' && existing.xp_awarded && Number(existing.xp_awarded_amount) > 0) {
+      revokeXpWithRef({
+        userId: existing.user_id,
+        amount: Number(existing.xp_awarded_amount),
+        source: 'xp_rollback',
+        details: `Откат XP: отклонена тема «${String(existing.title || '').slice(0, 40)}»`,
+        referenceKey: `rollback:post:${existing.id}`,
+      });
+      db.prepare('UPDATE posts SET xp_awarded = 0, xp_awarded_amount = 0 WHERE id = ?').run(existing.id);
+    }
+  })();
 
   res.json({ ok: true, status });
 });
@@ -4435,7 +5162,7 @@ app.post('/api/community/posts/:id/comments', requireAuth, (req: AuthRequest, re
     return;
   }
 
-  const targetPost = db.prepare('SELECT id, user_id, title, is_locked FROM posts WHERE id = ?').get(req.params.id) as any;
+  const targetPost = db.prepare('SELECT id, user_id, title, status, is_locked FROM posts WHERE id = ?').get(req.params.id) as any;
   if (!targetPost) {
     res.status(404).json({ error: 'Post not found.' });
     return;
@@ -4454,31 +5181,35 @@ app.post('/api/community/posts/:id/comments', requireAuth, (req: AuthRequest, re
 
   const id = 'cm_' + crypto.randomUUID().slice(0, 8);
   let newlyUnlocked: UnlockedAchievementInfo[] = [];
+  let xpEarned = 0;
 
   db.transaction(() => {
+    let xpAwardedFlag = 0;
+    let xpAwardedAmount = 0;
+    if (targetPost.status === 'approved' && canEarnDiscussionXp(req.user!.id, cleanContent)) {
+      const grant = awardXpWithRef({
+        userId: req.user!.id,
+        amount: 5,
+        source: 'comment',
+        details: 'Комментарий в обсуждении',
+        referenceKey: `award:comment:${id}`,
+      });
+      if (grant.awarded) {
+        xpAwardedFlag = 1;
+        xpAwardedAmount = grant.amount;
+        xpEarned = grant.amount;
+      }
+    }
+
     db.prepare(`
-      INSERT INTO comments (id, user_id, post_id, content, parent_id)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(id, req.user!.id, req.params.id, cleanContent, parentComment ? parentComment.id : null);
+      INSERT INTO comments (id, user_id, post_id, content, parent_id, xp_awarded, xp_awarded_amount)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(id, req.user!.id, req.params.id, cleanContent, parentComment ? parentComment.id : null, xpAwardedFlag, xpAwardedAmount);
 
     db.prepare(`
       UPDATE posts SET comments_count = comments_count + 1, updated_at = datetime('now')
       WHERE id = ?
     `).run(req.params.id);
-
-    // Give 5 XP for participation & recalculate level
-    db.prepare(`
-      UPDATE profiles SET xp = xp + 5, total_xp = total_xp + 5, updated_at = datetime('now')
-      WHERE user_id = ?
-    `).run(req.user!.id);
-    const updated = db.prepare('SELECT total_xp FROM profiles WHERE user_id = ?').get(req.user!.id) as any;
-    const { level } = calculateLevelFromXp(updated.total_xp);
-    db.prepare('UPDATE profiles SET level = ? WHERE user_id = ?').run(level, req.user!.id);
-
-    db.prepare(`
-      INSERT INTO xp_transactions (id, user_id, amount, source, details)
-      VALUES (?, ?, 5, 'comment', 'Комментарий в обсуждении')
-    `).run('xpt_' + crypto.randomUUID().slice(0, 8), req.user!.id);
 
     // Notify post author and/or parent comment author (deduplicated)
     const recipients = new Set<string>();
@@ -4497,10 +5228,23 @@ app.post('/api/community/posts/:id/comments', requireAuth, (req: AuthRequest, re
       });
     }
 
+    if (targetPost.status === 'approved') {
+      notifyFollowers({
+        author: req.user!,
+        type: 'new_comment',
+        targetType: 'post',
+        targetId: targetPost.id,
+        targetTitle: targetPost.title,
+        targetLink: `/community?post=${encodeURIComponent(targetPost.id)}`,
+        excerpt: cleanContent,
+        excludeUserIds: recipients,
+      });
+    }
+
     newlyUnlocked = evaluateUserAchievements(req.user!.id);
   })();
 
-  res.json({ ok: true, id, newly_unlocked_achievements: newlyUnlocked });
+  res.json({ ok: true, id, xp_earned: xpEarned, newly_unlocked_achievements: newlyUnlocked });
 });
 
 app.post('/api/community/posts/:id/react', requireAuth, (req: AuthRequest, res: Response) => {
@@ -4571,7 +5315,9 @@ app.post('/api/community/posts/:id/react', requireAuth, (req: AuthRequest, res: 
 });
 
 app.delete('/api/community/posts/:id', requireAuth, (req: AuthRequest, res: Response) => {
-  const post = db.prepare('SELECT user_id FROM posts WHERE id = ?').get(req.params.id) as any;
+  const post = db
+    .prepare('SELECT id, user_id, title, xp_awarded, xp_awarded_amount FROM posts WHERE id = ?')
+    .get(req.params.id) as any;
   if (!post) {
     res.status(404).json({ error: 'Post not found' });
     return;
@@ -4581,8 +5327,92 @@ app.delete('/api/community/posts/:id', requireAuth, (req: AuthRequest, res: Resp
     return;
   }
 
-  db.prepare('DELETE FROM posts WHERE id = ?').run(req.params.id);
+  db.transaction(() => {
+    if (post.xp_awarded && Number(post.xp_awarded_amount) > 0) {
+      revokeXpWithRef({
+        userId: post.user_id,
+        amount: Number(post.xp_awarded_amount),
+        source: 'xp_rollback',
+        details: `Откат XP: удаление темы «${String(post.title || '').slice(0, 40)}»`,
+        referenceKey: `rollback:post:${post.id}`,
+      });
+    }
+
+    const postComments = db
+      .prepare('SELECT id, user_id, xp_awarded, xp_awarded_amount FROM comments WHERE post_id = ?')
+      .all(post.id) as Array<{ id: string; user_id: string; xp_awarded: number; xp_awarded_amount: number }>;
+    for (const cm of postComments) {
+      if (cm.xp_awarded && Number(cm.xp_awarded_amount) > 0) {
+        revokeXpWithRef({
+          userId: cm.user_id,
+          amount: Number(cm.xp_awarded_amount),
+          source: 'xp_rollback',
+          details: 'Откат XP: удаление комментария',
+          referenceKey: `rollback:comment:${cm.id}`,
+        });
+      }
+    }
+
+    db.prepare('DELETE FROM comments WHERE post_id = ?').run(post.id);
+    db.prepare('DELETE FROM posts WHERE id = ?').run(post.id);
+  })();
+
   res.json({ ok: true });
+});
+
+app.get('/api/admin/comments', requireAdminOrMod, (req: AuthRequest, res: Response) => {
+  const filter = String(req.query.filter || 'all');
+  const scope = String(req.query.scope || 'all');
+  const search = String(req.query.search || '').trim();
+
+  const whereParts: string[] = [];
+  const params: any[] = [];
+
+  if (filter === 'hidden') {
+    whereParts.push('c.is_hidden = 1');
+  } else if (filter === 'visible') {
+    whereParts.push('COALESCE(c.is_hidden, 0) = 0');
+  }
+
+  if (scope === 'releases') {
+    whereParts.push('(c.album_id IS NOT NULL OR c.single_id IS NOT NULL)');
+  } else if (scope === 'forum') {
+    whereParts.push('c.post_id IS NOT NULL');
+  } else if (scope === 'creations') {
+    whereParts.push('c.creation_id IS NOT NULL');
+  }
+
+  if (search) {
+    whereParts.push('(c.content LIKE ? COLLATE NOCASE OR u.nickname LIKE ? COLLATE NOCASE)');
+    params.push(`%${search}%`, `%${search}%`);
+  }
+
+  const whereSql = whereParts.length > 0 ? `WHERE ${whereParts.join(' AND ')}` : '';
+  const rows = db.prepare(`
+    SELECT c.id, c.user_id, c.post_id, c.creation_id, c.album_id, c.single_id, c.parent_id,
+           c.content, c.is_hidden, c.status, c.xp_awarded, c.xp_awarded_amount, c.created_at,
+           u.nickname as author_nickname, p.display_name as author_name, p.avatar_url as author_avatar,
+           CASE
+             WHEN c.album_id IS NOT NULL THEN 'album'
+             WHEN c.single_id IS NOT NULL THEN 'single'
+             WHEN c.post_id IS NOT NULL THEN 'post'
+             WHEN c.creation_id IS NOT NULL THEN 'creation'
+             ELSE 'unknown'
+           END as target_type,
+           COALESCE(a.title, s.title, po.title, cr.title, '') as target_title
+    FROM comments c
+    JOIN users u ON u.id = c.user_id
+    JOIN profiles p ON p.user_id = u.id
+    LEFT JOIN albums a ON a.id = c.album_id
+    LEFT JOIN singles s ON s.id = c.single_id
+    LEFT JOIN posts po ON po.id = c.post_id
+    LEFT JOIN creations cr ON cr.id = c.creation_id
+    ${whereSql}
+    ORDER BY datetime(c.created_at) DESC
+    LIMIT 150
+  `).all(...params);
+
+  res.json({ comments: rows });
 });
 
 app.post('/api/community/comments/:id/hide', requireAdminOrMod, (req: AuthRequest, res: Response) => {
@@ -4599,7 +5429,9 @@ app.post('/api/community/comments/:id/hide', requireAdminOrMod, (req: AuthReques
 });
 
 app.delete('/api/community/comments/:id', requireAuth, (req: AuthRequest, res: Response) => {
-  const comment = db.prepare('SELECT id, user_id, post_id, creation_id FROM comments WHERE id = ?').get(req.params.id) as any;
+  const comment = db
+    .prepare('SELECT id, user_id, post_id, creation_id, xp_awarded, xp_awarded_amount FROM comments WHERE id = ?')
+    .get(req.params.id) as any;
   if (!comment) {
     res.status(404).json({ error: 'Comment not found' });
     return;
@@ -4611,8 +5443,39 @@ app.delete('/api/community/comments/:id', requireAuth, (req: AuthRequest, res: R
   }
 
   db.transaction(() => {
-    db.prepare('DELETE FROM comments WHERE parent_id = ?').run(comment.id);
-    db.prepare('DELETE FROM comments WHERE id = ?').run(comment.id);
+    const toDelete: Array<{ id: string; user_id: string; xp_awarded: number; xp_awarded_amount: number }> = [comment];
+    const queue = [comment.id];
+    const seen = new Set<string>([comment.id]);
+    while (queue.length > 0) {
+      const parentId = queue.shift()!;
+      const children = db
+        .prepare('SELECT id, user_id, xp_awarded, xp_awarded_amount FROM comments WHERE parent_id = ?')
+        .all(parentId) as Array<{ id: string; user_id: string; xp_awarded: number; xp_awarded_amount: number }>;
+      for (const ch of children) {
+        if (!seen.has(ch.id)) {
+          seen.add(ch.id);
+          toDelete.push(ch);
+          queue.push(ch.id);
+        }
+      }
+    }
+
+    for (const item of toDelete) {
+      if (item.xp_awarded && Number(item.xp_awarded_amount) > 0) {
+        revokeXpWithRef({
+          userId: item.user_id,
+          amount: Number(item.xp_awarded_amount),
+          source: 'xp_rollback',
+          details: 'Откат XP: удаление комментария',
+          referenceKey: `rollback:comment:${item.id}`,
+        });
+      }
+    }
+
+    for (let i = toDelete.length - 1; i >= 0; i--) {
+      db.prepare('DELETE FROM comments WHERE id = ?').run(toDelete[i].id);
+    }
+
     if (comment.post_id) {
       db.prepare(`
         UPDATE posts
@@ -4654,8 +5517,14 @@ app.get('/api/creations', (req: Request, res: Response) => {
   }
 
   if (category && category !== 'all') {
-    conditions.push('c.category = ?');
-    params.push(category);
+    if (category === 'art') {
+      conditions.push("c.category IN ('art', 'artwork', 'covers', 'beats', 'video', 'lyrics')");
+    } else if (category === 'meme') {
+      conditions.push("c.category = 'meme'");
+    } else {
+      conditions.push('c.category = ?');
+      params.push(category);
+    }
   }
 
   if (search && typeof search === 'string' && search.trim()) {
@@ -4712,6 +5581,7 @@ app.get('/api/creations/:id', (req: Request, res: Response) => {
            pr.avatar_url as author_avatar, pr.level as author_level,
            pr.equipped_frame as author_frame, pr.equipped_name_style as author_name_style,
            pr.equipped_badge as author_badge,
+           (SELECT COUNT(*) FROM follows f WHERE f.following_id = c.user_id) as author_followers_count,
            (SELECT COUNT(*) FROM reactions r WHERE r.target_type = 'creation' AND r.target_id = c.id AND r.reaction_type = 'rose') as rose_count,
            (SELECT COUNT(*) FROM reactions r WHERE r.target_type = 'creation' AND r.target_id = c.id AND r.reaction_type = 'skull') as skull_count
     FROM creations c
@@ -4747,6 +5617,7 @@ app.get('/api/creations/:id', (req: Request, res: Response) => {
 
   let userReaction: 'rose' | 'skull' | null = null;
   let favorited = false;
+  let authorIsFollowing = false;
   if (user) {
     const rx = db.prepare("SELECT reaction_type FROM reactions WHERE target_type = 'creation' AND target_id = ? AND user_id = ?").get(creation.id, user.id) as any;
     if (rx?.reaction_type === 'rose' || rx?.reaction_type === 'skull') {
@@ -4754,6 +5625,10 @@ app.get('/api/creations/:id', (req: Request, res: Response) => {
     }
     const fav = db.prepare("SELECT id FROM favorites WHERE target_type = 'creation' AND target_id = ? AND user_id = ?").get(creation.id, user.id);
     favorited = Boolean(fav);
+    if (user.id !== creation.user_id) {
+      const flw = db.prepare('SELECT id FROM follows WHERE follower_id = ? AND following_id = ?').get(user.id, creation.user_id);
+      authorIsFollowing = Boolean(flw);
+    }
   }
 
   res.json({
@@ -4762,6 +5637,8 @@ app.get('/api/creations/:id', (req: Request, res: Response) => {
       views_count: (creation.views_count || 0) + 1,
       rose_count: Number(creation.rose_count || 0),
       skull_count: Number(creation.skull_count || 0),
+      author_followers_count: Number(creation.author_followers_count || 0),
+      author_is_following: authorIsFollowing,
       user_reaction: userReaction,
     },
     comments,
@@ -4779,7 +5656,7 @@ app.post('/api/creations/:id/comments', requireAuth, (req: AuthRequest, res: Res
     return;
   }
 
-  const creation = db.prepare('SELECT id, user_id, title FROM creations WHERE id = ?').get(req.params.id) as any;
+  const creation = db.prepare('SELECT id, user_id, title, status FROM creations WHERE id = ?').get(req.params.id) as any;
   if (!creation) {
     res.status(404).json({ error: 'Creation not found.' });
     return;
@@ -4792,25 +5669,30 @@ app.post('/api/creations/:id/comments', requireAuth, (req: AuthRequest, res: Res
 
   const id = 'cm_' + crypto.randomUUID().slice(0, 8);
   let newlyUnlocked: UnlockedAchievementInfo[] = [];
+  let xpEarned = 0;
 
   db.transaction(() => {
-    db.prepare(`
-      INSERT INTO comments (id, user_id, creation_id, content, parent_id)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(id, req.user!.id, req.params.id, cleanContent, parentComment ? parentComment.id : null);
+    let xpAwardedFlag = 0;
+    let xpAwardedAmount = 0;
+    if (creation.status === 'approved' && canEarnDiscussionXp(req.user!.id, cleanContent)) {
+      const grant = awardXpWithRef({
+        userId: req.user!.id,
+        amount: 5,
+        source: 'comment',
+        details: 'Комментарий в творчестве',
+        referenceKey: `award:comment:${id}`,
+      });
+      if (grant.awarded) {
+        xpAwardedFlag = 1;
+        xpAwardedAmount = grant.amount;
+        xpEarned = grant.amount;
+      }
+    }
 
     db.prepare(`
-      UPDATE profiles SET xp = xp + 5, total_xp = total_xp + 5, updated_at = datetime('now')
-      WHERE user_id = ?
-    `).run(req.user!.id);
-    const updated = db.prepare('SELECT total_xp FROM profiles WHERE user_id = ?').get(req.user!.id) as any;
-    const { level } = calculateLevelFromXp(updated.total_xp);
-    db.prepare('UPDATE profiles SET level = ? WHERE user_id = ?').run(level, req.user!.id);
-
-    db.prepare(`
-      INSERT INTO xp_transactions (id, user_id, amount, source, details)
-      VALUES (?, ?, 5, 'comment', 'Комментарий в творчестве')
-    `).run('xpt_' + crypto.randomUUID().slice(0, 8), req.user!.id);
+      INSERT INTO comments (id, user_id, creation_id, content, parent_id, xp_awarded, xp_awarded_amount)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(id, req.user!.id, req.params.id, cleanContent, parentComment ? parentComment.id : null, xpAwardedFlag, xpAwardedAmount);
 
     const recipients = new Set<string>();
     if (creation.user_id && creation.user_id !== req.user!.id) recipients.add(creation.user_id);
@@ -4828,16 +5710,32 @@ app.post('/api/creations/:id/comments', requireAuth, (req: AuthRequest, res: Res
       });
     }
 
+    if (creation.status === 'approved') {
+      notifyFollowers({
+        author: req.user!,
+        type: 'new_comment',
+        targetType: 'creation',
+        targetId: creation.id,
+        targetTitle: creation.title,
+        targetLink: `/creations?creation=${encodeURIComponent(creation.id)}`,
+        excerpt: cleanContent,
+        excludeUserIds: recipients,
+      });
+    }
+
     newlyUnlocked = evaluateUserAchievements(req.user!.id);
   })();
 
-  res.json({ ok: true, id, newly_unlocked_achievements: newlyUnlocked });
+  res.json({ ok: true, id, xp_earned: xpEarned, newly_unlocked_achievements: newlyUnlocked });
 });
+
+const VALID_CREATION_CATEGORIES = new Set(['art', 'meme', 'artwork', 'covers', 'beats', 'video', 'lyrics']);
 
 app.post('/api/creations', requireAuth, (req: AuthRequest, res: Response) => {
   const { title, category, description, media_url, media_type } = req.body;
-  if (!title || !category || !media_url) {
-    res.status(400).json({ error: 'Title, category, and media URL are required.' });
+  const cleanCategory = typeof category === 'string' ? category.trim() : '';
+  if (!title || !cleanCategory || !VALID_CREATION_CATEGORIES.has(cleanCategory) || !media_url) {
+    res.status(400).json({ error: 'Выберите категорию («Творчество» или «Мемы»), укажите название и медиафайл.' });
     return;
   }
   const cleanTitle = String(title).trim().slice(0, 160);
@@ -4853,31 +5751,44 @@ app.post('/api/creations', requireAuth, (req: AuthRequest, res: Response) => {
   const isStaff = req.user!.role_id === 'admin' || req.user!.role_id === 'moderator';
   const status = isStaff ? 'approved' : 'pending';
   const id = 'cr_' + crypto.randomUUID().slice(0, 8);
+  const cleanDesc = description ? String(description).slice(0, 3000) : '';
+  let awardedXp = 0;
 
   db.transaction(() => {
     db.prepare(`
-      INSERT INTO creations (id, user_id, title, category, description, media_url, media_type, status, is_approved)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(id, req.user!.id, cleanTitle, category, description ? String(description).slice(0, 3000) : '', String(media_url).trim(), media_type || 'image', status, status === 'approved' ? 1 : 0);
+      INSERT INTO creations (id, user_id, title, category, description, media_url, media_type, status, is_approved, xp_awarded, xp_awarded_amount)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)
+    `).run(id, req.user!.id, cleanTitle, cleanCategory, cleanDesc, String(media_url).trim(), media_type || 'image', status, status === 'approved' ? 1 : 0);
 
-    // Give 50 XP for creative contribution & recalculate level
-    db.prepare(`
-      UPDATE profiles SET xp = xp + 50, total_xp = total_xp + 50, updated_at = datetime('now')
-      WHERE user_id = ?
-    `).run(req.user!.id);
-    const updated = db.prepare('SELECT total_xp FROM profiles WHERE user_id = ?').get(req.user!.id) as any;
-    const { level } = calculateLevelFromXp(updated.total_xp);
-    db.prepare('UPDATE profiles SET level = ? WHERE user_id = ?').run(level, req.user!.id);
+    if (status === 'approved') {
+      const rewardAmount = cleanCategory === 'meme' ? 5 : 15;
+      const source = cleanCategory === 'meme' ? 'meme_upload' : 'creation_upload';
+      const grant = awardXpWithRef({
+        userId: req.user!.id,
+        amount: rewardAmount,
+        source,
+        details: cleanCategory === 'meme' ? `Мем: «${cleanTitle.slice(0, 35)}»` : `Работа: «${cleanTitle.slice(0, 35)}»`,
+        referenceKey: `award:creation:${id}`,
+      });
+      if (grant.awarded) {
+        awardedXp = grant.amount;
+        db.prepare('UPDATE creations SET xp_awarded = 1, xp_awarded_amount = ? WHERE id = ?').run(grant.amount, id);
+      }
 
-    db.prepare(`
-      INSERT INTO xp_transactions (id, user_id, amount, source, details)
-      VALUES (?, ?, 50, 'creation_upload', ?)
-    `).run('xpt_' + crypto.randomUUID().slice(0, 8), req.user!.id, `Uploaded work: ${cleanTitle.slice(0, 30)}`);
-
-    evaluateUserAchievements(req.user!.id);
+      evaluateUserAchievements(req.user!.id);
+      notifyFollowers({
+        author: req.user!,
+        type: 'new_creation',
+        targetType: 'creation',
+        targetId: id,
+        targetTitle: cleanTitle,
+        targetLink: `/creations?creation=${encodeURIComponent(id)}`,
+        excerpt: cleanDesc || cleanTitle,
+      });
+    }
   })();
 
-  res.json({ ok: true, id, status });
+  res.json({ ok: true, id, status, xp_earned: awardedXp });
 });
 
 app.put('/api/creations/:id', requireAuth, (req: AuthRequest, res: Response) => {
@@ -4901,6 +5812,9 @@ app.put('/api/creations/:id', requireAuth, (req: AuthRequest, res: Response) => 
     res.status(400).json({ error: 'Invalid media URL.' });
     return;
   }
+  const nextCategory = typeof category === 'string' && VALID_CREATION_CATEGORIES.has(category.trim())
+    ? category.trim()
+    : existing.category;
   db.prepare(`
     UPDATE creations SET
       title = ?,
@@ -4912,7 +5826,7 @@ app.put('/api/creations/:id', requireAuth, (req: AuthRequest, res: Response) => 
     WHERE id = ?
   `).run(
     cleanTitle,
-    category || existing.category,
+    nextCategory,
     description !== undefined ? String(description).slice(0, 3000) : existing.description,
     media_url ? String(media_url).trim() : existing.media_url,
     media_type || existing.media_type,
@@ -4922,22 +5836,83 @@ app.put('/api/creations/:id', requireAuth, (req: AuthRequest, res: Response) => 
 });
 
 app.post('/api/admin/creations/:id/moderate', requireAdminOrMod, (req: AuthRequest, res: Response) => {
-  const { status, rejection_reason } = req.body;
+  const { status, rejection_reason, category } = req.body;
   if (!['approved', 'rejected', 'pending'].includes(status)) {
     res.status(400).json({ error: 'Invalid moderation status' });
     return;
   }
 
-  db.prepare(`
-    UPDATE creations SET
-      status = ?,
-      is_approved = ?,
-      rejection_reason = ?,
-      updated_at = datetime('now')
-    WHERE id = ?
-  `).run(status, status === 'approved' ? 1 : 0, rejection_reason || null, req.params.id);
+  const existing = db
+    .prepare('SELECT id, user_id, title, description, category, status, xp_awarded, xp_awarded_amount FROM creations WHERE id = ?')
+    .get(req.params.id) as any;
+  if (!existing) {
+    res.status(404).json({ error: 'Creation not found' });
+    return;
+  }
 
-  res.json({ ok: true, status });
+  const nextCategory = typeof category === 'string' && VALID_CREATION_CATEGORIES.has(category.trim())
+    ? category.trim()
+    : existing.category || 'art';
+
+  const authorRow = db
+    .prepare('SELECT u.id, u.nickname, p.display_name FROM users u JOIN profiles p ON p.user_id = u.id WHERE u.id = ?')
+    .get(existing.user_id) as { id: string; nickname: string; display_name?: string } | undefined;
+
+  db.transaction(() => {
+    db.prepare(`
+      UPDATE creations SET
+        status = ?,
+        is_approved = ?,
+        rejection_reason = ?,
+        category = ?,
+        updated_at = datetime('now')
+      WHERE id = ?
+    `).run(status, status === 'approved' ? 1 : 0, rejection_reason || null, nextCategory, existing.id);
+
+    if (status === 'approved') {
+      if (!existing.xp_awarded) {
+        const rewardAmount = nextCategory === 'meme' ? 5 : 15;
+        const source = nextCategory === 'meme' ? 'meme_upload' : 'creation_upload';
+        const grant = awardXpWithRef({
+          userId: existing.user_id,
+          amount: rewardAmount,
+          source,
+          details: nextCategory === 'meme'
+            ? `Одобрен мем: «${String(existing.title || '').slice(0, 35)}»`
+            : `Одобрена работа: «${String(existing.title || '').slice(0, 35)}»`,
+          referenceKey: `award:creation:${existing.id}`,
+        });
+        if (grant.awarded) {
+          db.prepare('UPDATE creations SET xp_awarded = 1, xp_awarded_amount = ? WHERE id = ?').run(grant.amount, existing.id);
+        }
+      }
+      if (existing.status !== 'approved') {
+        evaluateUserAchievements(existing.user_id);
+        if (authorRow) {
+          notifyFollowers({
+            author: authorRow,
+            type: 'new_creation',
+            targetType: 'creation',
+            targetId: existing.id,
+            targetTitle: existing.title,
+            targetLink: `/creations?creation=${encodeURIComponent(existing.id)}`,
+            excerpt: existing.description || existing.title,
+          });
+        }
+      }
+    } else if (status === 'rejected' && existing.xp_awarded && Number(existing.xp_awarded_amount) > 0) {
+      revokeXpWithRef({
+        userId: existing.user_id,
+        amount: Number(existing.xp_awarded_amount),
+        source: 'xp_rollback',
+        details: `Откат XP: отклонена публикация «${String(existing.title || '').slice(0, 35)}»`,
+        referenceKey: `rollback:creation:${existing.id}`,
+      });
+      db.prepare('UPDATE creations SET xp_awarded = 0, xp_awarded_amount = 0 WHERE id = ?').run(existing.id);
+    }
+  })();
+
+  res.json({ ok: true, status, category: nextCategory });
 });
 
 app.post('/api/creations/:id/react', requireAuth, (req: AuthRequest, res: Response) => {
@@ -5033,7 +6008,9 @@ app.post('/api/creations/:id/favorite', requireAuth, (req: AuthRequest, res: Res
 });
 
 app.delete('/api/creations/:id', requireAuth, (req: AuthRequest, res: Response) => {
-  const creation = db.prepare('SELECT user_id FROM creations WHERE id = ?').get(req.params.id) as any;
+  const creation = db
+    .prepare('SELECT id, user_id, title, xp_awarded, xp_awarded_amount FROM creations WHERE id = ?')
+    .get(req.params.id) as any;
   if (!creation) {
     res.status(404).json({ error: 'Creation not found' });
     return;
@@ -5043,7 +6020,36 @@ app.delete('/api/creations/:id', requireAuth, (req: AuthRequest, res: Response) 
     return;
   }
 
-  db.prepare('DELETE FROM creations WHERE id = ?').run(req.params.id);
+  db.transaction(() => {
+    if (creation.xp_awarded && Number(creation.xp_awarded_amount) > 0) {
+      revokeXpWithRef({
+        userId: creation.user_id,
+        amount: Number(creation.xp_awarded_amount),
+        source: 'xp_rollback',
+        details: `Откат XP: удаление работы «${String(creation.title || '').slice(0, 35)}»`,
+        referenceKey: `rollback:creation:${creation.id}`,
+      });
+    }
+
+    const creationComments = db
+      .prepare('SELECT id, user_id, xp_awarded, xp_awarded_amount FROM comments WHERE creation_id = ?')
+      .all(creation.id) as Array<{ id: string; user_id: string; xp_awarded: number; xp_awarded_amount: number }>;
+    for (const cm of creationComments) {
+      if (cm.xp_awarded && Number(cm.xp_awarded_amount) > 0) {
+        revokeXpWithRef({
+          userId: cm.user_id,
+          amount: Number(cm.xp_awarded_amount),
+          source: 'xp_rollback',
+          details: 'Откат XP: удаление комментария',
+          referenceKey: `rollback:comment:${cm.id}`,
+        });
+      }
+    }
+
+    db.prepare('DELETE FROM comments WHERE creation_id = ?').run(creation.id);
+    db.prepare('DELETE FROM creations WHERE id = ?').run(creation.id);
+  })();
+
   res.json({ ok: true });
 });
 
@@ -5061,7 +6067,7 @@ app.get('/api/profiles/:nickname', (req: Request, res: Response) => {
            p.display_name, p.avatar_url, p.bio, p.level, p.xp, p.total_xp, p.daily_streak, p.is_private,
            p.custom_status, p.favorite_track, p.equipped_frame, p.equipped_banner, p.equipped_name_style, p.equipped_badge,
            p.equipped_title, p.equipped_theme, p.equipped_effect, p.featured_achievements_json, p.username_changed_at,
-           p.privacy_settings
+           p.privacy_settings, p.notify_follows, p.notify_news
     FROM users u
     JOIN profiles p ON p.user_id = u.id
     WHERE u.nickname = ? COLLATE NOCASE OR u.nickname = ? COLLATE NOCASE
@@ -5096,8 +6102,15 @@ app.get('/api/profiles/:nickname', (req: Request, res: Response) => {
       (SELECT COUNT(*) FROM game_attempts WHERE user_id = ? AND game_id = 'guess-track' AND score > 0) as guess_track_wins,
       (SELECT COUNT(*) FROM game_attempts WHERE user_id = ? AND game_id = 'daily-quiz') as quiz_played,
       (SELECT COUNT(*) FROM game_attempts WHERE user_id = ? AND game_id = 'daily-quiz' AND details_json IS NOT NULL AND json_valid(details_json) = 1 AND CAST(json_extract(details_json, '$.total') AS INTEGER) > 0 AND CAST(json_extract(details_json, '$.correctCount') AS INTEGER) >= CAST(json_extract(details_json, '$.total') AS INTEGER)) as quiz_perfect_runs,
-      (SELECT COALESCE(MAX(score), 0) FROM game_attempts WHERE user_id = ? AND game_id = 'daily-quiz') as quiz_best_score
+      (SELECT COALESCE(MAX(score), 0) FROM game_attempts WHERE user_id = ? AND game_id = 'daily-quiz') as quiz_best_score,
+      (SELECT COUNT(*) FROM game_attempts WHERE user_id = ? AND game_id = 'guess-lyrics') as guess_lyrics_played,
+      (SELECT COUNT(*) FROM game_attempts WHERE user_id = ? AND game_id = 'guess-lyrics' AND score > 0) as guess_lyrics_wins,
+      (SELECT COUNT(*) FROM game_attempts WHERE user_id = ? AND game_id = 'reverse-track') as reverse_track_played,
+      (SELECT COUNT(*) FROM game_attempts WHERE user_id = ? AND game_id = 'reverse-track' AND score > 0) as reverse_track_wins,
+      (SELECT COUNT(*) FROM game_attempts WHERE user_id = ? AND game_id = 'speed-track') as speed_track_played,
+      (SELECT COUNT(*) FROM game_attempts WHERE user_id = ? AND game_id = 'speed-track' AND score > 0) as speed_track_wins
   `).get(
+    profile.id, profile.id, profile.id, profile.id, profile.id, profile.id,
     profile.id, profile.id, profile.id, profile.id, profile.id, profile.id,
     profile.id, profile.id, profile.id, profile.id, profile.id, profile.id
   ) as any;
@@ -5210,13 +6223,15 @@ app.get('/api/profiles/:nickname', (req: Request, res: Response) => {
         LIMIT 12
       `).all(profile.id);
 
-  // Privacy: never leak email, username cooldown, or hidden sections to other users
+  // Privacy: never leak email, username cooldown, notification prefs, or hidden sections to other users
   const {
     email,
     email_verified,
     featured_achievements_json,
     username_changed_at,
     privacy_settings: _rawPrivacy,
+    notify_follows: _rawNotifyFollows,
+    notify_news: _rawNotifyNews,
     ...publicProfile
   } = profile;
 
@@ -5238,6 +6253,12 @@ app.get('/api/profiles/:nickname', (req: Request, res: Response) => {
     quiz_played: hiddenSections.game_stats ? null : Number(counts?.quiz_played || 0),
     quiz_perfect_runs: hiddenSections.game_stats ? null : Number(counts?.quiz_perfect_runs || 0),
     quiz_best_score: hiddenSections.game_stats ? null : Number(counts?.quiz_best_score || 0),
+    guess_lyrics_played: hiddenSections.game_stats ? null : Number(counts?.guess_lyrics_played || 0),
+    guess_lyrics_wins: hiddenSections.game_stats ? null : Number(counts?.guess_lyrics_wins || 0),
+    reverse_track_played: hiddenSections.game_stats ? null : Number(counts?.reverse_track_played || 0),
+    reverse_track_wins: hiddenSections.game_stats ? null : Number(counts?.reverse_track_wins || 0),
+    speed_track_played: hiddenSections.game_stats ? null : Number(counts?.speed_track_played || 0),
+    speed_track_wins: hiddenSections.game_stats ? null : Number(counts?.speed_track_wins || 0),
   };
 
   // Resolve favorite track: explicit profile setting or most-listened track from user_track_plays
@@ -5279,6 +6300,8 @@ app.get('/api/profiles/:nickname', (req: Request, res: Response) => {
             email: email || null,
             email_verified: Number(email_verified || 0),
             privacy_settings: privacySettings,
+            notify_follows: Number(_rawNotifyFollows ?? 1),
+            notify_news: Number(_rawNotifyNews ?? 0),
             username_change_allowed: usernameCooldown?.allowed ?? true,
             username_next_allowed_at: usernameCooldown?.nextAllowedAt ?? null,
             username_cooldown_days: usernameCooldown?.remainingDays ?? 0,
@@ -5366,19 +6389,32 @@ app.post('/api/profiles/:nickname/follow', requireAuth, (req: AuthRequest, res: 
   }
 
   const existing = db.prepare('SELECT id FROM follows WHERE follower_id = ? AND following_id = ?').get(req.user!.id, target.id) as any;
+  let following = false;
+  let newlyUnlocked: UnlockedAchievementInfo[] = [];
+
   if (existing) {
     db.prepare('DELETE FROM follows WHERE id = ?').run(existing.id);
-    res.json({ following: false });
+    following = false;
   } else {
     db.prepare('INSERT INTO follows (id, follower_id, following_id) VALUES (?, ?, ?)').run(
       'flw_' + crypto.randomUUID().slice(0, 8),
       req.user!.id,
       target.id
     );
-    const newlyUnlocked = evaluateUserAchievements(req.user!.id);
+    following = true;
+    newlyUnlocked = evaluateUserAchievements(req.user!.id);
     evaluateUserAchievements(target.id);
-    res.json({ following: true, newly_unlocked_achievements: newlyUnlocked });
   }
+
+  const followersCount = Number(
+    (db.prepare('SELECT COUNT(*) as c FROM follows WHERE following_id = ?').get(target.id) as any)?.c || 0
+  );
+
+  res.json({
+    following,
+    followers_count: followersCount,
+    ...(newlyUnlocked.length > 0 ? { newly_unlocked_achievements: newlyUnlocked } : {}),
+  });
 });
 
 app.put('/api/profiles/me', requireAuth, (req: AuthRequest, res: Response) => {
@@ -5393,6 +6429,8 @@ app.put('/api/profiles/me', requireAuth, (req: AuthRequest, res: Response) => {
     featured_achievements,
     username,
     privacy_settings,
+    notify_follows,
+    notify_news,
   } = req.body || {};
 
   let nextDisplayName: string | null = null;
@@ -5519,6 +6557,8 @@ app.put('/api/profiles/me', requireAuth, (req: AuthRequest, res: Response) => {
         favorite_track = CASE WHEN ? = 1 THEN ? ELSE favorite_track END,
         featured_achievements_json = COALESCE(?, featured_achievements_json),
         privacy_settings = COALESCE(?, privacy_settings),
+        notify_follows = COALESCE(?, notify_follows),
+        notify_news = COALESCE(?, notify_news),
         updated_at = datetime('now')
       WHERE user_id = ?
     `).run(
@@ -5532,6 +6572,8 @@ app.put('/api/profiles/me', requireAuth, (req: AuthRequest, res: Response) => {
       favorite_track !== undefined ? (String(favorite_track).trim().slice(0, 80) || null) : null,
       nextFeaturedJson,
       nextPrivacyJson,
+      notify_follows !== undefined ? (notify_follows ? 1 : 0) : null,
+      notify_news !== undefined ? (notify_news ? 1 : 0) : null,
       userId
     );
   })();
@@ -5556,7 +6598,7 @@ app.put('/api/profiles/me', requireAuth, (req: AuthRequest, res: Response) => {
 });
 
 // Admin Game Pool management (Automatic audio linking)
-app.get('/api/admin/game-tracks', requireAdminOrMod, (_req: Request, res: Response) => {
+app.get('/api/admin/game-tracks', requireAdmin, (_req: Request, res: Response) => {
   const rawTracks = db.prepare(`
     SELECT t.id, t.title, t.duration_seconds, t.audio_url, t.snippet_start_seconds,
            t.snippet_duration_seconds, t.is_game_eligible,
@@ -5580,7 +6622,7 @@ app.get('/api/admin/game-tracks', requireAdminOrMod, (_req: Request, res: Respon
   res.json({ tracks });
 });
 
-app.post('/api/admin/game-tracks/:id/toggle', requireAdminOrMod, (req: AuthRequest, res: Response) => {
+app.post('/api/admin/game-tracks/:id/toggle', requireAdmin, (req: AuthRequest, res: Response) => {
   const { is_eligible } = req.body;
   const targetId = req.params.id;
   const val = is_eligible ? 1 : 0;
@@ -5606,7 +6648,7 @@ app.post('/api/admin/game-tracks/:id/toggle', requireAdminOrMod, (req: AuthReque
 // API: ADMINISTRATION & MODERATION
 // ----------------------------------------------------------------------------
 
-app.get('/api/admin/users', requireAdminOrMod, (req: Request, res: Response) => {
+app.get('/api/admin/users', requireAdmin, (req: Request, res: Response) => {
   const rawSearch = String(req.query.search || '').trim();
   const cleanSearch = normalizeUsername(rawSearch);
   const likeParam = `%${rawSearch}%`;
@@ -5672,17 +6714,22 @@ app.get('/api/admin/users', requireAdminOrMod, (req: Request, res: Response) => 
   res.json({ users, summary, sort: sortParam });
 });
 
-app.get('/api/admin/users/:id/details', requireAdminOrMod, (req: Request, res: Response) => {
+app.get('/api/admin/users/:id/details', requireAdmin, (req: Request, res: Response) => {
   const userId = req.params.id;
   const target = db.prepare(`
-    SELECT u.id, u.nickname, u.email, u.email_verified, u.role_id, u.is_banned, u.ban_reason,
+    SELECT u.id, u.nickname, u.email, u.email_verified, u.accepted_rules, u.role_id, u.is_banned, u.ban_reason,
            u.failed_login_attempts, u.locked_until, u.created_at as registered_at,
-           p.display_name, p.avatar_url, p.bio, p.custom_status, p.level, p.xp, p.total_xp, p.daily_streak,
+           p.display_name, p.avatar_url, p.bio, p.custom_status, p.favorite_track,
+           p.level, p.xp, p.total_xp, p.daily_streak, p.is_private,
+           p.privacy_settings, p.notify_follows, p.notify_news,
            p.equipped_frame, p.equipped_banner, p.equipped_name_style, p.equipped_badge,
            p.equipped_title, p.equipped_theme, p.equipped_effect,
            (SELECT COUNT(*) FROM game_attempts WHERE user_id = u.id) as games_played,
            (SELECT COUNT(*) FROM game_attempts WHERE user_id = u.id AND game_id = 'guess-track' AND score > 0) as guess_track_wins,
            (SELECT COUNT(*) FROM game_attempts WHERE user_id = u.id AND game_id = 'daily-quiz') as quiz_played,
+           (SELECT COUNT(*) FROM game_attempts WHERE user_id = u.id AND game_id = 'guess-lyrics' AND score > 0) as guess_lyrics_wins,
+           (SELECT COUNT(*) FROM game_attempts WHERE user_id = u.id AND game_id = 'reverse-track' AND score > 0) as reverse_track_wins,
+           (SELECT COUNT(*) FROM game_attempts WHERE user_id = u.id AND game_id = 'speed-track' AND score > 0) as speed_track_wins,
            (SELECT COUNT(*) FROM posts WHERE user_id = u.id) as posts_count,
            (SELECT COUNT(*) FROM creations WHERE user_id = u.id) as creations_count
     FROM users u
@@ -5695,15 +6742,29 @@ app.get('/api/admin/users/:id/details', requireAdminOrMod, (req: Request, res: R
     return;
   }
 
+  target.privacy_settings = parsePrivacySettings(target.privacy_settings);
+  target.email_verified = Number(target.email_verified || 0);
+  target.accepted_rules = Number(target.accepted_rules || 0);
+  target.notify_follows = target.notify_follows === 0 ? 0 : 1;
+  target.notify_news = Number(target.notify_news || 0);
+  target.is_private = Number(target.is_private || 0);
+
   const unlockedAchIds = new Set(
     (db.prepare('SELECT achievement_id FROM user_achievements WHERE user_id = ?').all(userId) as any[]).map(
       (r) => r.achievement_id
     )
   );
   const achievements = (
-    db.prepare('SELECT id, slug, title_ru, title_en, category, rarity, icon FROM achievements ORDER BY category ASC, rarity ASC').all() as any[]
+    db.prepare(`
+      SELECT id, slug, title_ru, title_en, desc_ru, desc_en, condition_ru, condition_en,
+             category, rarity, difficulty_tier, is_secret, xp_reward, icon
+      FROM achievements
+      ORDER BY is_secret ASC, category ASC, xp_reward ASC
+    `).all() as any[]
   ).map((a) => ({
     ...a,
+    is_secret: Boolean(a.is_secret),
+    xp_reward: Number(a.xp_reward || 0),
     is_unlocked: unlockedAchIds.has(a.id),
   }));
 
@@ -5712,14 +6773,570 @@ app.get('/api/admin/users/:id/details', requireAdminOrMod, (req: Request, res: R
     ownedItemsMap.set(row.item_id, Boolean(row.is_equipped));
   }
   const items = (
-    db.prepare('SELECT id, name_ru, name_en, category, cost_xp, rarity FROM shop_items WHERE is_active = 1 ORDER BY category ASC, cost_xp ASC').all() as any[]
+    db.prepare(`
+      SELECT id, name_ru, name_en, description_ru, description_en, category, cost_xp, rarity, preview_value, is_active
+      FROM shop_items
+      WHERE is_active = 1 OR id IN (SELECT item_id FROM user_inventory WHERE user_id = ?)
+      ORDER BY category ASC, cost_xp ASC, name_ru ASC
+    `).all(userId) as any[]
   ).map((it) => ({
     ...it,
     is_owned: ownedItemsMap.has(it.id),
     is_equipped: ownedItemsMap.get(it.id) || false,
   }));
 
-  res.json({ user: target, achievements, items });
+  const { cycleId } = getMoscow12hCycle();
+  const cycle_completions = db.prepare(`
+    SELECT game_type, is_correct, score, xp_earned, created_at
+    FROM game_completions
+    WHERE user_id = ? AND cycle_id = ?
+    ORDER BY created_at DESC
+  `).all(userId, cycleId);
+
+  res.json({ user: target, achievements, items, cycle_id: cycleId, cycle_completions });
+});
+
+app.put('/api/admin/users/:id/full', requireAdmin, (req: AuthRequest, res: Response) => {
+  const adminId = req.user!.id;
+  const targetId = req.params.id;
+  const current = db.prepare(`
+    SELECT u.*, p.display_name, p.bio, p.custom_status, p.avatar_url, p.favorite_track,
+           p.level, p.xp, p.total_xp, p.daily_streak, p.is_private, p.privacy_settings,
+           p.notify_follows, p.notify_news
+    FROM users u
+    JOIN profiles p ON p.user_id = u.id
+    WHERE u.id = ?
+  `).get(targetId) as any;
+
+  if (!current) {
+    res.status(404).json({ error: 'Пользователь не найден.' });
+    return;
+  }
+
+  const isTargetMaster =
+    String(current.nickname || '').toLowerCase() === 'sushkanov097' ||
+    String(current.email || '').toLowerCase() === 'sushkanov097@gmail.com';
+
+  const body = req.body || {};
+  let nextNickname = String(current.nickname);
+  let nicknameChanged = false;
+  if (typeof body.nickname === 'string' && body.nickname.trim()) {
+    const uCheck = validateUsername(body.nickname);
+    if (!uCheck.valid) {
+      res.status(400).json({ error: uCheck.error });
+      return;
+    }
+    if (uCheck.normalized !== String(current.nickname).toLowerCase()) {
+      if (isTargetMaster) {
+        res.status(403).json({ error: 'Юзернейм главного администратора @sushkanov097 менять нельзя.' });
+        return;
+      }
+      const collision = db
+        .prepare('SELECT id FROM users WHERE LOWER(TRIM(nickname)) = ? AND id != ?')
+        .get(uCheck.normalized, targetId);
+      if (collision) {
+        res.status(409).json({ error: 'Этот @username уже занят другим участником.' });
+        return;
+      }
+      nextNickname = uCheck.normalized;
+      nicknameChanged = true;
+    }
+  }
+
+  let nextEmail: string | null = current.email ?? null;
+  if (body.email !== undefined) {
+    const rawEmail = String(body.email || '').trim().toLowerCase();
+    if (!rawEmail) {
+      nextEmail = null;
+    } else {
+      const eCheck = validateEmail(rawEmail);
+      if (!eCheck.valid) {
+        res.status(400).json({ error: eCheck.error });
+        return;
+      }
+      const emailClash = db
+        .prepare('SELECT id FROM users WHERE LOWER(TRIM(email)) = ? AND id != ?')
+        .get(eCheck.normalized, targetId);
+      if (emailClash) {
+        res.status(409).json({ error: 'Этот email уже привязан к другому аккаунту.' });
+        return;
+      }
+      nextEmail = eCheck.normalized;
+    }
+  }
+
+  let nextRole = String(current.role_id || 'user');
+  if (body.role_id !== undefined) {
+    if (!['user', 'moderator', 'admin'].includes(body.role_id)) {
+      res.status(400).json({ error: 'Недопустимая роль пользователя.' });
+      return;
+    }
+    if (isTargetMaster && body.role_id !== 'admin') {
+      res.status(403).json({ error: 'Роль главного администратора нельзя понизить.' });
+      return;
+    }
+    if (targetId === adminId && body.role_id !== 'admin') {
+      res.status(400).json({ error: 'Вы не можете понизить роль собственного аккаунта.' });
+      return;
+    }
+    nextRole = body.role_id;
+  }
+
+  let nextBanned = Number(current.is_banned || 0);
+  if (body.is_banned !== undefined) {
+    const wantBan = body.is_banned ? 1 : 0;
+    if (wantBan && targetId === adminId) {
+      res.status(400).json({ error: 'Нельзя заблокировать собственный аккаунт.' });
+      return;
+    }
+    if (wantBan && isTargetMaster) {
+      res.status(403).json({ error: 'Главного администратора нельзя заблокировать.' });
+      return;
+    }
+    nextBanned = wantBan;
+  }
+
+  let nextDisplayName = String(current.display_name || current.nickname);
+  if (body.display_name !== undefined) {
+    const dCheck = validateDisplayName(String(body.display_name || ''));
+    if (!dCheck.valid) {
+      res.status(400).json({ error: dCheck.error });
+      return;
+    }
+    nextDisplayName = dCheck.normalized;
+  }
+
+  let nextAvatar = current.avatar_url;
+  if (body.avatar_url !== undefined) {
+    const av = String(body.avatar_url || '').trim();
+    if (!av) {
+      nextAvatar = '/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg';
+    } else if (!isSafeMediaUrl(av)) {
+      res.status(400).json({ error: 'Некорректная ссылка на аватар.' });
+      return;
+    } else {
+      nextAvatar = av;
+    }
+  }
+
+  let nextPasswordHash: string | null = null;
+  if (typeof body.new_password === 'string' && body.new_password.trim()) {
+    if (isTargetMaster && targetId !== adminId) {
+      res.status(403).json({ error: 'Пароль главного администратора нельзя сменить с другого аккаунта.' });
+      return;
+    }
+    const pCheck = validateRegistrationPassword(body.new_password);
+    if (!pCheck.valid) {
+      res.status(400).json({ error: pCheck.error });
+      return;
+    }
+    nextPasswordHash = bcrypt.hashSync(body.new_password, 12);
+  }
+
+  const nextEmailVerified = body.email_verified !== undefined ? (body.email_verified ? 1 : 0) : Number(current.email_verified || 0);
+  const nextAcceptedRules = body.accepted_rules !== undefined ? (body.accepted_rules ? 1 : 0) : Number(current.accepted_rules || 0);
+  const nextBio = body.bio !== undefined ? String(body.bio || '').slice(0, 500) : current.bio;
+  const nextCustomStatus = body.custom_status !== undefined ? String(body.custom_status || '').slice(0, 120) : current.custom_status;
+  const nextFavTrack =
+    body.favorite_track !== undefined ? (String(body.favorite_track || '').trim().slice(0, 80) || null) : current.favorite_track;
+  const nextBanReason =
+    body.ban_reason !== undefined ? String(body.ban_reason || '').trim().slice(0, 300) : current.ban_reason;
+  const nextIsPrivate = body.is_private !== undefined ? (body.is_private ? 1 : 0) : Number(current.is_private || 0);
+  const nextNotifyFollows = body.notify_follows !== undefined ? (body.notify_follows ? 1 : 0) : Number(current.notify_follows ?? 1);
+  const nextNotifyNews = body.notify_news !== undefined ? (body.notify_news ? 1 : 0) : Number(current.notify_news || 0);
+  const nextPrivacyJson =
+    body.privacy_settings !== undefined
+      ? JSON.stringify(parsePrivacySettings(body.privacy_settings))
+      : current.privacy_settings;
+
+  const nextTotalXp =
+    body.total_xp !== undefined ? Math.max(0, Math.floor(Number(body.total_xp) || 0)) : Number(current.total_xp ?? current.xp ?? 0);
+  const nextXp = body.xp !== undefined ? Math.max(0, Math.floor(Number(body.xp) || 0)) : Number(current.xp || 0);
+  const autoRecalc = body.auto_recalc_level !== false;
+  const nextLevel = autoRecalc
+    ? calculateLevelFromXp(nextTotalXp).level
+    : Math.max(1, Math.min(100, Math.floor(Number(body.level ?? current.level) || 1)));
+  const nextStreak =
+    body.daily_streak !== undefined ? Math.max(0, Math.floor(Number(body.daily_streak) || 0)) : Number(current.daily_streak || 0);
+
+  const nowIso = new Date().toISOString();
+  const xpDelta = nextTotalXp - Number(current.total_xp ?? current.xp ?? 0);
+
+  db.transaction(() => {
+    db.prepare(`
+      UPDATE users SET
+        nickname = ?,
+        email = ?,
+        email_verified = ?,
+        accepted_rules = ?,
+        role_id = ?,
+        is_banned = ?,
+        ban_reason = ?,
+        password_hash = COALESCE(?, password_hash),
+        password_changed_at = CASE WHEN ? IS NOT NULL THEN ? ELSE password_changed_at END,
+        failed_login_attempts = CASE WHEN ? IS NOT NULL THEN 0 ELSE failed_login_attempts END,
+        locked_until = CASE WHEN ? IS NOT NULL THEN NULL ELSE locked_until END,
+        updated_at = datetime('now')
+      WHERE id = ?
+    `).run(
+      nextNickname,
+      nextEmail,
+      nextEmailVerified,
+      nextAcceptedRules,
+      nextRole,
+      nextBanned,
+      nextBanReason,
+      nextPasswordHash,
+      nextPasswordHash,
+      nowIso,
+      nextPasswordHash,
+      nextPasswordHash,
+      targetId
+    );
+
+    if (nextPasswordHash || nextBanned) {
+      db.prepare('DELETE FROM sessions WHERE user_id = ?').run(targetId);
+    }
+
+    db.prepare(`
+      UPDATE profiles SET
+        display_name = ?,
+        avatar_url = ?,
+        bio = ?,
+        custom_status = ?,
+        favorite_track = ?,
+        is_private = ?,
+        privacy_settings = ?,
+        notify_follows = ?,
+        notify_news = ?,
+        total_xp = ?,
+        xp = ?,
+        level = ?,
+        daily_streak = ?,
+        updated_at = datetime('now')
+      WHERE user_id = ?
+    `).run(
+      nextDisplayName,
+      nextAvatar,
+      nextBio,
+      nextCustomStatus,
+      nextFavTrack,
+      nextIsPrivate,
+      nextPrivacyJson,
+      nextNotifyFollows,
+      nextNotifyNews,
+      nextTotalXp,
+      nextXp,
+      nextLevel,
+      nextStreak,
+      targetId
+    );
+
+    if (xpDelta !== 0) {
+      db.prepare(`
+        INSERT INTO xp_transactions (id, user_id, amount, source, details)
+        VALUES (?, ?, ?, 'admin_adjust', ?)
+      `).run(
+        'xpt_' + crypto.randomUUID().slice(0, 8),
+        targetId,
+        xpDelta,
+        `Администратор скорректировал XP (${current.total_xp ?? current.xp ?? 0} → ${nextTotalXp})`
+      );
+    }
+
+    db.prepare(`
+      INSERT INTO moderation_actions (id, moderator_id, target_user_id, action_type, details)
+      VALUES (?, ?, ?, 'admin_user_edit', ?)
+    `).run(
+      'mod_' + crypto.randomUUID().slice(0, 8),
+      adminId,
+      targetId,
+      `Updated user @${nextNickname} (role=${nextRole}, total_xp=${nextTotalXp}, xp=${nextXp}, streak=${nextStreak})`
+    );
+  })();
+
+  let refreshedToken: string | undefined;
+  if (targetId === adminId && (nicknameChanged || nextRole !== current.role_id)) {
+    refreshedToken = issueSessionForUser(res, {
+      id: targetId,
+      nickname: nextNickname,
+      role_id: nextRole,
+    });
+  }
+
+  res.json({ ok: true, nickname: nextNickname, role_id: nextRole, ...(refreshedToken ? { token: refreshedToken } : {}) });
+});
+
+app.post('/api/admin/users/:id/reset-cycle', requireAdmin, (req: AuthRequest, res: Response) => {
+  const targetId = req.params.id;
+  const target = db.prepare('SELECT id, nickname FROM users WHERE id = ?').get(targetId) as any;
+  if (!target) {
+    res.status(404).json({ error: 'Пользователь не найден.' });
+    return;
+  }
+
+  const { cycleId } = getMoscow12hCycle();
+  const dateOnly = cycleId.slice(0, 10);
+  let cleared = 0;
+
+  db.transaction(() => {
+    const r1 = db.prepare('DELETE FROM game_completions WHERE user_id = ? AND cycle_id = ?').run(targetId, cycleId);
+    const r2 = db.prepare('DELETE FROM daily_track_attempts WHERE user_id = ? AND challenge_date IN (?, ?)').run(targetId, cycleId, dateOnly);
+    const r3 = db.prepare('DELETE FROM quiz_attempts WHERE user_id = ? AND challenge_date IN (?, ?)').run(targetId, cycleId, dateOnly);
+    const r4 = db.prepare('DELETE FROM daily_mini_game_attempts WHERE user_id = ? AND cycle_id = ?').run(targetId, cycleId);
+    cleared = Number(r1.changes || 0) + Number(r2.changes || 0) + Number(r3.changes || 0) + Number(r4.changes || 0);
+
+    db.prepare(`
+      INSERT INTO moderation_actions (id, moderator_id, target_user_id, action_type, details)
+      VALUES (?, ?, ?, 'reset_game_cycle', ?)
+    `).run(
+      'mod_' + crypto.randomUUID().slice(0, 8),
+      req.user!.id,
+      targetId,
+      `Reset current cycle (${cycleId}) locks for @${target.nickname} (rows=${cleared})`
+    );
+  })();
+
+  res.json({ ok: true, cycle_id: cycleId, cleared });
+});
+
+app.post('/api/admin/users/:id/equip', requireAdmin, (req: AuthRequest, res: Response) => {
+  const targetId = req.params.id;
+  const { item_id, category, equip } = req.body || {};
+
+  const target = db.prepare('SELECT id FROM users WHERE id = ?').get(targetId);
+  if (!target) {
+    res.status(404).json({ error: 'Пользователь не найден.' });
+    return;
+  }
+
+  if (item_id) {
+    const item = db.prepare('SELECT id, category, preview_value FROM shop_items WHERE id = ?').get(item_id) as any;
+    if (!item) {
+      res.status(404).json({ error: 'Предмет не найден.' });
+      return;
+    }
+    const column = SHOP_CATEGORY_COLUMN_MAP[item.category];
+    const shouldEquip = equip !== false;
+
+    db.transaction(() => {
+      db.prepare(`
+        INSERT OR IGNORE INTO user_inventory (id, user_id, item_id, is_equipped)
+        VALUES (?, ?, ?, 0)
+      `).run('inv_' + crypto.randomUUID().slice(0, 8), targetId, item.id);
+
+      if (shouldEquip) {
+        db.prepare(`
+          UPDATE user_inventory SET is_equipped = 0
+          WHERE user_id = ? AND item_id IN (SELECT id FROM shop_items WHERE category = ?)
+        `).run(targetId, item.category);
+        db.prepare('UPDATE user_inventory SET is_equipped = 1 WHERE user_id = ? AND item_id = ?').run(targetId, item.id);
+        if (column) {
+          db.prepare(`UPDATE profiles SET ${column} = ?, updated_at = datetime('now') WHERE user_id = ?`).run(
+            item.preview_value,
+            targetId
+          );
+        }
+      } else {
+        db.prepare('UPDATE user_inventory SET is_equipped = 0 WHERE user_id = ? AND item_id = ?').run(targetId, item.id);
+        if (column) {
+          db.prepare(`UPDATE profiles SET ${column} = NULL, updated_at = datetime('now') WHERE user_id = ?`).run(targetId);
+        }
+      }
+    })();
+
+    res.json({ ok: true, item_id: item.id, is_equipped: shouldEquip });
+    return;
+  }
+
+  if (typeof category === 'string' && SHOP_CATEGORY_COLUMN_MAP[category]) {
+    const column = SHOP_CATEGORY_COLUMN_MAP[category];
+    db.transaction(() => {
+      db.prepare(`
+        UPDATE user_inventory SET is_equipped = 0
+        WHERE user_id = ? AND item_id IN (SELECT id FROM shop_items WHERE category = ?)
+      `).run(targetId, category);
+      db.prepare(`UPDATE profiles SET ${column} = NULL, updated_at = datetime('now') WHERE user_id = ?`).run(targetId);
+    })();
+    res.json({ ok: true, category, is_equipped: false });
+    return;
+  }
+
+  res.status(400).json({ error: 'Укажите item_id или category.' });
+});
+
+app.post('/api/admin/users/:id/custom-shield', requireAdmin, (req: AuthRequest, res: Response) => {
+  const targetId = req.params.id;
+  const target = db.prepare('SELECT id, nickname FROM users WHERE id = ?').get(targetId) as any;
+  if (!target) {
+    res.status(404).json({ error: 'Пользователь не найден.' });
+    return;
+  }
+
+  const labelRu = String(req.body?.label_ru || '').replace(/\s+/g, ' ').trim().slice(0, 32);
+  const labelEn = String(req.body?.label_en || labelRu).replace(/\s+/g, ' ').trim().slice(0, 32);
+  if (!labelRu) {
+    res.status(400).json({ error: 'Укажите текст шилда.' });
+    return;
+  }
+
+  const allowedRarities = new Set(['common', 'uncommon', 'rare', 'epic', 'legendary', 'mythic']);
+  const rarity = allowedRarities.has(req.body?.rarity) ? req.body.rarity : 'legendary';
+  const addToShop = Boolean(req.body?.add_to_shop);
+  const costXp = addToShop ? Math.max(0, Math.floor(Number(req.body?.cost_xp) || 0)) : 0;
+
+  const previewValue = buildCustomShieldValue({
+    ru: labelRu,
+    en: labelEn || labelRu,
+    bg: req.body?.bg,
+    border: req.body?.border,
+    text: req.body?.text,
+    glow: req.body?.glow,
+  });
+
+  const itemId = 'item_cshield_' + crypto.randomUUID().slice(0, 8);
+  const descRu = addToShop
+    ? `Авторский шилд «${labelRu}».`
+    : `Персональный уникальный шилд для @${target.nickname}.`;
+  const descEn = addToShop
+    ? `Custom shield "${labelEn || labelRu}".`
+    : `Exclusive custom shield for @${target.nickname}.`;
+
+  db.transaction(() => {
+    db.prepare(`
+      INSERT INTO shop_items (id, name_ru, name_en, description_ru, description_en, category, cost_xp, rarity, preview_value, is_active)
+      VALUES (?, ?, ?, ?, ?, 'title', ?, ?, ?, ?)
+    `).run(
+      itemId,
+      `Шилд «${labelRu}»`,
+      `Shield "${labelEn || labelRu}"`,
+      descRu,
+      descEn,
+      costXp,
+      rarity,
+      previewValue,
+      addToShop ? 1 : 0
+    );
+
+    db.prepare(`
+      UPDATE user_inventory SET is_equipped = 0
+      WHERE user_id = ? AND item_id IN (SELECT id FROM shop_items WHERE category = 'title')
+    `).run(targetId);
+
+    db.prepare(`
+      INSERT INTO user_inventory (id, user_id, item_id, is_equipped)
+      VALUES (?, ?, ?, 1)
+    `).run('inv_' + crypto.randomUUID().slice(0, 8), targetId, itemId);
+
+    db.prepare(`
+      UPDATE profiles SET equipped_title = ?, updated_at = datetime('now') WHERE user_id = ?
+    `).run(previewValue, targetId);
+  })();
+
+  res.json({ ok: true, item_id: itemId, preview_value: previewValue });
+});
+
+app.post('/api/admin/users/reset', requireAdmin, (req: AuthRequest, res: Response) => {
+  const mode = req.body?.mode === 'bulk' ? 'bulk' : 'single';
+  const targetUserId = typeof req.body?.target_user_id === 'string' ? req.body.target_user_id.trim() : '';
+  const skipAdmins = req.body?.skip_admins !== false;
+  const confirmText = String(req.body?.confirm_text || '').trim();
+  const scopesRaw = req.body?.scopes || {};
+  const scopes = {
+    xp: Boolean(scopesRaw.xp),
+    achievements: Boolean(scopesRaw.achievements),
+    cosmetics: Boolean(scopesRaw.cosmetics),
+    games: Boolean(scopesRaw.games),
+  };
+
+  if (!scopes.xp && !scopes.achievements && !scopes.cosmetics && !scopes.games) {
+    res.status(400).json({ error: 'Выберите хотя бы одну категорию данных для сброса.' });
+    return;
+  }
+
+  let targetIds: string[] = [];
+  if (mode === 'single') {
+    if (!targetUserId) {
+      res.status(400).json({ error: 'Выберите пользователя для сброса.' });
+      return;
+    }
+    const row = db.prepare('SELECT id FROM users WHERE id = ?').get(targetUserId) as { id: string } | undefined;
+    if (!row) {
+      res.status(404).json({ error: 'Пользователь не найден.' });
+      return;
+    }
+    targetIds = [row.id];
+  } else {
+    if (confirmText !== 'СБРОСИТЬ') {
+      res.status(400).json({ error: 'Для массового сброса введите точное слово СБРОСИТЬ.' });
+      return;
+    }
+    const rows = skipAdmins
+      ? (db.prepare("SELECT id FROM users WHERE role_id != 'admin'").all() as Array<{ id: string }>)
+      : (db.prepare('SELECT id FROM users').all() as Array<{ id: string }>);
+    targetIds = rows.map((r) => r.id);
+  }
+
+  if (targetIds.length === 0) {
+    res.json({ ok: true, affected_users: 0, scopes });
+    return;
+  }
+
+  db.transaction(() => {
+    for (const uid of targetIds) {
+      if (scopes.xp) {
+        db.prepare(`
+          UPDATE profiles SET total_xp = 0, xp = 0, level = 1, updated_at = datetime('now') WHERE user_id = ?
+        `).run(uid);
+        db.prepare('DELETE FROM xp_transactions WHERE user_id = ?').run(uid);
+      }
+
+      if (scopes.achievements) {
+        db.prepare('DELETE FROM user_achievements WHERE user_id = ?').run(uid);
+        db.prepare("UPDATE profiles SET featured_achievements_json = '[]', updated_at = datetime('now') WHERE user_id = ?").run(uid);
+        db.prepare('DELETE FROM user_track_plays WHERE user_id = ?').run(uid);
+        db.prepare('DELETE FROM post_reads WHERE user_id = ?').run(uid);
+        db.prepare('DELETE FROM user_secret_flags WHERE user_id = ?').run(uid);
+      }
+
+      if (scopes.cosmetics) {
+        db.prepare('DELETE FROM user_inventory WHERE user_id = ?').run(uid);
+        db.prepare(`
+          UPDATE profiles SET
+            equipped_frame = NULL,
+            equipped_banner = NULL,
+            equipped_name_style = NULL,
+            equipped_badge = NULL,
+            equipped_title = NULL,
+            equipped_theme = NULL,
+            equipped_effect = NULL,
+            updated_at = datetime('now')
+          WHERE user_id = ?
+        `).run(uid);
+      }
+
+      if (scopes.games) {
+        db.prepare("UPDATE profiles SET daily_streak = 0, last_active_date = NULL, updated_at = datetime('now') WHERE user_id = ?").run(uid);
+        db.prepare('DELETE FROM game_attempts WHERE user_id = ?').run(uid);
+        db.prepare('DELETE FROM daily_track_attempts WHERE user_id = ?').run(uid);
+        db.prepare('DELETE FROM quiz_attempts WHERE user_id = ?').run(uid);
+        db.prepare('DELETE FROM game_completions WHERE user_id = ?').run(uid);
+        db.prepare('DELETE FROM daily_mini_game_attempts WHERE user_id = ?').run(uid);
+      }
+    }
+
+    db.prepare(`
+      INSERT INTO moderation_actions (id, moderator_id, target_user_id, action_type, details)
+      VALUES (?, ?, ?, 'user_reset', ?)
+    `).run(
+      'mod_' + crypto.randomUUID().slice(0, 8),
+      req.user!.id,
+      mode === 'single' ? targetIds[0] : null,
+      `mode=${mode} skip_admins=${skipAdmins} affected=${targetIds.length} scopes=${JSON.stringify(scopes)}`
+    );
+  })();
+
+  res.json({ ok: true, mode, affected_users: targetIds.length, scopes });
 });
 
 app.post('/api/admin/users/:id/reset-password', requireAdmin, (req: AuthRequest, res: Response) => {
@@ -5784,29 +7401,85 @@ app.post('/api/admin/users/:id/reset-password', requireAdmin, (req: AuthRequest,
 
 app.post('/api/admin/users/:id/achievements', requireAdmin, (req: AuthRequest, res: Response) => {
   const targetId = req.params.id;
-  const { achievement_id, action } = req.body || {};
+  const { achievement_id, action, adjust_xp } = req.body || {};
   if (!achievement_id || (action !== 'grant' && action !== 'revoke')) {
     res.status(400).json({ error: 'Specify achievement_id and action (grant | revoke).' });
     return;
   }
 
   const target = db.prepare('SELECT id FROM users WHERE id = ?').get(targetId);
-  const ach = db.prepare('SELECT id, slug FROM achievements WHERE id = ?').get(achievement_id) as any;
+  const ach = db.prepare('SELECT id, slug, title_ru, xp_reward FROM achievements WHERE id = ?').get(achievement_id) as any;
   if (!target || !ach) {
     res.status(404).json({ error: 'Пользователь или достижение не найдены.' });
     return;
   }
 
-  if (action === 'grant') {
-    db.prepare(`
-      INSERT OR IGNORE INTO user_achievements (id, user_id, achievement_id)
-      VALUES (?, ?, ?)
-    `).run('uach_' + crypto.randomUUID().slice(0, 8), targetId, ach.id);
-  } else {
-    db.prepare('DELETE FROM user_achievements WHERE user_id = ? AND achievement_id = ?').run(targetId, ach.id);
-  }
+  const shouldAdjustXp = adjust_xp !== false;
+  const reward = Number(ach.xp_reward || 0);
+  let xpChanged = 0;
 
-  res.json({ ok: true, action, achievement_id: ach.id });
+  db.transaction(() => {
+    if (action === 'grant') {
+      const insertRes = db.prepare(`
+        INSERT OR IGNORE INTO user_achievements (id, user_id, achievement_id)
+        VALUES (?, ?, ?)
+      `).run('uach_' + crypto.randomUUID().slice(0, 8), targetId, ach.id);
+
+      if (insertRes.changes > 0 && shouldAdjustXp && reward > 0) {
+        const resGrant = awardXpWithRef({
+          userId: targetId,
+          amount: reward,
+          source: 'achievement',
+          details: `Достижение (адм.): ${ach.title_ru}`,
+          referenceKey: `admin_ach_grant:${targetId}:${ach.id}:${crypto.randomUUID().slice(0, 8)}`,
+        });
+        xpChanged = resGrant.amount;
+      }
+    } else {
+      const delRes = db
+        .prepare('DELETE FROM user_achievements WHERE user_id = ? AND achievement_id = ?')
+        .run(targetId, ach.id);
+
+      if (delRes.changes > 0 && shouldAdjustXp && reward > 0) {
+        const resRevoke = revokeXpWithRef({
+          userId: targetId,
+          amount: reward,
+          source: 'xp_rollback',
+          details: `Откат достижения: ${ach.title_ru}`,
+          referenceKey: `admin_ach_revoke:${targetId}:${ach.id}:${crypto.randomUUID().slice(0, 8)}`,
+        });
+        xpChanged = -resRevoke.amount;
+      }
+
+      // Allow natural re-earning and clean featured showcase & secret progress flags
+      db.prepare('DELETE FROM xp_transactions WHERE user_id = ? AND reference_key = ?').run(
+        targetId,
+        `ach:${targetId}:${ach.slug}`
+      );
+      if (ach.slug === 'secret_on_repeat') {
+        db.prepare('DELETE FROM user_track_plays WHERE user_id = ?').run(targetId);
+      } else if (ach.slug === 'secret_rose_hunter') {
+        db.prepare("DELETE FROM user_secret_flags WHERE user_id = ? AND flag_key = 'curious_rose'").run(targetId);
+      } else if (ach.slug === 'secret_scribe') {
+        db.prepare('DELETE FROM post_reads WHERE user_id = ?').run(targetId);
+      } else if (ach.slug === 'secret_midnight_apostle') {
+        db.prepare("DELETE FROM user_secret_flags WHERE user_id = ? AND flag_key = 'midnight_visit'").run(targetId);
+      }
+
+      const profRow = db.prepare('SELECT featured_achievements_json FROM profiles WHERE user_id = ?').get(targetId) as
+        | { featured_achievements_json?: string | null }
+        | undefined;
+      if (profRow?.featured_achievements_json) {
+        const cleaned = parseFeaturedAchievements(profRow.featured_achievements_json).filter((s) => s !== ach.slug);
+        db.prepare('UPDATE profiles SET featured_achievements_json = ? WHERE user_id = ?').run(
+          JSON.stringify(cleaned),
+          targetId
+        );
+      }
+    }
+  })();
+
+  res.json({ ok: true, action, achievement_id: ach.id, xp_changed: xpChanged });
 });
 
 app.post('/api/admin/users/:id/items', requireAdmin, (req: AuthRequest, res: Response) => {
@@ -5847,7 +7520,7 @@ app.post('/api/admin/users/:id/items', requireAdmin, (req: AuthRequest, res: Res
   res.json({ ok: true, action, item_id: item.id });
 });
 
-app.post('/api/admin/users/:id/ban', requireAdminOrMod, (req: AuthRequest, res: Response) => {
+app.post('/api/admin/users/:id/ban', requireAdmin, (req: AuthRequest, res: Response) => {
   const { is_banned, ban_reason } = req.body || {};
   const targetUser = db.prepare('SELECT id, nickname, email, role_id FROM users WHERE id = ?').get(req.params.id) as any;
   if (!targetUser) {
@@ -5913,7 +7586,7 @@ app.post('/api/admin/users/:id/role', requireAdmin, (req: AuthRequest, res: Resp
   res.json({ ok: true });
 });
 
-app.get('/api/admin/stats', requireAdminOrMod, (_req: Request, res: Response) => {
+app.get('/api/admin/stats', requireAdmin, (_req: Request, res: Response) => {
   const stats = db.prepare(`
     SELECT
       (SELECT COUNT(*) FROM users) as total_users,
@@ -5972,7 +7645,7 @@ app.post('/api/reports', requireAuth, (req: AuthRequest, res: Response) => {
 });
 
 // Admin Quiz Settings (enable/disable quiz + manual active_quiz_ids mode)
-app.get('/api/admin/quiz/settings', requireAdminOrMod, (_req: Request, res: Response) => {
+app.get('/api/admin/quiz/settings', requireAdmin, (_req: Request, res: Response) => {
   const settings = getQuizSettingsFromDb();
   const poolInfo = getCombinedQuizPool();
   res.json({
@@ -5982,7 +7655,7 @@ app.get('/api/admin/quiz/settings', requireAdminOrMod, (_req: Request, res: Resp
   });
 });
 
-app.put('/api/admin/quiz/settings', requireAdminOrMod, (req: AuthRequest, res: Response) => {
+app.put('/api/admin/quiz/settings', requireAdmin, (req: AuthRequest, res: Response) => {
   const { quiz_enabled, active_quiz_ids } = req.body || {};
 
   db.transaction(() => {
@@ -6013,8 +7686,40 @@ app.put('/api/admin/quiz/settings', requireAdminOrMod, (req: AuthRequest, res: R
   res.json({ ok: true, ...updated });
 });
 
+app.post('/api/admin/quiz/randomize', requireAdmin, (req: AuthRequest, res: Response) => {
+  const mode = req.body?.mode === 'auto' ? 'auto' : 'pick5';
+  const poolInfo = getCombinedQuizPool();
+  const { cycleId } = getMoscow12hCycle();
+
+  if (mode === 'auto') {
+    db.transaction(() => {
+      db.prepare(`
+        INSERT INTO app_meta (key, value) VALUES ('active_quiz_ids', '[]')
+        ON CONFLICT(key) DO UPDATE SET value = '[]'
+      `).run();
+      db.prepare('DELETE FROM daily_challenges WHERE challenge_date = ?').run(cycleId);
+    })();
+    const updated = getQuizSettingsFromDb();
+    res.json({ ok: true, mode, ...updated });
+    return;
+  }
+
+  const validIds = Array.from(poolInfo.validById.keys());
+  const picked = fisherYatesShuffle(validIds).slice(0, Math.min(5, validIds.length));
+
+  db.transaction(() => {
+    db.prepare(`
+      INSERT INTO app_meta (key, value) VALUES ('active_quiz_ids', ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(JSON.stringify(picked));
+    db.prepare('DELETE FROM daily_challenges WHERE challenge_date = ?').run(cycleId);
+  })();
+
+  res.json({ ok: true, mode, quiz_enabled: getQuizSettingsFromDb().quiz_enabled, active_quiz_ids: picked });
+});
+
 // Admin Quiz Question management (with generated discography pool counter + bulk import)
-app.get('/api/admin/quiz-questions', requireAdminOrMod, (_req: Request, res: Response) => {
+app.get('/api/admin/quiz-questions', requireAdmin, (_req: Request, res: Response) => {
   const questions = db.prepare('SELECT * FROM quiz_questions ORDER BY created_at DESC').all();
   const poolInfo = getCombinedQuizPool();
   const settings = getQuizSettingsFromDb();
@@ -6028,7 +7733,7 @@ app.get('/api/admin/quiz-questions', requireAdminOrMod, (_req: Request, res: Res
   });
 });
 
-app.post('/api/admin/quiz-questions/bulk', requireAdminOrMod, (req: AuthRequest, res: Response) => {
+app.post('/api/admin/quiz-questions/bulk', requireAdmin, (req: AuthRequest, res: Response) => {
   const rawInput = req.body?.raw_text ?? req.body?.items;
   const parsed = parseBulkQuizInput(rawInput);
 
@@ -6072,7 +7777,7 @@ app.post('/api/admin/quiz-questions/bulk', requireAdminOrMod, (req: AuthRequest,
   });
 });
 
-app.post('/api/admin/quiz-questions', requireAdminOrMod, (req: AuthRequest, res: Response) => {
+app.post('/api/admin/quiz-questions', requireAdmin, (req: AuthRequest, res: Response) => {
   const { question_ru, question_en, options, correct_index, explanation_ru, explanation_en, difficulty } = req.body || {};
   const cleanRu = typeof question_ru === 'string' ? question_ru.trim() : '';
   const cleanEn = typeof question_en === 'string' && question_en.trim() ? question_en.trim() : cleanRu;
@@ -6108,7 +7813,7 @@ app.post('/api/admin/quiz-questions', requireAdminOrMod, (req: AuthRequest, res:
   res.json({ ok: true, id });
 });
 
-app.put('/api/admin/quiz-questions/:id', requireAdminOrMod, (req: AuthRequest, res: Response) => {
+app.put('/api/admin/quiz-questions/:id', requireAdmin, (req: AuthRequest, res: Response) => {
   const existing = db.prepare('SELECT id FROM quiz_questions WHERE id = ?').get(req.params.id);
   if (!existing) {
     res.status(404).json({ error: 'Quiz question not found' });
@@ -6140,8 +7845,284 @@ app.put('/api/admin/quiz-questions/:id', requireAdminOrMod, (req: AuthRequest, r
   res.json({ ok: true });
 });
 
-app.delete('/api/admin/quiz-questions/:id', requireAdminOrMod, (req: AuthRequest, res: Response) => {
+app.delete('/api/admin/quiz-questions/:id', requireAdmin, (req: AuthRequest, res: Response) => {
   db.prepare('DELETE FROM quiz_questions WHERE id = ?').run(req.params.id);
+  res.json({ ok: true });
+});
+
+// ----------------------------------------------------------------------------
+// API: ADMIN PROMO CODES & SHOP / SHIELDS CRUD
+// ----------------------------------------------------------------------------
+
+const PROTECTED_PROMO_IDS = new Set(['promo_apostles', 'promo_deathmarried']);
+const PROTECTED_PROMO_CODES = new Set(['apostles', 'deathmarried']);
+
+app.get('/api/admin/promos', requireAdmin, (_req: AuthRequest, res: Response) => {
+  const promos = db.prepare(`
+    SELECT pc.*,
+           (SELECT COUNT(*) FROM promo_code_uses pcu WHERE pcu.promo_code_id = pc.id) as uses_count
+    FROM promo_codes pc
+    ORDER BY datetime(pc.created_at) DESC, pc.code ASC
+  `).all();
+  res.json({ promos });
+});
+
+app.post('/api/admin/promos', requireAdmin, (req: AuthRequest, res: Response) => {
+  const normalizedCode = normalizePromoCode(String(req.body?.code || ''));
+  if (!normalizedCode || normalizedCode.length < 2 || normalizedCode.length > 64) {
+    res.status(400).json({ error: 'Промокод должен быть от 2 до 64 символов.' });
+    return;
+  }
+  const xpReward = Math.max(1, Math.min(100000, Math.floor(Number(req.body?.xp_reward) || 0)));
+  if (!xpReward) {
+    res.status(400).json({ error: 'Укажите награду в XP (> 0).' });
+    return;
+  }
+  const existing = db
+    .prepare('SELECT id FROM promo_codes WHERE LOWER(TRIM(code)) = ?')
+    .get(normalizedCode);
+  if (existing) {
+    res.status(409).json({ error: 'Такой промокод уже существует.' });
+    return;
+  }
+
+  const maxUses =
+    req.body?.max_uses !== undefined && req.body?.max_uses !== null && String(req.body.max_uses).trim() !== ''
+      ? Math.max(1, Math.floor(Number(req.body.max_uses)))
+      : null;
+  const expiresAt =
+    typeof req.body?.expires_at === 'string' && req.body.expires_at.trim()
+      ? req.body.expires_at.trim()
+      : null;
+  if (expiresAt && Number.isNaN(Date.parse(expiresAt))) {
+    res.status(400).json({ error: 'Некорректная дата истечения срока.' });
+    return;
+  }
+  const isActive = req.body?.is_active === false || req.body?.is_active === 0 ? 0 : 1;
+  const id = 'promo_' + crypto.randomUUID().slice(0, 8);
+
+  db.prepare(`
+    INSERT INTO promo_codes (id, code, xp_reward, is_active, max_uses, expires_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(id, normalizedCode, xpReward, isActive, maxUses, expiresAt);
+
+  res.json({ ok: true, id });
+});
+
+app.put('/api/admin/promos/:id', requireAdmin, (req: AuthRequest, res: Response) => {
+  const existing = db.prepare('SELECT * FROM promo_codes WHERE id = ?').get(req.params.id) as any;
+  if (!existing) {
+    res.status(404).json({ error: 'Промокод не найден.' });
+    return;
+  }
+  const isProtected =
+    PROTECTED_PROMO_IDS.has(existing.id) ||
+    PROTECTED_PROMO_CODES.has(String(existing.code || '').toLowerCase());
+
+  let nextCode = existing.code;
+  if (typeof req.body?.code === 'string' && req.body.code.trim()) {
+    const norm = normalizePromoCode(req.body.code);
+    if (!norm || norm.length < 2 || norm.length > 64) {
+      res.status(400).json({ error: 'Некорректная длина промокода.' });
+      return;
+    }
+    if (isProtected && norm !== String(existing.code).toLowerCase()) {
+      res.status(403).json({ error: 'Базовый промокод нельзя переименовать.' });
+      return;
+    }
+    const clash = db
+      .prepare('SELECT id FROM promo_codes WHERE LOWER(TRIM(code)) = ? AND id != ?')
+      .get(norm, existing.id);
+    if (clash) {
+      res.status(409).json({ error: 'Такой промокод уже существует.' });
+      return;
+    }
+    nextCode = norm;
+  }
+
+  const nextXp =
+    req.body?.xp_reward !== undefined
+      ? Math.max(1, Math.min(100000, Math.floor(Number(req.body.xp_reward) || 0)))
+      : existing.xp_reward;
+  const nextActive = req.body?.is_active !== undefined ? (req.body.is_active ? 1 : 0) : existing.is_active;
+  const nextMaxUses =
+    req.body?.max_uses !== undefined
+      ? req.body.max_uses === null || String(req.body.max_uses).trim() === ''
+        ? null
+        : Math.max(1, Math.floor(Number(req.body.max_uses)))
+      : existing.max_uses;
+  const nextExpiresAt =
+    req.body?.expires_at !== undefined
+      ? typeof req.body.expires_at === 'string' && req.body.expires_at.trim()
+        ? req.body.expires_at.trim()
+        : null
+      : existing.expires_at;
+  if (nextExpiresAt && Number.isNaN(Date.parse(nextExpiresAt))) {
+    res.status(400).json({ error: 'Некорректная дата истечения срока.' });
+    return;
+  }
+
+  db.prepare(`
+    UPDATE promo_codes SET
+      code = ?, xp_reward = ?, is_active = ?, max_uses = ?, expires_at = ?
+    WHERE id = ?
+  `).run(nextCode, nextXp, nextActive, nextMaxUses, nextExpiresAt, existing.id);
+
+  res.json({ ok: true });
+});
+
+app.delete('/api/admin/promos/:id', requireAdmin, (req: AuthRequest, res: Response) => {
+  const existing = db.prepare('SELECT id, code FROM promo_codes WHERE id = ?').get(req.params.id) as any;
+  if (!existing) {
+    res.status(404).json({ error: 'Промокод не найден.' });
+    return;
+  }
+  if (
+    PROTECTED_PROMO_IDS.has(existing.id) ||
+    PROTECTED_PROMO_CODES.has(String(existing.code || '').toLowerCase())
+  ) {
+    res.status(403).json({ error: 'Системные промокоды «apostles» и «deathmarried» защищены от удаления.' });
+    return;
+  }
+  db.transaction(() => {
+    db.prepare('DELETE FROM promo_code_uses WHERE promo_code_id = ?').run(existing.id);
+    db.prepare('DELETE FROM promo_codes WHERE id = ?').run(existing.id);
+  })();
+  res.json({ ok: true });
+});
+
+app.get('/api/admin/shop/items', requireAdmin, (_req: AuthRequest, res: Response) => {
+  const items = db.prepare(`
+    SELECT si.*,
+           (SELECT COUNT(*) FROM user_inventory ui WHERE ui.item_id = si.id) as owners_count
+    FROM shop_items si
+    ORDER BY si.category ASC, si.cost_xp ASC, si.name_ru ASC
+  `).all();
+  res.json({ items });
+});
+
+app.post('/api/admin/shop/items', requireAdmin, (req: AuthRequest, res: Response) => {
+  const { name_ru, name_en, description_ru, description_en, category, cost_xp, rarity, preview_value, is_active } =
+    req.body || {};
+
+  if (!SHOP_CATEGORY_COLUMN_MAP[category]) {
+    res.status(400).json({ error: 'Некорректная категория предмета.' });
+    return;
+  }
+  const cleanNameRu = String(name_ru || '').trim().slice(0, 80);
+  const cleanNameEn = String(name_en || cleanNameRu).trim().slice(0, 80);
+  if (!cleanNameRu) {
+    res.status(400).json({ error: 'Укажите название предмета.' });
+    return;
+  }
+  const cleanPreview = String(preview_value || '').trim().slice(0, 500);
+  if (!cleanPreview) {
+    res.status(400).json({ error: 'Укажите ключ стиля или значение preview_value.' });
+    return;
+  }
+  const allowedRarities = new Set(['common', 'uncommon', 'rare', 'epic', 'legendary', 'mythic']);
+  const cleanRarity = allowedRarities.has(rarity) ? rarity : 'rare';
+  const cleanCost = Math.max(0, Math.floor(Number(cost_xp) || 0));
+  const id = 'item_' + crypto.randomUUID().slice(0, 8);
+
+  db.prepare(`
+    INSERT INTO shop_items (id, name_ru, name_en, description_ru, description_en, category, cost_xp, rarity, preview_value, is_active)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    id,
+    cleanNameRu,
+    cleanNameEn,
+    String(description_ru || '').trim().slice(0, 300),
+    String(description_en || description_ru || '').trim().slice(0, 300),
+    category,
+    cleanCost,
+    cleanRarity,
+    cleanPreview,
+    is_active === false || is_active === 0 ? 0 : 1
+  );
+
+  res.json({ ok: true, id });
+});
+
+app.put('/api/admin/shop/items/:id', requireAdmin, (req: AuthRequest, res: Response) => {
+  const existing = db.prepare('SELECT * FROM shop_items WHERE id = ?').get(req.params.id) as any;
+  if (!existing) {
+    res.status(404).json({ error: 'Предмет магазина не найден.' });
+    return;
+  }
+
+  const body = req.body || {};
+  const nextCategory = body.category !== undefined ? body.category : existing.category;
+  if (!SHOP_CATEGORY_COLUMN_MAP[nextCategory]) {
+    res.status(400).json({ error: 'Некорректная категория предмета.' });
+    return;
+  }
+  const allowedRarities = new Set(['common', 'uncommon', 'rare', 'epic', 'legendary', 'mythic']);
+  const nextRarity = body.rarity !== undefined && allowedRarities.has(body.rarity) ? body.rarity : existing.rarity;
+  const nextPreview =
+    typeof body.preview_value === 'string' && body.preview_value.trim()
+      ? body.preview_value.trim().slice(0, 500)
+      : existing.preview_value;
+
+  db.transaction(() => {
+    db.prepare(`
+      UPDATE shop_items SET
+        name_ru = COALESCE(?, name_ru),
+        name_en = COALESCE(?, name_en),
+        description_ru = COALESCE(?, description_ru),
+        description_en = COALESCE(?, description_en),
+        category = ?,
+        cost_xp = ?,
+        rarity = ?,
+        preview_value = ?,
+        is_active = ?
+      WHERE id = ?
+    `).run(
+      typeof body.name_ru === 'string' && body.name_ru.trim() ? body.name_ru.trim().slice(0, 80) : null,
+      typeof body.name_en === 'string' && body.name_en.trim() ? body.name_en.trim().slice(0, 80) : null,
+      typeof body.description_ru === 'string' ? body.description_ru.trim().slice(0, 300) : null,
+      typeof body.description_en === 'string' ? body.description_en.trim().slice(0, 300) : null,
+      nextCategory,
+      body.cost_xp !== undefined ? Math.max(0, Math.floor(Number(body.cost_xp) || 0)) : existing.cost_xp,
+      nextRarity,
+      nextPreview,
+      body.is_active !== undefined ? (body.is_active ? 1 : 0) : existing.is_active,
+      existing.id
+    );
+
+    if (nextPreview !== existing.preview_value) {
+      const col = SHOP_CATEGORY_COLUMN_MAP[nextCategory];
+      if (col) {
+        db.prepare(`
+          UPDATE profiles SET ${col} = ?, updated_at = datetime('now')
+          WHERE user_id IN (SELECT user_id FROM user_inventory WHERE item_id = ? AND is_equipped = 1)
+        `).run(nextPreview, existing.id);
+      }
+    }
+  })();
+
+  res.json({ ok: true });
+});
+
+app.delete('/api/admin/shop/items/:id', requireAdmin, (req: AuthRequest, res: Response) => {
+  const existing = db.prepare('SELECT * FROM shop_items WHERE id = ?').get(req.params.id) as any;
+  if (!existing) {
+    res.status(404).json({ error: 'Предмет не найден.' });
+    return;
+  }
+
+  db.transaction(() => {
+    const col = SHOP_CATEGORY_COLUMN_MAP[existing.category];
+    if (col) {
+      db.prepare(`
+        UPDATE profiles SET ${col} = NULL, updated_at = datetime('now')
+        WHERE user_id IN (SELECT user_id FROM user_inventory WHERE item_id = ? AND is_equipped = 1)
+      `).run(existing.id);
+    }
+    db.prepare('DELETE FROM user_inventory WHERE item_id = ?').run(existing.id);
+    db.prepare('DELETE FROM shop_items WHERE id = ?').run(existing.id);
+  })();
+
   res.json({ ok: true });
 });
 
@@ -6164,14 +8145,14 @@ function adjustUserProfileAfterXpRemoval(userId: string, removedXp: number) {
   `).run(nextSpendableXp, nextTotalXp, level, userId);
 }
 
-app.get('/api/admin/leaderboard', requireAdminOrMod, (req: Request, res: Response) => {
+app.get('/api/admin/leaderboard', requireAdmin, (req: Request, res: Response) => {
   const rawTimeframe = String(req.query.timeframe || 'all');
   const timeframe = rawTimeframe === 'weekly' || rawTimeframe === 'monthly' ? rawTimeframe : 'all';
   const rawGame = String(req.query.game || 'all');
-  const gameFilter = rawGame === 'guess-track' || rawGame === 'daily-quiz' ? rawGame : 'all';
+  const ALLOWED_GAMES = new Set(['guess-track', 'daily-quiz', 'guess-lyrics', 'reverse-track', 'speed-track']);
+  const gameFilter = ALLOWED_GAMES.has(rawGame) ? rawGame : 'all';
   const search = String(req.query.search || '').trim().toLowerCase();
-  const today = getUtcDateString();
-  const trackSlot = getUtc12HourSlot();
+  const { cycleId, nextResetAt } = getMoscow12hCycle();
 
   const timeConditionGa =
     timeframe === 'weekly'
@@ -6205,19 +8186,21 @@ app.get('/api/admin/leaderboard', requireAdminOrMod, (req: Request, res: Respons
       (SELECT COALESCE(SUM(ga.score), 0) FROM game_attempts ga WHERE ga.user_id = u.id ${gameFilter !== 'all' ? 'AND ga.game_id = @gameFilter' : ''} ${timeConditionGa}) as game_score,
       (SELECT COALESCE(SUM(ga.xp_earned), 0) FROM game_attempts ga WHERE ga.user_id = u.id ${gameFilter !== 'all' ? 'AND ga.game_id = @gameFilter' : ''} ${timeConditionGa}) as game_xp,
       (SELECT COALESCE(SUM(xt.amount), 0) FROM xp_transactions xt WHERE xt.user_id = u.id AND xt.amount > 0 ${timeConditionXt}) as period_xp,
-      EXISTS(SELECT 1 FROM daily_track_attempts dta WHERE dta.user_id = u.id AND dta.challenge_date = @trackSlot) as completed_today_track,
-      EXISTS(SELECT 1 FROM quiz_attempts qa WHERE qa.user_id = u.id AND qa.challenge_date = @today) as completed_today_quiz
+      EXISTS(SELECT 1 FROM game_completions gc WHERE gc.user_id = u.id AND gc.game_type = 'guess-track' AND gc.cycle_id = @cycleId) as completed_today_track,
+      EXISTS(SELECT 1 FROM game_completions gc WHERE gc.user_id = u.id AND gc.game_type = 'daily-quiz' AND gc.cycle_id = @cycleId) as completed_today_quiz
     FROM users u
     JOIN profiles p ON p.user_id = u.id
-  `).all({ gameFilter, today, trackSlot }) as any[];
+  `).all({ gameFilter, cycleId }) as any[];
 
   const enriched = rows
     .map((row) => {
+      const totalXp = Number(row.total_xp) || 0;
+      const computedLevel = calculateLevelFromXp(totalXp).level;
       const rankXp =
         gameFilter !== 'all'
           ? Number(row.game_xp) || 0
           : timeframe === 'all'
-            ? Number(row.total_xp) || 0
+            ? totalXp
             : Number(row.period_xp) || 0;
       const scopedGamesPlayed =
         gameFilter === 'guess-track'
@@ -6227,6 +8210,8 @@ app.get('/api/admin/leaderboard', requireAdminOrMod, (req: Request, res: Respons
             : Number(row.games_played) || 0;
       return {
         ...row,
+        level: computedLevel,
+        total_xp: totalXp,
         rank_xp: rankXp,
         scoped_games_played: scopedGamesPlayed,
         completed_today_track: Boolean(row.completed_today_track),
@@ -6245,26 +8230,32 @@ app.get('/api/admin/leaderboard', requireAdminOrMod, (req: Request, res: Respons
       return true;
     })
     .sort((a, b) => {
-      if (b.rank_xp !== a.rank_xp) return b.rank_xp - a.rank_xp;
+      if (timeframe === 'all' && gameFilter === 'all') {
+        if (b.level !== a.level) return b.level - a.level;
+        if (b.total_xp !== a.total_xp) return b.total_xp - a.total_xp;
+      } else {
+        if (b.level !== a.level && gameFilter !== 'all') return b.level - a.level;
+        if (b.rank_xp !== a.rank_xp) return b.rank_xp - a.rank_xp;
+      }
       if (b.game_score !== a.game_score) return b.game_score - a.game_score;
       return b.scoped_games_played - a.scoped_games_played;
     });
 
-  const todayTrack = getOrCreateDailyTrackChallenge(trackSlot);
-  const todayQuiz = getOrCreateDailyQuizChallenge(today);
+  const todayTrack = getOrCreateDailyTrackChallenge(cycleId);
+  const todayQuiz = getOrCreateDailyQuizChallenge(cycleId);
   const totalAttempts = (db.prepare('SELECT COUNT(*) as c FROM game_attempts').get() as any)?.c || 0;
-  const todayTrackAttempts = (db.prepare('SELECT COUNT(*) as c FROM daily_track_attempts WHERE challenge_date = ?').get(trackSlot) as any)?.c || 0;
-  const todayQuizAttempts = (db.prepare('SELECT COUNT(*) as c FROM quiz_attempts WHERE challenge_date = ?').get(today) as any)?.c || 0;
+  const todayTrackAttempts = (db.prepare("SELECT COUNT(*) as c FROM game_completions WHERE game_type = 'guess-track' AND cycle_id = ?").get(cycleId) as any)?.c || 0;
+  const todayQuizAttempts = (db.prepare("SELECT COUNT(*) as c FROM game_completions WHERE game_type = 'daily-quiz' AND cycle_id = ?").get(cycleId) as any)?.c || 0;
 
   res.json({
     leaders: enriched,
     timeframe,
     game: gameFilter,
     summary: {
-      today_utc: today,
-      track_slot_utc: trackSlot,
-      next_reset_at: getNextUtcMidnightIso(today),
-      next_track_reset_at: getNextUtc12HourResetIso(trackSlot),
+      today_utc: cycleId,
+      track_slot_utc: cycleId,
+      next_reset_at: nextResetAt,
+      next_track_reset_at: nextResetAt,
       total_ranked: enriched.length,
       total_attempts: totalAttempts,
       today_track_title: todayTrack?.track.title || null,
@@ -6279,17 +8270,18 @@ app.get('/api/admin/leaderboard', requireAdminOrMod, (req: Request, res: Respons
 
 app.post('/api/admin/leaderboard/clear', requireAdmin, (req: AuthRequest, res: Response) => {
   const rawScope = String(req.body?.scope || 'all').trim();
-  const allowedScopes = new Set(['all', 'weekly', 'monthly', 'guess-track', 'daily-quiz', 'daily-attempts']);
+  const allowedScopes = new Set(['all', 'weekly', 'monthly', 'guess-track', 'daily-quiz', 'guess-lyrics', 'reverse-track', 'speed-track', 'daily-attempts']);
   if (!allowedScopes.has(rawScope)) {
     res.status(400).json({ error: 'Invalid leaderboard clear scope.' });
     return;
   }
 
-  const today = getUtcDateString();
+  const { cycleId } = getMoscow12hCycle();
   const removed = {
     game_attempts: 0,
     daily_track_attempts: 0,
     quiz_attempts: 0,
+    game_completions: 0,
     xp_transactions: 0,
     profiles_updated: 0,
   };
@@ -6299,7 +8291,9 @@ app.post('/api/admin/leaderboard/clear', requireAdmin, (req: AuthRequest, res: R
       removed.game_attempts = db.prepare('DELETE FROM game_attempts').run().changes;
       removed.daily_track_attempts = db.prepare('DELETE FROM daily_track_attempts').run().changes;
       removed.quiz_attempts = db.prepare('DELETE FROM quiz_attempts').run().changes;
-      removed.xp_transactions = db.prepare("DELETE FROM xp_transactions WHERE source IN ('guess_track', 'daily_quiz') OR amount > 0").run().changes;
+      removed.game_completions = db.prepare('DELETE FROM game_completions').run().changes;
+      try { db.prepare('DELETE FROM daily_mini_game_attempts').run(); } catch {}
+      removed.xp_transactions = db.prepare("DELETE FROM xp_transactions WHERE source IN ('guess_track', 'daily_quiz', 'guess_lyrics', 'reverse_track', 'speed_track') OR amount > 0").run().changes;
       removed.profiles_updated = db.prepare(`
         UPDATE profiles
         SET xp = 0, total_xp = 0, level = 1, daily_streak = 0, last_active_date = NULL, updated_at = datetime('now')
@@ -6316,48 +8310,49 @@ app.post('/api/admin/leaderboard/clear', requireAdmin, (req: AuthRequest, res: R
       removed.game_attempts = db.prepare(`DELETE FROM game_attempts WHERE datetime(created_at) >= datetime('now', ?)`).run(windowSql).changes;
       removed.daily_track_attempts = db.prepare(`DELETE FROM daily_track_attempts WHERE datetime(created_at) >= datetime('now', ?)`).run(windowSql).changes;
       removed.quiz_attempts = db.prepare(`DELETE FROM quiz_attempts WHERE datetime(created_at) >= datetime('now', ?)`).run(windowSql).changes;
+      removed.game_completions = db.prepare(`DELETE FROM game_completions WHERE datetime(created_at) >= datetime('now', ?)`).run(windowSql).changes;
       removed.xp_transactions = db.prepare(`DELETE FROM xp_transactions WHERE amount > 0 AND datetime(created_at) >= datetime('now', ?)`).run(windowSql).changes;
 
       for (const item of xpByUser) {
         adjustUserProfileAfterXpRemoval(item.user_id, item.sum_xp);
         removed.profiles_updated += 1;
       }
-    } else if (rawScope === 'guess-track') {
+    } else if (rawScope === 'guess-track' || rawScope === 'daily-quiz' || rawScope === 'guess-lyrics' || rawScope === 'reverse-track' || rawScope === 'speed-track') {
+      const xpSourceMap: Record<string, string> = {
+        'guess-track': 'guess_track',
+        'daily-quiz': 'daily_quiz',
+        'guess-lyrics': 'guess_lyrics',
+        'reverse-track': 'reverse_track',
+        'speed-track': 'speed_track',
+      };
+      const xpSource = xpSourceMap[rawScope];
       const xpByUser = db.prepare(`
         SELECT user_id, COALESCE(SUM(xp_earned), 0) as sum_xp
         FROM game_attempts
-        WHERE game_id = 'guess-track'
+        WHERE game_id = ?
         GROUP BY user_id
-      `).all() as Array<{ user_id: string; sum_xp: number }>;
+      `).all(rawScope) as Array<{ user_id: string; sum_xp: number }>;
 
-      removed.game_attempts = db.prepare("DELETE FROM game_attempts WHERE game_id = 'guess-track'").run().changes;
-      removed.daily_track_attempts = db.prepare('DELETE FROM daily_track_attempts').run().changes;
-      removed.xp_transactions = db.prepare("DELETE FROM xp_transactions WHERE source = 'guess_track'").run().changes;
-
-      for (const item of xpByUser) {
-        adjustUserProfileAfterXpRemoval(item.user_id, item.sum_xp);
-        removed.profiles_updated += 1;
+      removed.game_attempts = db.prepare('DELETE FROM game_attempts WHERE game_id = ?').run(rawScope).changes;
+      if (rawScope === 'guess-track') {
+        removed.daily_track_attempts = db.prepare('DELETE FROM daily_track_attempts').run().changes;
+      } else if (rawScope === 'daily-quiz') {
+        removed.quiz_attempts = db.prepare('DELETE FROM quiz_attempts').run().changes;
+      } else {
+        try { db.prepare('DELETE FROM daily_mini_game_attempts WHERE game_id = ?').run(rawScope); } catch {}
       }
-    } else if (rawScope === 'daily-quiz') {
-      const xpByUser = db.prepare(`
-        SELECT user_id, COALESCE(SUM(xp_earned), 0) as sum_xp
-        FROM game_attempts
-        WHERE game_id = 'daily-quiz'
-        GROUP BY user_id
-      `).all() as Array<{ user_id: string; sum_xp: number }>;
-
-      removed.game_attempts = db.prepare("DELETE FROM game_attempts WHERE game_id = 'daily-quiz'").run().changes;
-      removed.quiz_attempts = db.prepare('DELETE FROM quiz_attempts').run().changes;
-      removed.xp_transactions = db.prepare("DELETE FROM xp_transactions WHERE source = 'daily_quiz'").run().changes;
+      removed.game_completions = db.prepare('DELETE FROM game_completions WHERE game_type = ?').run(rawScope).changes;
+      removed.xp_transactions = db.prepare('DELETE FROM xp_transactions WHERE source = ?').run(xpSource).changes;
 
       for (const item of xpByUser) {
         adjustUserProfileAfterXpRemoval(item.user_id, item.sum_xp);
         removed.profiles_updated += 1;
       }
     } else if (rawScope === 'daily-attempts') {
-      const trackSlot = getUtc12HourSlot();
-      removed.daily_track_attempts = db.prepare('DELETE FROM daily_track_attempts WHERE challenge_date IN (?, ?)').run(trackSlot, today).changes;
-      removed.quiz_attempts = db.prepare('DELETE FROM quiz_attempts WHERE challenge_date = ?').run(today).changes;
+      removed.daily_track_attempts = db.prepare('DELETE FROM daily_track_attempts WHERE challenge_date = ?').run(cycleId).changes;
+      removed.quiz_attempts = db.prepare('DELETE FROM quiz_attempts WHERE challenge_date = ?').run(cycleId).changes;
+      try { db.prepare('DELETE FROM daily_mini_game_attempts WHERE cycle_id = ?').run(cycleId); } catch {}
+      removed.game_completions = db.prepare('DELETE FROM game_completions WHERE cycle_id = ?').run(cycleId).changes;
     }
 
     db.prepare(`
@@ -6377,7 +8372,7 @@ app.post('/api/admin/leaderboard/clear', requireAdmin, (req: AuthRequest, res: R
 app.delete('/api/admin/leaderboard/users/:userId', requireAdmin, (req: AuthRequest, res: Response) => {
   const userId = String(req.params.userId || '').trim();
   const rawScope = String(req.query.scope || req.body?.scope || 'all').trim();
-  const allowedScopes = new Set(['all', 'guess-track', 'daily-quiz', 'daily-attempts']);
+  const allowedScopes = new Set(['all', 'guess-track', 'daily-quiz', 'guess-lyrics', 'reverse-track', 'speed-track', 'daily-attempts']);
   if (!allowedScopes.has(rawScope)) {
     res.status(400).json({ error: 'Invalid user leaderboard reset scope.' });
     return;
@@ -6391,11 +8386,12 @@ app.delete('/api/admin/leaderboard/users/:userId', requireAdmin, (req: AuthReque
     return;
   }
 
-  const today = getUtcDateString();
+  const { cycleId } = getMoscow12hCycle();
   const removed = {
     game_attempts: 0,
     daily_track_attempts: 0,
     quiz_attempts: 0,
+    game_completions: 0,
     xp_transactions: 0,
   };
 
@@ -6404,28 +8400,40 @@ app.delete('/api/admin/leaderboard/users/:userId', requireAdmin, (req: AuthReque
       removed.game_attempts = db.prepare('DELETE FROM game_attempts WHERE user_id = ?').run(userId).changes;
       removed.daily_track_attempts = db.prepare('DELETE FROM daily_track_attempts WHERE user_id = ?').run(userId).changes;
       removed.quiz_attempts = db.prepare('DELETE FROM quiz_attempts WHERE user_id = ?').run(userId).changes;
-      removed.xp_transactions = db.prepare("DELETE FROM xp_transactions WHERE user_id = ? AND (source IN ('guess_track', 'daily_quiz') OR amount > 0)").run(userId).changes;
+      removed.game_completions = db.prepare('DELETE FROM game_completions WHERE user_id = ?').run(userId).changes;
+      try { db.prepare('DELETE FROM daily_mini_game_attempts WHERE user_id = ?').run(userId); } catch {}
+      removed.xp_transactions = db.prepare("DELETE FROM xp_transactions WHERE user_id = ? AND (source IN ('guess_track', 'daily_quiz', 'guess_lyrics', 'reverse_track', 'speed_track') OR amount > 0)").run(userId).changes;
       db.prepare(`
         UPDATE profiles
         SET xp = 0, total_xp = 0, level = 1, daily_streak = 0, last_active_date = NULL, updated_at = datetime('now')
         WHERE user_id = ?
       `).run(userId);
-    } else if (rawScope === 'guess-track') {
-      const sumRow = db.prepare("SELECT COALESCE(SUM(xp_earned), 0) as sum_xp FROM game_attempts WHERE user_id = ? AND game_id = 'guess-track'").get(userId) as any;
-      removed.game_attempts = db.prepare("DELETE FROM game_attempts WHERE user_id = ? AND game_id = 'guess-track'").run(userId).changes;
-      removed.daily_track_attempts = db.prepare('DELETE FROM daily_track_attempts WHERE user_id = ?').run(userId).changes;
-      removed.xp_transactions = db.prepare("DELETE FROM xp_transactions WHERE user_id = ? AND source = 'guess_track'").run(userId).changes;
-      adjustUserProfileAfterXpRemoval(userId, Number(sumRow?.sum_xp) || 0);
-    } else if (rawScope === 'daily-quiz') {
-      const sumRow = db.prepare("SELECT COALESCE(SUM(xp_earned), 0) as sum_xp FROM game_attempts WHERE user_id = ? AND game_id = 'daily-quiz'").get(userId) as any;
-      removed.game_attempts = db.prepare("DELETE FROM game_attempts WHERE user_id = ? AND game_id = 'daily-quiz'").run(userId).changes;
-      removed.quiz_attempts = db.prepare('DELETE FROM quiz_attempts WHERE user_id = ?').run(userId).changes;
-      removed.xp_transactions = db.prepare("DELETE FROM xp_transactions WHERE user_id = ? AND source = 'daily_quiz'").run(userId).changes;
+    } else if (rawScope === 'guess-track' || rawScope === 'daily-quiz' || rawScope === 'guess-lyrics' || rawScope === 'reverse-track' || rawScope === 'speed-track') {
+      const xpSourceMap: Record<string, string> = {
+        'guess-track': 'guess_track',
+        'daily-quiz': 'daily_quiz',
+        'guess-lyrics': 'guess_lyrics',
+        'reverse-track': 'reverse_track',
+        'speed-track': 'speed_track',
+      };
+      const xpSource = xpSourceMap[rawScope];
+      const sumRow = db.prepare('SELECT COALESCE(SUM(xp_earned), 0) as sum_xp FROM game_attempts WHERE user_id = ? AND game_id = ?').get(userId, rawScope) as any;
+      removed.game_attempts = db.prepare('DELETE FROM game_attempts WHERE user_id = ? AND game_id = ?').run(userId, rawScope).changes;
+      if (rawScope === 'guess-track') {
+        removed.daily_track_attempts = db.prepare('DELETE FROM daily_track_attempts WHERE user_id = ?').run(userId).changes;
+      } else if (rawScope === 'daily-quiz') {
+        removed.quiz_attempts = db.prepare('DELETE FROM quiz_attempts WHERE user_id = ?').run(userId).changes;
+      } else {
+        try { db.prepare('DELETE FROM daily_mini_game_attempts WHERE user_id = ? AND game_id = ?').run(userId, rawScope); } catch {}
+      }
+      removed.game_completions = db.prepare('DELETE FROM game_completions WHERE user_id = ? AND game_type = ?').run(userId, rawScope).changes;
+      removed.xp_transactions = db.prepare('DELETE FROM xp_transactions WHERE user_id = ? AND source = ?').run(userId, xpSource).changes;
       adjustUserProfileAfterXpRemoval(userId, Number(sumRow?.sum_xp) || 0);
     } else if (rawScope === 'daily-attempts') {
-      const trackSlot = getUtc12HourSlot();
-      removed.daily_track_attempts = db.prepare('DELETE FROM daily_track_attempts WHERE user_id = ? AND challenge_date IN (?, ?)').run(userId, trackSlot, today).changes;
-      removed.quiz_attempts = db.prepare('DELETE FROM quiz_attempts WHERE user_id = ? AND challenge_date = ?').run(userId, today).changes;
+      removed.daily_track_attempts = db.prepare('DELETE FROM daily_track_attempts WHERE user_id = ? AND challenge_date = ?').run(userId, cycleId).changes;
+      removed.quiz_attempts = db.prepare('DELETE FROM quiz_attempts WHERE user_id = ? AND challenge_date = ?').run(userId, cycleId).changes;
+      try { db.prepare('DELETE FROM daily_mini_game_attempts WHERE user_id = ? AND cycle_id = ?').run(userId, cycleId); } catch {}
+      removed.game_completions = db.prepare('DELETE FROM game_completions WHERE user_id = ? AND cycle_id = ?').run(userId, cycleId).changes;
     }
 
     db.prepare(`
@@ -6477,7 +8485,7 @@ function indexUploadedMediaMetadata(
   return fileId;
 }
 
-// Step 1 of direct cloud upload (bypasses Vercel 4.5MB serverless body limit for large MP3/WAV files)
+// Step 1 of direct cloud upload (bypasses Vercel 4.5MB serverless body limit)
 app.post('/api/upload/signed-url', uploadRateLimit, requireAuth, async (req: AuthRequest, res: Response) => {
   const { filename, mimetype, size } = req.body || {};
   if (typeof filename !== 'string' || !filename.trim()) {
@@ -6489,10 +8497,11 @@ app.post('/api/upload/signed-url', uploadRateLimit, requireAuth, async (req: Aut
     res.status(413).json({ error: 'File exceeds maximum allowed size of 100 MB.' });
     return;
   }
-  const classified = classifyMediaUpload(filename, typeof mimetype === 'string' ? mimetype : '');
-  if (!classified.allowed) {
-    res.status(400).json({
-      error: 'Disallowed file type. Only audio (MP3, WAV, FLAC, OGG, M4A), images (JPG, PNG, WEBP, GIF), and video (MP4, WEBM, MOV) are accepted.',
+  const safeMime = typeof mimetype === 'string' ? mimetype : '';
+  const policy = validateUploadPolicy(filename, safeMime, numericSize);
+  if (!policy.ok) {
+    res.status(policy.status || 400).json({
+      error: policy.error,
     });
     return;
   }
@@ -6502,7 +8511,7 @@ app.post('/api/upload/signed-url', uploadRateLimit, requireAuth, async (req: Aut
     return;
   }
 
-  const storedFilename = buildSafeUploadFilename(filename, typeof mimetype === 'string' ? mimetype : '');
+  const storedFilename = buildSafeUploadFilename(filename, safeMime);
   const signed = await createSignedMediaUploadUrl(storedFilename);
   if (!signed) {
     res.json({ direct: false, reason: 'signed-url-unavailable' });
@@ -6514,7 +8523,7 @@ app.post('/api/upload/signed-url', uploadRateLimit, requireAuth, async (req: Aut
     signedUrl: signed.signedUrl,
     storedFilename,
     url: `/uploads/${storedFilename}`,
-    kind: classified.kind,
+    kind: policy.kind,
   });
 });
 
@@ -6527,15 +8536,15 @@ app.post('/api/upload/complete', uploadRateLimit, requireAuth, (req: AuthRequest
   }
   const safeOriginal = typeof originalName === 'string' && originalName.trim() ? originalName.trim() : storedFilename;
   const safeMime = typeof mimetype === 'string' ? mimetype : 'application/octet-stream';
-  const classified = classifyMediaUpload(safeOriginal, safeMime);
-  if (!classified.allowed) {
-    res.status(400).json({ error: 'Disallowed media type.' });
+  const numericSize = Math.max(0, Number(size) || 0);
+  const policy = validateUploadPolicy(safeOriginal, safeMime, numericSize);
+  if (!policy.ok) {
+    res.status(policy.status || 400).json({ error: policy.error || 'Disallowed media type.' });
     return;
   }
 
   const fileUrl = `/uploads/${path.basename(storedFilename)}`;
-  const numericSize = Math.max(0, Number(size) || 0);
-  const fileId = indexUploadedMediaMetadata(classified.kind, safeOriginal, safeMime, numericSize, fileUrl, req.user?.id || null);
+  const fileId = indexUploadedMediaMetadata(policy.kind, safeOriginal, safeMime, numericSize, fileUrl, req.user?.id || null);
 
   res.json({
     id: fileId,
@@ -6543,9 +8552,9 @@ app.post('/api/upload/complete', uploadRateLimit, requireAuth, (req: AuthRequest
     filename: safeOriginal,
     mimetype: safeMime,
     size: numericSize,
-    is_audio: classified.kind === 'audio',
-    is_image: classified.kind === 'image',
-    is_video: classified.kind === 'video',
+    is_audio: policy.kind === 'audio',
+    is_image: policy.kind === 'image',
+    is_video: policy.kind === 'video',
     storage_backend: 'supabase-storage',
   });
 });
@@ -6566,11 +8575,21 @@ app.post('/api/upload', uploadRateLimit, requireAuth, (req: AuthRequest, res: Re
       return;
     }
 
+    const policy = validateUploadPolicy(req.file.originalname, req.file.mimetype, req.file.size);
+    if (!policy.ok) {
+      if (req.file.path && fs.existsSync(req.file.path)) {
+        try {
+          fs.unlinkSync(req.file.path);
+        } catch {}
+      }
+      res.status(policy.status || 400).json({ error: policy.error || 'File upload rejected.' });
+      return;
+    }
+
     const fileUrl = `/uploads/${req.file.filename}`;
-    const classified = classifyMediaUpload(req.file.originalname, req.file.mimetype);
-    const isAudio = classified.kind === 'audio';
-    const isImage = classified.kind === 'image';
-    const isVideo = classified.kind === 'video';
+    const isAudio = policy.kind === 'audio';
+    const isImage = policy.kind === 'image';
+    const isVideo = policy.kind === 'video';
 
     let fileBuffer: Buffer | null = null;
     if (req.file.path && fs.existsSync(req.file.path)) {
@@ -6607,7 +8626,7 @@ app.post('/api/upload', uploadRateLimit, requireAuth, (req: AuthRequest, res: Re
     }
 
     const fileId = indexUploadedMediaMetadata(
-      classified.kind,
+      policy.kind,
       req.file.originalname,
       req.file.mimetype,
       req.file.size,
@@ -6629,7 +8648,7 @@ app.post('/api/upload', uploadRateLimit, requireAuth, (req: AuthRequest, res: Re
   });
 });
 
-// Serve uploaded files from disk first, falling back to SQLite uploaded_blobs, then Supabase Storage (with HTTP Range streaming)
+// Serve uploaded files from disk first, falling back to SQLite uploaded_blobs, then Supabase Storage (with HTTP Range streaming & CDN immutable caching)
 app.get('/uploads/:filename', async (req: Request, res: Response, next: NextFunction) => {
   const filename = path.basename(req.params.filename || '');
   if (!filename || filename.includes('..')) {
@@ -6658,18 +8677,32 @@ app.get('/uploads/:filename', async (req: Request, res: Response, next: NextFunc
       const total = buffer.length;
       res.setHeader('Content-Type', row.mime_type || 'application/octet-stream');
       res.setHeader('Accept-Ranges', 'bytes');
-      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+      res.setHeader('Cache-Control', 'public, max-age=31536000, s-maxage=31536000, immutable');
 
       const range = req.headers.range;
       if (range) {
-        const parts = range.replace(/bytes=/, '').split('-');
-        const start = parseInt(parts[0], 10);
-        const end = parts[1] ? parseInt(parts[1], 10) : total - 1;
-        if (!isNaN(start) && !isNaN(end) && start >= 0 && end < total && start <= end) {
-          res.status(206);
-          res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
-          res.setHeader('Content-Length', String(end - start + 1));
-          res.end(buffer.subarray(start, end + 1));
+        const match = /^bytes=(\d*)-(\d*)$/i.exec(range.trim());
+        if (match) {
+          let start: number;
+          let end: number;
+          if (match[1] === '' && match[2] !== '') {
+            const suffix = parseInt(match[2], 10);
+            start = Math.max(0, total - suffix);
+            end = total - 1;
+          } else {
+            start = match[1] ? parseInt(match[1], 10) : 0;
+            end = match[2] ? Math.min(parseInt(match[2], 10), total - 1) : total - 1;
+          }
+          if (!isNaN(start) && !isNaN(end) && start >= 0 && start < total && start <= end) {
+            res.status(206);
+            res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
+            res.setHeader('Content-Length', String(end - start + 1));
+            res.end(buffer.subarray(start, end + 1));
+            return;
+          }
+          res.status(416);
+          res.setHeader('Content-Range', `bytes */${total}`);
+          res.end();
           return;
         }
       }
@@ -6679,13 +8712,13 @@ app.get('/uploads/:filename', async (req: Request, res: Response, next: NextFunc
       return;
     }
 
-    // Fallback to Supabase Storage (supports large MP3/WAV files >25MB and direct signed uploads)
+    // Fallback to Supabase Storage (supports audio seeking via HTTP Range / 206 Partial Content)
     const cloudMedia = await fetchMediaFromSupabase(filename, req.headers.range);
     if (cloudMedia) {
       res.status(cloudMedia.status);
       res.setHeader('Content-Type', cloudMedia.contentType);
       res.setHeader('Accept-Ranges', 'bytes');
-      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+      res.setHeader('Cache-Control', 'public, max-age=31536000, s-maxage=31536000, immutable');
       if (cloudMedia.contentRange) {
         res.setHeader('Content-Range', cloudMedia.contentRange);
       }
@@ -6702,8 +8735,16 @@ app.get('/uploads/:filename', async (req: Request, res: Response, next: NextFunc
 });
 
 // Serve uploaded static files & audio/asset resources
-app.use('/uploads', express.static(uploadDir));
-app.use('/uploads', express.static(path.resolve(process.cwd(), 'public', 'uploads')));
+const uploadsStaticOptions = {
+  maxAge: '365d',
+  immutable: true,
+  setHeaders: (res: Response) => {
+    res.setHeader('Cache-Control', 'public, max-age=31536000, s-maxage=31536000, immutable');
+    res.setHeader('Accept-Ranges', 'bytes');
+  },
+};
+app.use('/uploads', express.static(uploadDir, uploadsStaticOptions));
+app.use('/uploads', express.static(path.resolve(process.cwd(), 'public', 'uploads'), uploadsStaticOptions));
 app.use('/audio', express.static(path.resolve(process.cwd(), 'public', 'audio')));
 app.use('/assets', express.static(path.resolve(process.cwd(), 'public', 'assets')));
 
@@ -6734,6 +8775,10 @@ app.use('/api', (err: any, _req: Request, res: Response, _next: NextFunction) =>
 // ----------------------------------------------------------------------------
 
 async function startServer() {
+  if (isSupabaseConfigured()) {
+    await triggerColdStartRestoreOnce();
+  }
+
   const httpServer = http.createServer(app);
   let viteServer: { close: () => Promise<void> } | null = null;
 
