@@ -180,6 +180,7 @@ export const GamesView: React.FC = () => {
   // -------------------------------------------------------------------------
   const [guessRound, setGuessRound] = useState<DailyTrackRound | null>(null);
   const [isSnippetPlaying, setIsSnippetPlaying] = useState(false);
+  const [guessAudioLoading, setGuessAudioLoading] = useState(false);
   const [snippetElapsed, setSnippetElapsed] = useState(0);
   const [snippetEffectiveDuration, setSnippetEffectiveDuration] = useState(5);
   const [selectedGuessOption, setSelectedGuessOption] = useState<string | null>(null);
@@ -337,6 +338,9 @@ export const GamesView: React.FC = () => {
       speedAudioRef.current.onerror = null;
       speedAudioRef.current.ontimeupdate = null;
       speedAudioRef.current.onloadedmetadata = null;
+      speedAudioRef.current.onplaying = null;
+      speedAudioRef.current.onwaiting = null;
+      speedAudioRef.current.oncanplay = null;
       speedAudioRef.current.src = '';
       speedAudioRef.current = null;
     }
@@ -356,6 +360,7 @@ export const GamesView: React.FC = () => {
         } catch {}
       }
     }
+    setGuessAudioLoading(false);
     setIsSnippetPlaying(false);
     setSnippetElapsed(0);
   }, []);
@@ -367,6 +372,9 @@ export const GamesView: React.FC = () => {
       snippetAudioRef.current.onerror = null;
       snippetAudioRef.current.ontimeupdate = null;
       snippetAudioRef.current.onseeking = null;
+      snippetAudioRef.current.onwaiting = null;
+      snippetAudioRef.current.onplaying = null;
+      snippetAudioRef.current.oncanplay = null;
       snippetAudioRef.current.src = '';
       snippetAudioRef.current = null;
     }
@@ -710,7 +718,7 @@ export const GamesView: React.FC = () => {
   };
 
   const toggleSnippetAudio = () => {
-    if (!guessRound) return;
+    if (!guessRound || guessAudioLoading) return;
     setGuessError(null);
     if (isSnippetPlaying) {
       stopSnippetPlayback(true);
@@ -722,7 +730,9 @@ export const GamesView: React.FC = () => {
     if (!audio || audio.src !== resolvedTargetSrc) {
       destroySnippetAudio();
       audio = new Audio(guessRound.audio_url);
-      audio.preload = 'none';
+      audio.preload = 'metadata';
+      (audio as unknown as { playsInline?: boolean }).playsInline = true;
+      audio.setAttribute('playsinline', '');
       snippetAudioRef.current = audio;
     }
 
@@ -744,6 +754,9 @@ export const GamesView: React.FC = () => {
       setGuessError('Ошибка воспроизведения аудиофайла.');
     };
     audio.ontimeupdate = enforceBounds;
+    audio.onwaiting = () => setGuessAudioLoading(true);
+    audio.oncanplay = () => setGuessAudioLoading(false);
+    audio.onplaying = () => setGuessAudioLoading(false);
 
     const startPlayback = () => {
       if (!audio) return;
@@ -757,6 +770,7 @@ export const GamesView: React.FC = () => {
       audio
         .play()
         .then(() => {
+          setGuessAudioLoading(false);
           setIsSnippetPlaying(true);
           setSnippetElapsed(0);
           if (snippetTimerRef.current !== null) window.clearInterval(snippetTimerRef.current);
@@ -768,6 +782,7 @@ export const GamesView: React.FC = () => {
         });
     };
 
+    setGuessAudioLoading(true);
     if (audio.readyState >= 1) {
       startPlayback();
     } else {
@@ -780,7 +795,7 @@ export const GamesView: React.FC = () => {
     }
   };
 
-  // Reverse Track Web Audio handler (synchronously unlocks AudioContext inside tap & loads via 1.5MB Range chunks)
+  // Reverse Track Web Audio handler (synchronously unlocks AudioContext inside tap & loads minimal Range chunks)
   const toggleReverseAudio = async () => {
     if (!reverseRound) return;
     setReverseError(null);
@@ -810,7 +825,10 @@ export const GamesView: React.FC = () => {
       await resumePromise;
       if (controller.signal.aborted || reqId !== reverseRequestIdRef.current) return;
 
-      const buffer = await fetchAndDecodeAudio(reverseRound.audio_url, ctx, controller.signal);
+      const buffer = await fetchAndDecodeAudio(reverseRound.audio_url, ctx, {
+        signal: controller.signal,
+        snippetStart: reverseRound.snippet_start,
+      });
       if (controller.signal.aborted || reqId !== reverseRequestIdRef.current) return;
 
       if (ctx.state === 'suspended') {
@@ -897,7 +915,7 @@ export const GamesView: React.FC = () => {
   };
 
   const toggleSpeedAudio = () => {
-    if (!speedRound) return;
+    if (!speedRound || speedAudioDecoding) return;
     setSpeedError(null);
     if (speedPlaying) {
       stopSpeedPlayback(true);
@@ -942,6 +960,8 @@ export const GamesView: React.FC = () => {
     };
 
     audio.onloadedmetadata = syncBoundsAndSeek;
+    audio.onwaiting = () => setSpeedAudioDecoding(true);
+    audio.oncanplay = () => setSpeedAudioDecoding(false);
     audio.onplaying = () => {
       if (!audio) return;
       applySpeedAudioProperties(audio, rate);
@@ -1021,7 +1041,7 @@ export const GamesView: React.FC = () => {
         }
         if (data.correct) confetti({ particleCount: 35, spread: 55, origin: { y: 0.7 } });
         if (data.newly_unlocked_achievements?.length > 0) dispatchAchievementUnlocked(data.newly_unlocked_achievements);
-        if (user) refresh();
+        if (user) await refresh();
       } else {
         setSelectedGuessOption(null);
         setGuessError(data?.error || 'Не удалось проверить ответ.');
@@ -1065,7 +1085,7 @@ export const GamesView: React.FC = () => {
         setAlreadyCompletedDaily(true);
         if (data.correct_count === data.total) confetti({ particleCount: 60, spread: 70, origin: { y: 0.6 } });
         if (data.newly_unlocked_achievements?.length > 0) dispatchAchievementUnlocked(data.newly_unlocked_achievements);
-        if (user) refresh();
+        if (user) await refresh();
       } else {
         setQuizError(data?.error || 'Не удалось отправить ответы.');
         if (res.status === 409 || data?.already_completed) {
@@ -1120,7 +1140,7 @@ export const GamesView: React.FC = () => {
         }
         if (data.correct) confetti({ particleCount: 35, spread: 55, origin: { y: 0.7 } });
         if (data.newly_unlocked_achievements?.length > 0) dispatchAchievementUnlocked(data.newly_unlocked_achievements);
-        if (user) refresh();
+        if (user) await refresh();
       } else {
         setSelectedLyricOption(null);
         setLyricsError(data?.error || 'Не удалось проверить ответ.');
@@ -1177,7 +1197,7 @@ export const GamesView: React.FC = () => {
         }
         if (data.correct) confetti({ particleCount: 40, spread: 60, origin: { y: 0.7 } });
         if (data.newly_unlocked_achievements?.length > 0) dispatchAchievementUnlocked(data.newly_unlocked_achievements);
-        if (user) refresh();
+        if (user) await refresh();
       } else {
         setSelectedReverseOption(null);
         setReverseError(data?.error || 'Не удалось проверить ответ.');
@@ -1235,7 +1255,7 @@ export const GamesView: React.FC = () => {
         }
         if (data.correct) confetti({ particleCount: 40, spread: 60, origin: { y: 0.7 } });
         if (data.newly_unlocked_achievements?.length > 0) dispatchAchievementUnlocked(data.newly_unlocked_achievements);
-        if (user) refresh();
+        if (user) await refresh();
       } else {
         setSelectedSpeedOption(null);
         setSpeedError(data?.error || 'Не удалось проверить ответ.');
@@ -1313,7 +1333,17 @@ export const GamesView: React.FC = () => {
 
         {user ? (
           <div className="mt-4 inline-flex flex-wrap items-center justify-center gap-3 px-4 py-2 bg-[#100f13] border border-white/[0.08] rounded-lg font-mono text-xs tabular-nums">
-            <div className="text-[#ded8ce] font-semibold">{user.xp} XP</div>
+            <div
+              className="text-[#ded8ce] font-semibold"
+              title="Доступный баланс XP для магазина (рейтинг и уровень считаются по общему заработанному XP)"
+            >
+              {user.xp} XP
+              {typeof user.total_xp === 'number' && user.total_xp > user.xp && (
+                <span className="ml-1.5 text-[10px] font-normal text-[#8e877e]">
+                  (всего {user.total_xp})
+                </span>
+              )}
+            </div>
             <span className="text-[#423d38]">·</span>
             <div className="text-[#8e877e]">
               {t('level').toUpperCase()} {user.level}
@@ -1407,10 +1437,13 @@ export const GamesView: React.FC = () => {
                   <button
                     type="button"
                     onClick={toggleSnippetAudio}
-                    className="w-16 h-16 rounded-full bg-white/[0.06] hover:bg-white/[0.14] border border-white/[0.15] text-white flex items-center justify-center transition-all cursor-pointer hover:scale-105 shadow-lg"
+                    disabled={guessAudioLoading}
+                    className="w-16 h-16 rounded-full bg-white/[0.06] hover:bg-white/[0.14] border border-white/[0.15] text-white flex items-center justify-center transition-all cursor-pointer hover:scale-105 shadow-lg disabled:opacity-60"
                     aria-label={isSnippetPlaying ? 'Пауза' : 'Слушать 5-секундный фрагмент'}
                   >
-                    {isSnippetPlaying ? (
+                    {guessAudioLoading ? (
+                      <Loader2 className="w-6 h-6 animate-spin" />
+                    ) : isSnippetPlaying ? (
                       <Pause className="w-6 h-6 fill-current" />
                     ) : (
                       <Play className="w-6 h-6 fill-current ml-1" />
@@ -1441,7 +1474,13 @@ export const GamesView: React.FC = () => {
                     </div>
                     <div className="flex items-center justify-between font-mono text-[10px] text-[#8e877e] tabular-nums">
                       <span>{snippetElapsed.toFixed(1)}s</span>
-                      <span>{isSnippetPlaying ? 'Воспроизведение...' : 'Фрагмент 5 сек'}</span>
+                      <span>
+                        {guessAudioLoading
+                          ? 'Загрузка фрагмента...'
+                          : isSnippetPlaying
+                            ? 'Воспроизведение...'
+                            : 'Фрагмент 5 сек'}
+                      </span>
                       <span>{snippetEffectiveDuration.toFixed(1)}s</span>
                     </div>
                   </div>
@@ -2020,7 +2059,7 @@ export const GamesView: React.FC = () => {
                       <span>{reverseElapsed.toFixed(1)}s</span>
                       <span>
                         {reverseAudioDecoding
-                          ? 'Декодирование аудио...'
+                          ? 'Загрузка и подготовка фрагмента...'
                           : reversePlaying
                             ? 'Играет задом наперёд...'
                             : 'Нажмите, чтобы слушать'}

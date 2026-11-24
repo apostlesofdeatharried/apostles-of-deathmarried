@@ -534,6 +534,11 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
             : '6-digit code sent. Check your inbox and Spam folder.',
         });
       }
+    } catch {
+      setVerifyMsg({
+        type: 'err',
+        text: lang === 'ru' ? 'Ошибка соединения при отправке кода.' : 'Network error sending code.',
+      });
     } finally {
       setVerifySending(false);
     }
@@ -544,7 +549,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
     setVerifyConfirming(true);
     setVerifyMsg(null);
     try {
-      const res = await authFetch('/api/auth/verify-email', {
+      const res = await authFetch('/api/auth/email/verify', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -563,6 +568,11 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
         await refresh();
         await fetchProfile();
       }
+    } catch {
+      setVerifyMsg({
+        type: 'err',
+        text: lang === 'ru' ? 'Ошибка соединения при подтверждении почты.' : 'Network error verifying email.',
+      });
     } finally {
       setVerifyConfirming(false);
     }
@@ -700,6 +710,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
           isOpen={isShopOpen}
           onClose={() => {
             setIsShopOpen(false);
+            refresh().catch(() => {});
             fetchProfile();
           }}
         />
@@ -1867,8 +1878,8 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
                 </span>
                 <p className="text-[11px] text-[#736c64] leading-snug">
                   {lang === 'ru'
-                    ? 'Выберите, какие оповещения приходят в колокольчик и системные уведомления браузера.'
-                    : 'Choose which alerts appear in your notification center and browser.'}
+                    ? 'Выберите, какие оповещения приходят в колокольчик на сайте.'
+                    : 'Choose which alerts appear in your notification bell.'}
                 </p>
               </div>
 

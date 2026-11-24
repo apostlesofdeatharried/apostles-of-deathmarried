@@ -8,6 +8,7 @@
  */
 
 export const AUDIO_CHUNK_SIZE_BYTES = 1572864; // 1.5 MiB per request (well below Vercel 4.5 MB cap)
+export const AUDIO_REVERSE_FAST_CHUNK_BYTES = 1310720; // 1.25 MiB fast chunk for 5s reverse snippets
 export const AUDIO_MAX_DOWNLOAD_BYTES = 4 * 1024 * 1024; // 4 MiB ceiling for huge files
 
 interface CachedAudioEntry {
@@ -216,20 +217,61 @@ export async function fetchAudioBufferInChunks(
   return merged.buffer;
 }
 
+export interface FetchDecodeAudioOptions {
+  signal?: AbortSignal;
+  snippetStart?: number;
+  chunkSizeBytes?: number;
+  maxDownloadBytes?: number;
+  fetchImpl?: typeof fetch;
+}
+
 export async function fetchAndDecodeAudio(
   url: string,
   ctx: AudioContext,
-  signal?: AbortSignal
+  signalOrOptions?: AbortSignal | FetchDecodeAudioOptions
 ): Promise<AudioBuffer> {
   const safeUrl = normalizeSameOriginUrl(url);
+  const opts: FetchDecodeAudioOptions =
+    signalOrOptions && typeof (signalOrOptions as AbortSignal).aborted === 'boolean'
+      ? { signal: signalOrOptions as AbortSignal }
+      : (signalOrOptions as FetchDecodeAudioOptions | undefined) || {};
+
+  const signal = opts.signal;
+  const snippetStart = typeof opts.snippetStart === 'number' && Number.isFinite(opts.snippetStart)
+    ? Math.max(0, opts.snippetStart)
+    : undefined;
+
+  const chunkSizeBytes = Math.max(
+    1024,
+    opts.chunkSizeBytes || AUDIO_REVERSE_FAST_CHUNK_BYTES
+  );
+  const defaultMaxBytes =
+    snippetStart !== undefined && snippetStart > 35
+      ? chunkSizeBytes * 2
+      : chunkSizeBytes;
+  const targetMaxBytes = Math.max(chunkSizeBytes, opts.maxDownloadBytes || defaultMaxBytes);
+
   const existing = audioCache.get(safeUrl);
-  if (existing?.decoded && existing.ctx === ctx && ctx.state !== 'closed') {
+  if (
+    existing?.decoded &&
+    existing.ctx === ctx &&
+    ctx.state !== 'closed' &&
+    (snippetStart === undefined ||
+      existing.decoded.duration >= snippetStart + 5 ||
+      existing.raw.byteLength >= targetMaxBytes)
+  ) {
     return existing.decoded;
   }
 
-  let rawBuffer = existing?.raw;
+  let rawBuffer =
+    existing?.raw && existing.raw.byteLength >= targetMaxBytes ? existing.raw : undefined;
   if (!rawBuffer) {
-    rawBuffer = await fetchAudioBufferInChunks(safeUrl, { signal });
+    rawBuffer = await fetchAudioBufferInChunks(safeUrl, {
+      signal,
+      fetchImpl: opts.fetchImpl,
+      chunkSizeBytes,
+      maxDownloadBytes: targetMaxBytes,
+    });
     if (audioCache.size >= MAX_CACHE_ENTRIES) {
       const oldestKey = audioCache.keys().next().value;
       if (oldestKey) audioCache.delete(oldestKey);
@@ -248,7 +290,27 @@ export async function fetchAndDecodeAudio(
     decoded = await decodeAudioDataCompat(ctx, copy);
   } catch (err: any) {
     if (err?.name === 'AbortError') throw err;
-    throw new Error('Не удалось декодировать аудиофайл. Попробуйте ещё раз.');
+    const fallbackMaxBytes = Math.max(targetMaxBytes, AUDIO_CHUNK_SIZE_BYTES * 2);
+    if (rawBuffer.byteLength < fallbackMaxBytes) {
+      const expandedBuffer = await fetchAudioBufferInChunks(safeUrl, {
+        signal,
+        fetchImpl: opts.fetchImpl,
+        chunkSizeBytes: AUDIO_CHUNK_SIZE_BYTES,
+        maxDownloadBytes: fallbackMaxBytes,
+      });
+      if (signal?.aborted) {
+        throw new DOMException('Aborted', 'AbortError');
+      }
+      try {
+        decoded = await decodeAudioDataCompat(ctx, expandedBuffer.slice(0));
+        rawBuffer = expandedBuffer;
+      } catch (retryErr: any) {
+        if (retryErr?.name === 'AbortError') throw retryErr;
+        throw new Error('Не удалось декодировать аудиофайл. Попробуйте ещё раз.');
+      }
+    } else {
+      throw new Error('Не удалось декодировать аудиофайл. Попробуйте ещё раз.');
+    }
   }
 
   audioCache.set(safeUrl, { raw: rawBuffer, ctx, decoded });

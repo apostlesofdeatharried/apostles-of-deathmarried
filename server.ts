@@ -315,7 +315,10 @@ function isPathInsideDir(baseDir: string, candidatePath: string): boolean {
   return resolvedCandidate.startsWith(resolvedBase + path.sep);
 }
 
-function localAudioExists(audioUrl?: string | null): boolean {
+function localAudioExists(
+  audioUrl?: string | null,
+  cachedDbLookup?: { blobs: Set<string>; audioPaths: Set<string> }
+): boolean {
   if (!audioUrl || typeof audioUrl !== 'string') return false;
   const trimmed = audioUrl.trim();
   if (!trimmed) return false;
@@ -336,6 +339,9 @@ function localAudioExists(audioUrl?: string | null): boolean {
     const publicPath = path.resolve(process.cwd(), 'public', 'uploads', filename);
     if (fs.existsSync(diskPath) || fs.existsSync(publicPath)) return true;
     if (isSupabaseConfigured()) return true;
+    if (cachedDbLookup) {
+      return cachedDbLookup.blobs.has(filename) || cachedDbLookup.audioPaths.has(trimmed);
+    }
     try {
       const blobRow = db.prepare('SELECT 1 FROM uploaded_blobs WHERE filename = ?').get(filename);
       if (blobRow) return true;
@@ -790,7 +796,7 @@ app.post('/api/auth/email/send-code', emailCodeRateLimit, async (req: Request, r
 });
 
 // Verify existing account's email using stateless HMAC-signed token + 6-digit code
-app.post('/api/auth/email/verify', requireAuth, authRateLimit, (req: AuthRequest, res: Response) => {
+const handleVerifyExistingAccountEmail = async (req: AuthRequest, res: Response) => {
   if (!req.user) {
     res.status(401).json({ error: 'Authentication required' });
     return;
@@ -831,14 +837,17 @@ app.post('/api/auth/email/verify', requireAuth, authRateLimit, (req: AuthRequest
     WHERE id = ?
   `).run(emailCheck.normalized, req.user.id);
 
-  res.json({
+  await flushCloudBackupAndRespond(res, {
     ok: true,
     email: emailCheck.normalized,
     email_verified: 1,
   });
-});
+};
 
-app.post('/api/auth/register', authRateLimit, (req: Request, res: Response) => {
+app.post('/api/auth/email/verify', requireAuth, authRateLimit, handleVerifyExistingAccountEmail);
+app.post('/api/auth/verify-email', requireAuth, authRateLimit, handleVerifyExistingAccountEmail);
+
+app.post('/api/auth/register', authRateLimit, async (req: Request, res: Response) => {
   // 1. Honeypot trap: bots filling hidden fields are rejected immediately
   const honeypot = String(req.body?.website ?? req.body?.company_url ?? '').trim();
   if (honeypot.length > 0) {
@@ -1012,33 +1021,37 @@ app.post('/api/auth/register', authRateLimit, (req: Request, res: Response) => {
     maxAge: 30 * 24 * 60 * 60 * 1000,
   });
 
-  res.status(201).json({
-    user: {
-      id: userId,
-      nickname: normalizedUsername,
-      email: emailCheck.normalized,
-      email_verified: 1,
-      role_id: assignedRole,
-      display_name: displayNameCheck.normalized,
-      avatar_url: defaultAvatar,
-      bio: '',
-      custom_status: null,
-      level: 1,
-      xp: 0,
-      total_xp: 0,
-      daily_streak: 0,
-      equipped_frame: null,
-      equipped_banner: null,
-      equipped_name_style: null,
-      equipped_badge: null,
-      equipped_title: null,
-      equipped_theme: null,
-      equipped_effect: null,
-      featured_achievements: [],
-      registered_at: new Date().toISOString(),
+  await flushCloudBackupAndRespond(
+    res,
+    {
+      user: {
+        id: userId,
+        nickname: normalizedUsername,
+        email: emailCheck.normalized,
+        email_verified: 1,
+        role_id: assignedRole,
+        display_name: displayNameCheck.normalized,
+        avatar_url: defaultAvatar,
+        bio: '',
+        custom_status: null,
+        level: 1,
+        xp: 0,
+        total_xp: 0,
+        daily_streak: 0,
+        equipped_frame: null,
+        equipped_banner: null,
+        equipped_name_style: null,
+        equipped_badge: null,
+        equipped_title: null,
+        equipped_theme: null,
+        equipped_effect: null,
+        featured_achievements: [],
+        registered_at: new Date().toISOString(),
+      },
+      token,
     },
-    token,
-  });
+    201
+  );
 });
 
 app.post('/api/auth/login', authRateLimit, (req: Request, res: Response) => {
@@ -1537,8 +1550,8 @@ app.get('/api/notifications', requireAuth, (req: AuthRequest, res: Response) => 
            target_type, target_id, target_title, target_link, excerpt, is_read, created_at
     FROM notifications
     WHERE user_id = ?
-    ORDER BY created_at DESC
-    LIMIT 30
+    ORDER BY datetime(created_at) DESC, is_read ASC, rowid DESC
+    LIMIT 50
   `).all(userId);
 
   const unreadRow = db.prepare(`
@@ -1561,7 +1574,7 @@ app.get('/api/notifications/preferences', requireAuth, (req: AuthRequest, res: R
   });
 });
 
-app.put('/api/notifications/preferences', requireAuth, (req: AuthRequest, res: Response) => {
+app.put('/api/notifications/preferences', requireAuth, async (req: AuthRequest, res: Response) => {
   const { notify_follows, notify_news } = req.body || {};
   const nextFollows = notify_follows !== undefined ? (notify_follows ? 1 : 0) : null;
   const nextNews = notify_news !== undefined ? (notify_news ? 1 : 0) : null;
@@ -1578,7 +1591,7 @@ app.put('/api/notifications/preferences', requireAuth, (req: AuthRequest, res: R
     .prepare('SELECT notify_follows, notify_news FROM profiles WHERE user_id = ?')
     .get(req.user!.id) as { notify_follows?: number; notify_news?: number } | undefined;
 
-  res.json({
+  await flushCloudBackupAndRespond(res, {
     ok: true,
     notify_follows: row?.notify_follows === 0 ? false : true,
     notify_news: Boolean(row?.notify_news),
@@ -1650,7 +1663,7 @@ app.post('/api/admin/news/broadcast', requireAdmin, async (req: AuthRequest, res
   await flushCloudBackupAndRespond(res, { ok: true, id: newsId, sent_count: sentCount });
 });
 
-app.post('/api/notifications/read', requireAuth, (req: AuthRequest, res: Response) => {
+app.post('/api/notifications/read', requireAuth, async (req: AuthRequest, res: Response) => {
   const userId = req.user!.id;
   const { id, all } = req.body || {};
 
@@ -1667,12 +1680,12 @@ app.post('/api/notifications/read', requireAuth, (req: AuthRequest, res: Respons
     SELECT COUNT(*) as cnt FROM notifications WHERE user_id = ? AND is_read = 0
   `).get(userId) as { cnt?: number } | undefined;
 
-  res.json({ ok: true, unreadCount: Number(unreadRow?.cnt || 0) });
+  await flushCloudBackupAndRespond(res, { ok: true, unreadCount: Number(unreadRow?.cnt || 0) });
 });
 
-app.post('/api/rules/accept', requireAuth, (req: AuthRequest, res: Response) => {
+app.post('/api/rules/accept', requireAuth, async (req: AuthRequest, res: Response) => {
   db.prepare("UPDATE users SET accepted_rules = 1, updated_at = datetime('now') WHERE id = ?").run(req.user!.id);
-  res.json({ ok: true, accepted_rules: 1 });
+  await flushCloudBackupAndRespond(res, { ok: true, accepted_rules: 1 });
 });
 
 const DEFAULT_COMMUNITY_RULES_FALLBACK = {
@@ -1802,7 +1815,7 @@ app.get('/api/archive/:releaseType/:releaseId/comments', (req: Request, res: Res
   res.json({ comments });
 });
 
-app.post('/api/archive/:releaseType/:releaseId/comments', requireAuth, (req: AuthRequest, res: Response) => {
+app.post('/api/archive/:releaseType/:releaseId/comments', requireAuth, async (req: AuthRequest, res: Response) => {
   const releaseType = String(req.params.releaseType || '').toLowerCase() as 'album' | 'single';
   const releaseId = String(req.params.releaseId || '').trim();
   if ((releaseType !== 'album' && releaseType !== 'single') || !releaseId) {
@@ -1892,7 +1905,7 @@ app.post('/api/archive/:releaseType/:releaseId/comments', requireAuth, (req: Aut
     newlyUnlocked = evaluateUserAchievements(req.user!.id);
   })();
 
-  res.json({ ok: true, id, xp_earned: xpAwardedAmount, newly_unlocked_achievements: newlyUnlocked });
+  await flushCloudBackupAndRespond(res, { ok: true, id, xp_earned: xpAwardedAmount, newly_unlocked_achievements: newlyUnlocked });
 });
 
 app.get('/api/archive/albums', (_req: Request, res: Response) => {
@@ -2476,33 +2489,35 @@ function getDailyChallengeSecret(): string {
   return configured ? `daily-games:${configured}` : 'apostles-daily-challenge-v1';
 }
 
+const wavDurationCache = new Map<string, number>();
+
 function resolveEffectiveTrackDuration(audioUrl: string, dbDurationSeconds: number): number {
   const trimmed = (audioUrl || '').trim();
-  if (trimmed.startsWith('/audio/') && !trimmed.includes('..')) {
+  if ((trimmed.startsWith('/audio/') || trimmed.startsWith('/uploads/')) && !trimmed.includes('..')) {
+    const cached = wavDurationCache.get(trimmed);
+    if (cached && cached > 0) return cached;
+
     const filename = path.basename(trimmed);
-    const publicAudioDir = path.resolve(process.cwd(), 'public', 'audio');
-    const distAudioDir = path.resolve(process.cwd(), 'dist', 'audio');
-    const candidates = [
-      { dir: publicAudioDir, file: path.join(publicAudioDir, filename) },
-      { dir: distAudioDir, file: path.join(distAudioDir, filename) },
-    ];
+    const candidates = trimmed.startsWith('/audio/')
+      ? [
+          { dir: path.resolve(process.cwd(), 'public', 'audio'), file: path.join(path.resolve(process.cwd(), 'public', 'audio'), filename) },
+          { dir: path.resolve(process.cwd(), 'dist', 'audio'), file: path.join(path.resolve(process.cwd(), 'dist', 'audio'), filename) },
+        ]
+      : [
+          { dir: uploadDir, file: path.join(uploadDir, filename) },
+          { dir: path.resolve(process.cwd(), 'public', 'uploads'), file: path.join(path.resolve(process.cwd(), 'public', 'uploads'), filename) },
+        ];
     for (const { dir, file } of candidates) {
       if (isPathInsideDir(dir, file)) {
         const wavDur = readLocalWavDurationSeconds(file);
-        if (wavDur && wavDur > 0) return wavDur;
-      }
-    }
-  } else if (trimmed.startsWith('/uploads/') && !trimmed.includes('..')) {
-    const filename = path.basename(trimmed);
-    const publicUploadsDir = path.resolve(process.cwd(), 'public', 'uploads');
-    const candidates = [
-      { dir: uploadDir, file: path.join(uploadDir, filename) },
-      { dir: publicUploadsDir, file: path.join(publicUploadsDir, filename) },
-    ];
-    for (const { dir, file } of candidates) {
-      if (isPathInsideDir(dir, file)) {
-        const wavDur = readLocalWavDurationSeconds(file);
-        if (wavDur && wavDur > 0) return wavDur;
+        if (wavDur && wavDur > 0) {
+          if (wavDurationCache.size >= 300) {
+            const firstKey = wavDurationCache.keys().next().value;
+            if (firstKey) wavDurationCache.delete(firstKey);
+          }
+          wavDurationCache.set(trimmed, wavDur);
+          return wavDur;
+        }
       }
     }
   }
@@ -2549,6 +2564,32 @@ function getPlayableGameTrackPool(): {
       AND s.id NOT IN (SELECT single_id FROM tracks WHERE single_id IS NOT NULL)
   `).all() as any[];
 
+  let cachedDbLookup: { blobs: Set<string>; audioPaths: Set<string> } | undefined;
+  if (!isSupabaseConfigured()) {
+    try {
+      const blobs = new Set(
+        (db.prepare('SELECT filename FROM uploaded_blobs').all() as Array<{ filename?: string }>).map(
+          (r) => String(r.filename || '')
+        )
+      );
+      const audioPaths = new Set(
+        (db.prepare('SELECT storage_path FROM audio_files').all() as Array<{ storage_path?: string }>).map(
+          (r) => String(r.storage_path || '')
+        )
+      );
+      cachedDbLookup = { blobs, audioPaths };
+    } catch {}
+  }
+
+  const existenceCache = new Map<string, boolean>();
+  const checkAudioExists = (audioUrl: string): boolean => {
+    const cached = existenceCache.get(audioUrl);
+    if (cached !== undefined) return cached;
+    const exists = localAudioExists(audioUrl, cachedDbLookup);
+    existenceCache.set(audioUrl, exists);
+    return exists;
+  };
+
   const playablePool: PlayableTrackCandidate[] = [
     ...rawTracks.map((row) => ({
       id: String(row.id),
@@ -2568,7 +2609,7 @@ function getPlayableGameTrackPool(): {
       album_title: row.album_title,
       cover_url: row.cover_url,
     })),
-  ].filter((item) => item.title.length > 0 && localAudioExists(item.audio_url));
+  ].filter((item) => item.title.length > 0 && checkAudioExists(item.audio_url));
 
   const allTitles = db.prepare(`
     SELECT id, title FROM tracks WHERE title IS NOT NULL AND trim(title) != ''
@@ -2670,8 +2711,11 @@ interface ResolvedDailyTrackChallenge {
   options: TitleOption[];
 }
 
-function getOrCreateDailyTrackChallenge(utcDate: string): ResolvedDailyTrackChallenge | null {
-  const { playablePool, allTitles } = getPlayableGameTrackPool();
+function getOrCreateDailyTrackChallenge(
+  utcDate: string,
+  preloadedPool?: { playablePool: PlayableTrackCandidate[]; allTitles: TitleOption[] }
+): ResolvedDailyTrackChallenge | null {
+  const { playablePool, allTitles } = preloadedPool || getPlayableGameTrackPool();
   if (playablePool.length === 0) return null;
 
   const playableById = new Map(playablePool.map((t) => [t.id, t]));
@@ -3019,7 +3063,7 @@ app.get('/api/games/guess-track/round', (req: Request, res: Response) => {
   });
 });
 
-app.post('/api/games/guess-track/verify', (req: AuthRequest, res: Response) => {
+app.post('/api/games/guess-track/verify', async (req: AuthRequest, res: Response) => {
   const { round_token, challenge_date, selected_track_id, time_spent } = req.body || {};
   if (!selected_track_id || typeof selected_track_id !== 'string') {
     res.status(400).json({ error: 'Missing selected_track_id' });
@@ -3212,7 +3256,7 @@ app.post('/api/games/guess-track/verify', (req: AuthRequest, res: Response) => {
     }
   }
 
-  res.json({
+  await flushCloudBackupAndRespond(res, {
     correct: isCorrect,
     correct_track_id: correctTrackId,
     selected_track_id,
@@ -3298,7 +3342,7 @@ app.get('/api/games/quiz/daily', (req: Request, res: Response) => {
   });
 });
 
-app.post('/api/games/quiz/submit', (req: AuthRequest, res: Response) => {
+app.post('/api/games/quiz/submit', async (req: AuthRequest, res: Response) => {
   const { answers, challenge_date } = req.body || {};
   if (!answers || typeof answers !== 'object' || Array.isArray(answers)) {
     res.status(400).json({ error: 'Answers must be provided.' });
@@ -3494,7 +3538,7 @@ app.post('/api/games/quiz/submit', (req: AuthRequest, res: Response) => {
     }
   }
 
-  res.json({
+  await flushCloudBackupAndRespond(res, {
     total,
     correct_count: correctCount,
     base_score: baseScore,
@@ -3715,7 +3759,7 @@ app.get('/api/games/guess-lyrics/round', (req: Request, res: Response) => {
   });
 });
 
-app.post('/api/games/guess-lyrics/verify', (req: AuthRequest, res: Response) => {
+app.post('/api/games/guess-lyrics/verify', async (req: AuthRequest, res: Response) => {
   const { challenge_date, selected_option_id } = req.body || {};
   if (!selected_option_id || typeof selected_option_id !== 'string') {
     res.status(400).json({ error: 'Не выбран вариант ответа.' });
@@ -3829,7 +3873,7 @@ app.post('/api/games/guess-lyrics/verify', (req: AuthRequest, res: Response) => 
     }
   }
 
-  res.json({
+  await flushCloudBackupAndRespond(res, {
     correct: isCorrect,
     selected_option_id,
     correct_option_id: round.correct_option_id,
@@ -3850,12 +3894,16 @@ app.post('/api/games/guess-lyrics/verify', (req: AuthRequest, res: Response) => 
 });
 
 // 4. Reverse Track (12-hour MSK cycle, 5-second reversed audio via Web Audio API)
-function resolveReverseTrackForCycle(cycleId: string) {
-  const { playablePool, allTitles } = getPlayableGameTrackPool();
+function resolveReverseTrackForCycle(
+  cycleId: string,
+  preloadedPool?: { playablePool: PlayableTrackCandidate[]; allTitles: TitleOption[] }
+) {
+  const pool = preloadedPool || getPlayableGameTrackPool();
+  const { playablePool, allTitles } = pool;
   if (playablePool.length === 0) return null;
   const secret = getDailyChallengeSecret();
   const prevCycleId = getPreviousMoscow12hCycle(cycleId);
-  const guessTrackToday = getOrCreateDailyTrackChallenge(cycleId);
+  const guessTrackToday = getOrCreateDailyTrackChallenge(cycleId, pool);
   const prevReverse = pickDailyReverseTrackChallenge({
     cycleId: prevCycleId,
     playableTracks: playablePool,
@@ -3927,7 +3975,7 @@ app.get('/api/games/reverse-track/round', (req: Request, res: Response) => {
   });
 });
 
-app.post('/api/games/reverse-track/verify', (req: AuthRequest, res: Response) => {
+app.post('/api/games/reverse-track/verify', async (req: AuthRequest, res: Response) => {
   const { challenge_date, selected_track_id } = req.body || {};
   if (!selected_track_id || typeof selected_track_id !== 'string') {
     res.status(400).json({ error: 'Missing selected_track_id' });
@@ -4037,7 +4085,7 @@ app.post('/api/games/reverse-track/verify', (req: AuthRequest, res: Response) =>
     }
   }
 
-  res.json({
+  await flushCloudBackupAndRespond(res, {
     correct: isCorrect,
     correct_track_id: correctTrackId,
     selected_track_id,
@@ -4057,13 +4105,17 @@ app.post('/api/games/reverse-track/verify', (req: AuthRequest, res: Response) =>
 });
 
 // 5. Speed Track 0.5x / 2.5x (12-hour MSK cycle, 5 seconds real listening time with pitch shift)
-function resolveSpeedTrackForCycle(cycleId: string) {
-  const { playablePool, allTitles } = getPlayableGameTrackPool();
+function resolveSpeedTrackForCycle(
+  cycleId: string,
+  preloadedPool?: { playablePool: PlayableTrackCandidate[]; allTitles: TitleOption[] }
+) {
+  const pool = preloadedPool || getPlayableGameTrackPool();
+  const { playablePool, allTitles } = pool;
   if (playablePool.length === 0) return null;
   const secret = getDailyChallengeSecret();
   const prevCycleId = getPreviousMoscow12hCycle(cycleId);
-  const guessTrackToday = getOrCreateDailyTrackChallenge(cycleId);
-  const reverseToday = resolveReverseTrackForCycle(cycleId);
+  const guessTrackToday = getOrCreateDailyTrackChallenge(cycleId, pool);
+  const reverseToday = resolveReverseTrackForCycle(cycleId, pool);
   const prevSpeed = pickDailySpeedTrackChallenge({
     cycleId: prevCycleId,
     playableTracks: playablePool,
@@ -4139,7 +4191,7 @@ app.get('/api/games/speed-track/round', (req: Request, res: Response) => {
   });
 });
 
-app.post('/api/games/speed-track/verify', (req: AuthRequest, res: Response) => {
+app.post('/api/games/speed-track/verify', async (req: AuthRequest, res: Response) => {
   const { challenge_date, selected_track_id } = req.body || {};
   if (!selected_track_id || typeof selected_track_id !== 'string') {
     res.status(400).json({ error: 'Missing selected_track_id' });
@@ -4249,7 +4301,7 @@ app.post('/api/games/speed-track/verify', (req: AuthRequest, res: Response) => {
     }
   }
 
-  res.json({
+  await flushCloudBackupAndRespond(res, {
     correct: isCorrect,
     correct_track_id: correctTrackId,
     selected_track_id,
@@ -4392,7 +4444,7 @@ function evaluateUserAchievements(userId: string): UnlockedAchievementInfo[] {
 }
 
 // Secret & Activity Achievement Triggers (Server-authoritative)
-app.post('/api/achievements/check-visit', requireAuth, (req: AuthRequest, res: Response) => {
+app.post('/api/achievements/check-visit', requireAuth, async (req: AuthRequest, res: Response) => {
   const userId = req.user!.id;
   const inMidnightWindow = isMoscowMidnightWindow();
   let newlyUnlocked: UnlockedAchievementInfo[] = [];
@@ -4405,14 +4457,14 @@ app.post('/api/achievements/check-visit', requireAuth, (req: AuthRequest, res: R
     newlyUnlocked = evaluateUserAchievements(userId);
   }
 
-  res.json({
+  await flushCloudBackupAndRespond(res, {
     ok: true,
     midnight_window: inMidnightWindow,
     newly_unlocked_achievements: newlyUnlocked,
   });
 });
 
-app.post('/api/achievements/track-complete', requireAuth, (req: AuthRequest, res: Response) => {
+app.post('/api/achievements/track-complete', requireAuth, async (req: AuthRequest, res: Response) => {
   const userId = req.user!.id;
   const rawTrackId = String(req.body?.track_id || '').trim().slice(0, 120);
   if (!rawTrackId) {
@@ -4468,7 +4520,7 @@ app.post('/api/achievements/track-complete', requireAuth, (req: AuthRequest, res
     newlyUnlocked = evaluateUserAchievements(userId);
   })();
 
-  res.json({
+  await flushCloudBackupAndRespond(res, {
     ok: true,
     counted: true,
     track_id: rawTrackId,
@@ -4477,7 +4529,7 @@ app.post('/api/achievements/track-complete', requireAuth, (req: AuthRequest, res
   });
 });
 
-app.post('/api/achievements/easter-egg', requireAuth, (req: AuthRequest, res: Response) => {
+app.post('/api/achievements/easter-egg', requireAuth, async (req: AuthRequest, res: Response) => {
   const userId = req.user!.id;
   const key = String(req.body?.key || '').trim();
   if (key !== 'curious_rose') {
@@ -4495,7 +4547,7 @@ app.post('/api/achievements/easter-egg', requireAuth, (req: AuthRequest, res: Re
     newlyUnlocked = evaluateUserAchievements(userId);
   })();
 
-  res.json({
+  await flushCloudBackupAndRespond(res, {
     ok: true,
     newly_unlocked_achievements: newlyUnlocked,
   });
@@ -4629,7 +4681,7 @@ app.get('/api/games/leaderboard', (req: Request, res: Response) => {
 // API: PROMO CODES
 // ----------------------------------------------------------------------------
 
-app.post('/api/promo/redeem', requireAuth, promoRateLimit, (req: AuthRequest, res: Response) => {
+app.post('/api/promo/redeem', requireAuth, promoRateLimit, async (req: AuthRequest, res: Response) => {
   if (!req.user) {
     res.status(401).json({ error: 'Authentication required' });
     return;
@@ -4721,7 +4773,7 @@ app.post('/api/promo/redeem', requireAuth, promoRateLimit, (req: AuthRequest, re
     throw err;
   }
 
-  res.json({
+  await flushCloudBackupAndRespond(res, {
     ok: true,
     code: promo.code,
     xp_reward: promo.xp_reward,
@@ -4774,7 +4826,7 @@ const SHOP_CATEGORY_COLUMN_MAP: Record<string, string> = {
   effect: 'equipped_effect',
 };
 
-app.post('/api/shop/buy', requireAuth, (req: AuthRequest, res: Response) => {
+app.post('/api/shop/buy', requireAuth, async (req: AuthRequest, res: Response) => {
   const { item_id } = req.body || {};
   if (!item_id || typeof item_id !== 'string') {
     res.status(400).json({ error: 'Item ID is required.' });
@@ -4839,10 +4891,10 @@ app.post('/api/shop/buy', requireAuth, (req: AuthRequest, res: Response) => {
   const newlyUnlocked = evaluateUserAchievements(userId);
 
   const updatedProfile = db.prepare('SELECT xp, total_xp, level FROM profiles WHERE user_id = ?').get(userId) as any;
-  res.json({ ok: true, new_xp: updatedProfile.xp, profile: updatedProfile, newly_unlocked_achievements: newlyUnlocked });
+  await flushCloudBackupAndRespond(res, { ok: true, new_xp: updatedProfile.xp, profile: updatedProfile, newly_unlocked_achievements: newlyUnlocked });
 });
 
-app.post('/api/shop/equip', requireAuth, (req: AuthRequest, res: Response) => {
+app.post('/api/shop/equip', requireAuth, async (req: AuthRequest, res: Response) => {
   const { item_id, equip } = req.body || {};
   if (!item_id || typeof item_id !== 'string') {
     res.status(400).json({ error: 'Item ID is required.' });
@@ -4897,7 +4949,7 @@ app.post('/api/shop/equip', requireAuth, (req: AuthRequest, res: Response) => {
            equipped_title, equipped_theme, equipped_effect
     FROM profiles WHERE user_id = ?
   `).get(userId);
-  res.json({ ok: true, is_equipped: shouldEquip, category: owned.category, equipped: equippedState, newly_unlocked_achievements: newlyUnlocked });
+  await flushCloudBackupAndRespond(res, { ok: true, is_equipped: shouldEquip, category: owned.category, equipped: equippedState, newly_unlocked_achievements: newlyUnlocked });
 });
 
 app.get('/api/shop/inventory', requireAuth, (req: AuthRequest, res: Response) => {
@@ -5084,7 +5136,7 @@ app.get('/api/community/posts/:id', (req: Request, res: Response) => {
   });
 });
 
-app.post('/api/community/posts', requireAuth, (req: AuthRequest, res: Response) => {
+app.post('/api/community/posts', requireAuth, async (req: AuthRequest, res: Response) => {
   const { title, content, category_id, media_url, media_type } = req.body;
   if (!title || !content || !category_id) {
     res.status(400).json({ error: 'Title, content and category are required.' });
@@ -5152,7 +5204,7 @@ app.post('/api/community/posts', requireAuth, (req: AuthRequest, res: Response) 
     }
   })();
 
-  res.json({ ok: true, id, status, xp_earned: awardedXp });
+  await flushCloudBackupAndRespond(res, { ok: true, id, status, xp_earned: awardedXp });
 });
 
 app.put('/api/community/posts/:id', requireAuth, (req: AuthRequest, res: Response) => {
@@ -5197,7 +5249,7 @@ app.put('/api/community/posts/:id', requireAuth, (req: AuthRequest, res: Respons
   res.json({ ok: true });
 });
 
-app.post('/api/admin/community/posts/:id/moderate', requireAdminOrMod, (req: AuthRequest, res: Response) => {
+app.post('/api/admin/community/posts/:id/moderate', requireAdminOrMod, async (req: AuthRequest, res: Response) => {
   const { status, rejection_reason } = req.body;
   if (!['approved', 'rejected', 'pending'].includes(status)) {
     res.status(400).json({ error: 'Invalid moderation status' });
@@ -5261,7 +5313,7 @@ app.post('/api/admin/community/posts/:id/moderate', requireAdminOrMod, (req: Aut
     }
   })();
 
-  res.json({ ok: true, status });
+  await flushCloudBackupAndRespond(res, { ok: true, status });
 });
 
 app.post('/api/admin/community/posts/:id/pin', requireAdminOrMod, (req: AuthRequest, res: Response) => {
@@ -5286,7 +5338,7 @@ app.post('/api/admin/community/posts/:id/lock', requireAdminOrMod, (req: AuthReq
   res.json({ ok: true, is_locked: nextLocked });
 });
 
-app.post('/api/community/posts/:id/comments', requireAuth, (req: AuthRequest, res: Response) => {
+app.post('/api/community/posts/:id/comments', requireAuth, async (req: AuthRequest, res: Response) => {
   const { content, parent_id } = req.body;
   const cleanContent = content ? String(content).trim().slice(0, 2000) : '';
   if (!cleanContent) {
@@ -5376,7 +5428,7 @@ app.post('/api/community/posts/:id/comments', requireAuth, (req: AuthRequest, re
     newlyUnlocked = evaluateUserAchievements(req.user!.id);
   })();
 
-  res.json({ ok: true, id, xp_earned: xpEarned, newly_unlocked_achievements: newlyUnlocked });
+  await flushCloudBackupAndRespond(res, { ok: true, id, xp_earned: xpEarned, newly_unlocked_achievements: newlyUnlocked });
 });
 
 app.post('/api/community/posts/:id/react', requireAuth, (req: AuthRequest, res: Response) => {
@@ -5446,7 +5498,7 @@ app.post('/api/community/posts/:id/react', requireAuth, (req: AuthRequest, res: 
   });
 });
 
-app.delete('/api/community/posts/:id', requireAuth, (req: AuthRequest, res: Response) => {
+app.delete('/api/community/posts/:id', requireAuth, async (req: AuthRequest, res: Response) => {
   const post = db
     .prepare('SELECT id, user_id, title, xp_awarded, xp_awarded_amount FROM posts WHERE id = ?')
     .get(req.params.id) as any;
@@ -5489,7 +5541,7 @@ app.delete('/api/community/posts/:id', requireAuth, (req: AuthRequest, res: Resp
     db.prepare('DELETE FROM posts WHERE id = ?').run(post.id);
   })();
 
-  res.json({ ok: true });
+  await flushCloudBackupAndRespond(res, { ok: true });
 });
 
 app.get('/api/admin/comments', requireAdminOrMod, (req: AuthRequest, res: Response) => {
@@ -5560,7 +5612,7 @@ app.post('/api/community/comments/:id/hide', requireAdminOrMod, (req: AuthReques
   res.json({ ok: true, is_hidden: nextHidden });
 });
 
-app.delete('/api/community/comments/:id', requireAuth, (req: AuthRequest, res: Response) => {
+app.delete('/api/community/comments/:id', requireAuth, async (req: AuthRequest, res: Response) => {
   const comment = db
     .prepare('SELECT id, user_id, post_id, creation_id, xp_awarded, xp_awarded_amount FROM comments WHERE id = ?')
     .get(req.params.id) as any;
@@ -5618,7 +5670,7 @@ app.delete('/api/community/comments/:id', requireAuth, (req: AuthRequest, res: R
     }
   })();
 
-  res.json({ ok: true });
+  await flushCloudBackupAndRespond(res, { ok: true });
 });
 
 // ----------------------------------------------------------------------------
@@ -5780,7 +5832,7 @@ app.get('/api/creations/:id', (req: Request, res: Response) => {
   });
 });
 
-app.post('/api/creations/:id/comments', requireAuth, (req: AuthRequest, res: Response) => {
+app.post('/api/creations/:id/comments', requireAuth, async (req: AuthRequest, res: Response) => {
   const { content, parent_id } = req.body;
   const cleanContent = content ? String(content).trim().slice(0, 2000) : '';
   if (!cleanContent) {
@@ -5858,12 +5910,12 @@ app.post('/api/creations/:id/comments', requireAuth, (req: AuthRequest, res: Res
     newlyUnlocked = evaluateUserAchievements(req.user!.id);
   })();
 
-  res.json({ ok: true, id, xp_earned: xpEarned, newly_unlocked_achievements: newlyUnlocked });
+  await flushCloudBackupAndRespond(res, { ok: true, id, xp_earned: xpEarned, newly_unlocked_achievements: newlyUnlocked });
 });
 
 const VALID_CREATION_CATEGORIES = new Set(['art', 'meme', 'artwork', 'covers', 'beats', 'video', 'lyrics']);
 
-app.post('/api/creations', requireAuth, (req: AuthRequest, res: Response) => {
+app.post('/api/creations', requireAuth, async (req: AuthRequest, res: Response) => {
   const { title, category, description, media_url, media_type } = req.body;
   const cleanCategory = typeof category === 'string' ? category.trim() : '';
   if (!title || !cleanCategory || !VALID_CREATION_CATEGORIES.has(cleanCategory) || !media_url) {
@@ -5920,7 +5972,7 @@ app.post('/api/creations', requireAuth, (req: AuthRequest, res: Response) => {
     }
   })();
 
-  res.json({ ok: true, id, status, xp_earned: awardedXp });
+  await flushCloudBackupAndRespond(res, { ok: true, id, status, xp_earned: awardedXp });
 });
 
 app.put('/api/creations/:id', requireAuth, (req: AuthRequest, res: Response) => {
@@ -5967,7 +6019,7 @@ app.put('/api/creations/:id', requireAuth, (req: AuthRequest, res: Response) => 
   res.json({ ok: true });
 });
 
-app.post('/api/admin/creations/:id/moderate', requireAdminOrMod, (req: AuthRequest, res: Response) => {
+app.post('/api/admin/creations/:id/moderate', requireAdminOrMod, async (req: AuthRequest, res: Response) => {
   const { status, rejection_reason, category } = req.body;
   if (!['approved', 'rejected', 'pending'].includes(status)) {
     res.status(400).json({ error: 'Invalid moderation status' });
@@ -6044,7 +6096,7 @@ app.post('/api/admin/creations/:id/moderate', requireAdminOrMod, (req: AuthReque
     }
   })();
 
-  res.json({ ok: true, status, category: nextCategory });
+  await flushCloudBackupAndRespond(res, { ok: true, status, category: nextCategory });
 });
 
 app.post('/api/creations/:id/react', requireAuth, (req: AuthRequest, res: Response) => {
@@ -6139,7 +6191,7 @@ app.post('/api/creations/:id/favorite', requireAuth, (req: AuthRequest, res: Res
   }
 });
 
-app.delete('/api/creations/:id', requireAuth, (req: AuthRequest, res: Response) => {
+app.delete('/api/creations/:id', requireAuth, async (req: AuthRequest, res: Response) => {
   const creation = db
     .prepare('SELECT id, user_id, title, xp_awarded, xp_awarded_amount FROM creations WHERE id = ?')
     .get(req.params.id) as any;
@@ -6182,7 +6234,7 @@ app.delete('/api/creations/:id', requireAuth, (req: AuthRequest, res: Response) 
     db.prepare('DELETE FROM creations WHERE id = ?').run(creation.id);
   })();
 
-  res.json({ ok: true });
+  await flushCloudBackupAndRespond(res, { ok: true });
 });
 
 // ----------------------------------------------------------------------------
@@ -6505,7 +6557,7 @@ app.get('/api/profiles/:nickname/history', (req: Request, res: Response) => {
   });
 });
 
-app.post('/api/profiles/:nickname/follow', requireAuth, (req: AuthRequest, res: Response) => {
+app.post('/api/profiles/:nickname/follow', requireAuth, async (req: AuthRequest, res: Response) => {
   const rawLookup = String(req.params.nickname || '').trim();
   const cleanLookup = normalizeUsername(rawLookup);
   const target = db
@@ -6542,14 +6594,14 @@ app.post('/api/profiles/:nickname/follow', requireAuth, (req: AuthRequest, res: 
     (db.prepare('SELECT COUNT(*) as c FROM follows WHERE following_id = ?').get(target.id) as any)?.c || 0
   );
 
-  res.json({
+  await flushCloudBackupAndRespond(res, {
     following,
     followers_count: followersCount,
     ...(newlyUnlocked.length > 0 ? { newly_unlocked_achievements: newlyUnlocked } : {}),
   });
 });
 
-app.put('/api/profiles/me', requireAuth, (req: AuthRequest, res: Response) => {
+app.put('/api/profiles/me', requireAuth, async (req: AuthRequest, res: Response) => {
   const userId = req.user!.id;
   const {
     display_name,
@@ -6721,7 +6773,7 @@ app.put('/api/profiles/me', requireAuth, (req: AuthRequest, res: Response) => {
     });
   }
 
-  res.json({
+  await flushCloudBackupAndRespond(res, {
     ok: true,
     nickname: changedUsername || req.user!.nickname,
     ...(refreshedToken ? { token: refreshedToken } : {}),

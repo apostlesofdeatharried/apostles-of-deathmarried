@@ -119,6 +119,7 @@ export const AdminNewsTab: React.FC<CommonProps> = ({ lang, onNotify, onError })
         setMessage('');
         setRoutePreset('');
         setCustomPath('');
+        window.dispatchEvent(new CustomEvent('aod-notifications-refresh'));
         await loadNews();
       } else {
         onError(data.error || 'Failed to broadcast news');

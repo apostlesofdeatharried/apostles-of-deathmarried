@@ -116,8 +116,8 @@ export const BrowserNotificationsControl: React.FC<{ compact?: boolean }> = ({ c
 
   if (status === 'unsupported') {
     return (
-      <div className={`text-[11px] text-[#736c64] ${compact ? 'px-3 py-2 border-t border-white/[0.06]' : ''}`}>
-        Системные уведомления не поддерживаются этим браузером.
+      <div className={`text-[11px] text-[#8e877e] leading-snug ${compact ? 'px-3 py-2 border-t border-white/[0.06]' : ''}`}>
+        Уведомления приходят прямо в колокольчик на сайте.
       </div>
     );
   }
@@ -130,35 +130,61 @@ export const BrowserNotificationsControl: React.FC<{ compact?: boolean }> = ({ c
         }`}
       >
         <BellRing className="w-3.5 h-3.5 shrink-0" />
-        <span>Уведомления в браузере включены</span>
+        <span>Уведомления браузера включены (приходят, пока открыт сайт)</span>
       </div>
     );
   }
 
   if (status === 'denied') {
     return (
-      <div className={`text-[11px] text-[#c49298] ${compact ? 'px-3 py-2 border-t border-white/[0.06]' : ''}`}>
-        Уведомления заблокированы в настройках браузера.
+      <div className={`text-[11px] text-[#c49298] leading-snug ${compact ? 'px-3 py-2 border-t border-white/[0.06]' : ''}`}>
+        Уведомления браузера отключены в настройках браузера. Все оповещения по-прежнему приходят в колокольчик на сайте.
       </div>
     );
   }
 
   return (
-    <button
-      type="button"
-      onClick={handleEnable}
-      disabled={requesting}
-      className={
-        compact
-          ? 'w-full flex items-center justify-center gap-1.5 px-3 py-2 border-t border-white/[0.06] bg-white/[0.03] hover:bg-white/[0.08] text-[11px] font-mono text-[#ded8ce] hover:text-white transition-colors cursor-pointer disabled:opacity-50'
-          : 'inline-flex items-center gap-2 px-3.5 py-2 rounded-md bg-white/[0.07] hover:bg-white/[0.13] border border-white/[0.12] text-xs font-mono text-[#f2eee9] transition-colors cursor-pointer disabled:opacity-50'
-      }
-    >
-      <BellRing className="w-3.5 h-3.5 text-[#c96075] shrink-0" />
-      <span>{requesting ? 'Запрос разрешения...' : 'Включить уведомления в браузере'}</span>
-    </button>
+    <div className={compact ? 'border-t border-white/[0.06]' : 'space-y-1.5'}>
+      <button
+        type="button"
+        onClick={handleEnable}
+        disabled={requesting}
+        className={
+          compact
+            ? 'w-full flex items-center justify-center gap-1.5 px-3 py-2 bg-white/[0.03] hover:bg-white/[0.08] text-[11px] font-mono text-[#ded8ce] hover:text-white transition-colors cursor-pointer disabled:opacity-50'
+            : 'inline-flex items-center gap-2 px-3.5 py-2 rounded-md bg-white/[0.07] hover:bg-white/[0.13] border border-white/[0.12] text-xs font-mono text-[#f2eee9] transition-colors cursor-pointer disabled:opacity-50'
+        }
+      >
+        <BellRing className="w-3.5 h-3.5 text-[#c96075] shrink-0" />
+        <span>{requesting ? 'Запрос разрешения...' : 'Включить уведомления браузера'}</span>
+      </button>
+      <p className={`text-[10px] text-[#736c64] ${compact ? 'px-3 pb-2 text-center' : ''}`}>
+        Приходят, пока открыт сайт
+      </p>
+    </div>
   );
 };
+
+function loadShownToastIds(userId: string): Set<string> {
+  try {
+    const raw = window.sessionStorage.getItem(`aod_shown_notif_toasts_v1:${userId}`);
+    if (!raw) return new Set();
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      return new Set(parsed.filter((id): id is string => typeof id === 'string'));
+    }
+  } catch {}
+  return new Set();
+}
+
+function persistShownToastId(userId: string, notifId: string) {
+  try {
+    const current = loadShownToastIds(userId);
+    current.add(notifId);
+    const trimmed = Array.from(current).slice(-60);
+    window.sessionStorage.setItem(`aod_shown_notif_toasts_v1:${userId}`, JSON.stringify(trimmed));
+  } catch {}
+}
 
 export const NotificationCenter: React.FC = () => {
   const { user, refresh } = useAuth();
@@ -172,6 +198,8 @@ export const NotificationCenter: React.FC = () => {
 
   const dropdownRef = useRef<HTMLDivElement | null>(null);
   const knownIdsRef = useRef<Set<string>>(new Set());
+  const optimisticReadIdsRef = useRef<Set<string>>(new Set());
+  const optimisticReadAllRef = useRef<boolean>(false);
   const initializedRef = useRef(false);
   const toastTimerRef = useRef<number | null>(null);
 
@@ -218,25 +246,53 @@ export const NotificationCenter: React.FC = () => {
     }
   };
 
+  const dismissToastOnly = useCallback(() => {
+    if (toastTimerRef.current) {
+      window.clearTimeout(toastTimerRef.current);
+      toastTimerRef.current = null;
+    }
+    if (toastNotif && user?.id) {
+      persistShownToastId(user.id, toastNotif.id);
+    }
+    setToastNotif(null);
+  }, [toastNotif, user?.id]);
+
   const openNotificationTarget = useCallback(async (n: AppNotification) => {
-    setOpen(false);
+    if (toastTimerRef.current) {
+      window.clearTimeout(toastTimerRef.current);
+      toastTimerRef.current = null;
+    }
+    if (user?.id) {
+      persistShownToastId(user.id, n.id);
+    }
     setToastNotif(null);
 
     if (!n.is_read) {
+      optimisticReadIdsRef.current.add(n.id);
       setNotifications((prev) => prev.map((item) => (item.id === n.id ? { ...item, is_read: 1 } : item)));
       setUnreadCount((prev) => Math.max(0, prev - 1));
-      authFetch('/api/notifications/read', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: n.id }),
-      }).catch(() => {});
+      try {
+        const res = await authFetch('/api/notifications/read', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: n.id }),
+        });
+        if (res.ok) {
+          const data = await safeJson<{ unreadCount?: number }>(res, {});
+          if (typeof data.unreadCount === 'number') {
+            setUnreadCount(data.unreadCount);
+          }
+        }
+      } catch {}
     }
 
     const hasNewsNavLink = Boolean(n.target_link && n.target_link.trim() && n.target_link.trim() !== 'none');
     if (n.target_type === 'news' && !hasNewsNavLink) {
+      setOpen(true);
       return;
     }
 
+    setOpen(false);
     window.dispatchEvent(
       new CustomEvent('navigate-notification', {
         detail: {
@@ -246,7 +302,7 @@ export const NotificationCenter: React.FC = () => {
         },
       })
     );
-  }, []);
+  }, [user?.id]);
 
   const fetchNotifications = useCallback(async () => {
     if (!user?.id) return;
@@ -255,28 +311,64 @@ export const NotificationCenter: React.FC = () => {
       const res = await authFetch('/api/notifications', { cache: 'no-store' });
       if (!res.ok) return;
       const data = await safeJson<{ notifications?: AppNotification[]; unreadCount?: number }>(res, {});
-      const list = Array.isArray(data.notifications) ? data.notifications : [];
-      const unread = Number(data.unreadCount || 0);
+      const rawList = Array.isArray(data.notifications) ? data.notifications : [];
+
+      // Deduplicate by id while preserving server ordering
+      const seenIds = new Set<string>();
+      const dedupedList: AppNotification[] = [];
+      for (const item of rawList) {
+        if (!item?.id || seenIds.has(item.id)) continue;
+        seenIds.add(item.id);
+        if (item.is_read) {
+          optimisticReadIdsRef.current.delete(item.id);
+        }
+        const markedLocally =
+          optimisticReadAllRef.current || optimisticReadIdsRef.current.has(item.id);
+        dedupedList.push(markedLocally ? { ...item, is_read: 1 } : item);
+      }
+
+      const serverUnread = Number(data.unreadCount ?? dedupedList.filter((i) => !i.is_read).length);
+      let effectiveUnread = optimisticReadAllRef.current
+        ? 0
+        : Math.max(
+            0,
+            serverUnread -
+              rawList.filter((i) => i && !i.is_read && optimisticReadIdsRef.current.has(i.id)).length
+          );
+      if (!optimisticReadAllRef.current && effectiveUnread === 0) {
+        const localUnreadCount = dedupedList.filter((i) => !i.is_read).length;
+        if (localUnreadCount > 0) effectiveUnread = localUnreadCount;
+      }
+
+      const shownToasts = loadShownToastIds(user.id);
 
       if (initializedRef.current) {
-        const freshUnread = list.filter((item) => !item.is_read && !knownIdsRef.current.has(item.id));
+        const freshUnread = dedupedList.filter(
+          (item) => !item.is_read && !knownIdsRef.current.has(item.id) && !shownToasts.has(item.id)
+        );
         if (freshUnread.length > 0) {
-          const newest = freshUnread[0];
-          setToastNotif(newest);
-          if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
-          toastTimerRef.current = window.setTimeout(() => setToastNotif(null), 7000);
-          showNativeBrowserNotification(newest, () => openNotificationTarget(newest));
+          const preferred = freshUnread.find((item) => item.type === 'news') || freshUnread[0];
+          persistShownToastId(user.id, preferred.id);
+          setToastNotif(preferred);
+          showNativeBrowserNotification(preferred, () => openNotificationTarget(preferred));
         }
       } else {
         initializedRef.current = true;
+        const unreadNews = dedupedList.find(
+          (item) => item.type === 'news' && !item.is_read && !shownToasts.has(item.id)
+        );
+        if (unreadNews) {
+          persistShownToastId(user.id, unreadNews.id);
+          setToastNotif(unreadNews);
+        }
       }
 
-      for (const item of list) {
+      for (const item of dedupedList) {
         knownIdsRef.current.add(item.id);
       }
 
-      setNotifications(list);
-      setUnreadCount(unread);
+      setNotifications(dedupedList);
+      setUnreadCount(effectiveUnread);
     } catch {
       // Silent retry on next interval
     }
@@ -290,6 +382,8 @@ export const NotificationCenter: React.FC = () => {
       setOpen(false);
       setToastNotif(null);
       knownIdsRef.current = new Set();
+      optimisticReadIdsRef.current = new Set();
+      optimisticReadAllRef.current = false;
       initializedRef.current = false;
       return;
     }
@@ -298,6 +392,12 @@ export const NotificationCenter: React.FC = () => {
     setNotifyNews(Boolean(user?.notify_news));
     fetchNotifications();
     fetchPreferences();
+
+    const handleForceRefresh = () => {
+      fetchNotifications();
+    };
+    window.addEventListener('aod-notifications-refresh', handleForceRefresh);
+
     const intervalId = window.setInterval(() => {
       if (document.visibilityState === 'visible') {
         fetchNotifications();
@@ -306,6 +406,7 @@ export const NotificationCenter: React.FC = () => {
 
     return () => {
       window.clearInterval(intervalId);
+      window.removeEventListener('aod-notifications-refresh', handleForceRefresh);
       if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
     };
   }, [user?.id, fetchNotifications, fetchPreferences]);
@@ -331,13 +432,18 @@ export const NotificationCenter: React.FC = () => {
 
   const handleMarkAllRead = async () => {
     if (unreadCount === 0) return;
+    optimisticReadAllRef.current = true;
     setNotifications((prev) => prev.map((n) => ({ ...n, is_read: 1 })));
     setUnreadCount(0);
-    await authFetch('/api/notifications/read', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ all: true }),
-    }).catch(() => {});
+    try {
+      await authFetch('/api/notifications/read', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ all: true }),
+      });
+    } finally {
+      optimisticReadAllRef.current = false;
+    }
   };
 
   if (!user) return null;
@@ -361,7 +467,7 @@ export const NotificationCenter: React.FC = () => {
         >
           <Bell className="w-4 h-4" />
           {unreadCount > 0 && (
-            <span className="absolute -top-1 -right-1 min-w-[16px] h-4 px-1 rounded-full bg-[#821c2c] text-white font-mono text-[9px] font-semibold tabular-nums flex items-center justify-center">
+            <span className="absolute -top-1.5 -right-1.5 min-w-[18px] h-[18px] px-1 rounded-full bg-[#d92638] ring-2 ring-[#0a0a0d] text-white font-mono text-[10px] font-bold tabular-nums flex items-center justify-center shadow-[0_0_8px_rgba(217,38,56,0.55)]">
               {unreadCount > 9 ? '9+' : unreadCount}
             </span>
           )}
@@ -488,35 +594,51 @@ export const NotificationCenter: React.FC = () => {
         )}
       </div>
 
-      {/* Live In-App Reply Toast Widget */}
+      {/* Live In-App News / Reply Toast Widget */}
       {toastNotif && (
-        <div className="fixed bottom-24 right-4 z-[60] w-80 max-w-[calc(100vw-2rem)] rounded-xl bg-[#121017] border border-[#821c2c]/60 shadow-2xl p-3.5 animate-fadeIn">
+        <div className="fixed bottom-24 right-4 z-[60] w-80 max-w-[calc(100vw-2rem)] rounded-xl bg-[#121017] border border-[#d92638]/55 shadow-2xl p-3.5 animate-fadeIn space-y-2.5">
           <div className="flex items-start justify-between gap-2">
-            <button
-              type="button"
-              onClick={() => openNotificationTarget(toastNotif)}
-              className="flex-1 text-left space-y-1 cursor-pointer min-w-0"
-            >
+            <div className="flex-1 text-left space-y-1 min-w-0">
               <div className="flex items-center gap-1.5 text-[11px] font-mono text-[#e28593]">
                 <Bell className="w-3.5 h-3.5 shrink-0" />
                 <span className="truncate">
-                  {toastNotif.actor_name} · {targetTypeLabel(toastNotif.target_type)}
+                  {toastNotif.type === 'news'
+                    ? 'Новости сайта'
+                    : `${toastNotif.actor_name} · ${targetTypeLabel(toastNotif.target_type)}`}
                 </span>
               </div>
-              <div className="text-xs font-medium text-[#f2eee9] truncate">
+              <div className="text-xs font-medium text-[#f2eee9] line-clamp-2">
                 {toastNotif.target_title}
               </div>
-              <p className="text-[11px] text-[#c7c0b6] line-clamp-2 leading-snug">
-                «{toastNotif.excerpt}»
-              </p>
-            </button>
+              {toastNotif.excerpt && (
+                <p className="text-[11px] text-[#c7c0b6] line-clamp-2 leading-snug">
+                  «{toastNotif.excerpt}»
+                </p>
+              )}
+            </div>
             <button
               type="button"
-              onClick={() => setToastNotif(null)}
+              onClick={dismissToastOnly}
               aria-label="Закрыть уведомление"
               className="p-1 text-[#736c64] hover:text-white cursor-pointer shrink-0"
             >
               <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+          <div className="flex items-center justify-end gap-2 pt-1 border-t border-white/[0.06]">
+            <button
+              type="button"
+              onClick={dismissToastOnly}
+              className="px-2.5 py-1 rounded-md border border-white/[0.1] bg-white/[0.03] hover:bg-white/[0.08] text-[11px] font-mono text-[#b5aea4] hover:text-white transition-colors cursor-pointer"
+            >
+              Закрыть
+            </button>
+            <button
+              type="button"
+              onClick={() => openNotificationTarget(toastNotif)}
+              className="px-2.5 py-1 rounded-md bg-[#821c2c] hover:bg-[#9b2336] text-[11px] font-mono text-white transition-colors cursor-pointer"
+            >
+              Открыть
             </button>
           </div>
         </div>
