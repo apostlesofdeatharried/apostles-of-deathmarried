@@ -670,6 +670,881 @@ export function parseBulkQuizInput(raw: unknown): {
   return { items, errors };
 }
 
+export type AchievementDifficultyTier = 'easy' | 'medium' | 'hard';
+export type AchievementRarity = 'common' | 'rare' | 'epic' | 'legendary';
+
+export interface AchievementDefinition {
+  id: string;
+  slug: string;
+  title_ru: string;
+  title_en: string;
+  desc_ru: string;
+  desc_en: string;
+  condition_ru: string;
+  condition_en: string;
+  category: string;
+  rarity: AchievementRarity;
+  difficulty_tier: AchievementDifficultyTier;
+  is_secret: 0 | 1;
+  icon: string;
+  xp_reward: number;
+}
+
+/**
+ * Single-source canonical catalog of all 52 achievements across 3 balanced difficulty tiers:
+ * - Easy ('easy'): 25–75 XP (starter 'archive_initiate' stays 0 XP so newly registered accounts start at 0 XP)
+ * - Medium ('medium'): 150–350 XP
+ * - Hard ('hard'): 500–1200 XP
+ * All 35 legacy `id` and `slug` identifiers are preserved 1:1 so existing user unlocks stay intact.
+ */
+export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
+  // =========================================================================
+  // EASY ('easy') — 16 achievements (1 starter at 0 XP + 15 in 25–75 XP)
+  // =========================================================================
+  {
+    id: 'ach_archive_initiate',
+    slug: 'archive_initiate',
+    title_ru: 'Участник архива',
+    title_en: 'Archive Member',
+    desc_ru: 'Создайте свой аккаунт в сообществе Apostles of deathmarried',
+    desc_en: 'Create your Apostles of deathmarried account',
+    condition_ru: 'Зарегистрироваться на сайте',
+    condition_en: 'Register an account',
+    category: 'getting_started',
+    rarity: 'common',
+    difficulty_tier: 'easy',
+    is_secret: 0,
+    icon: 'moon',
+    xp_reward: 0,
+  },
+  {
+    id: 'ach_first_listen',
+    slug: 'first_listen',
+    title_ru: 'Первый звук',
+    title_en: 'First Echo',
+    desc_ru: 'Прослушайте любую композицию в плеере архива до конца',
+    desc_en: 'Listen to any archive track to completion',
+    condition_ru: 'Дослушать 1 трек в архиве',
+    condition_en: 'Complete 1 archive track',
+    category: 'music',
+    rarity: 'common',
+    difficulty_tier: 'easy',
+    is_secret: 0,
+    icon: 'play',
+    xp_reward: 30,
+  },
+  {
+    id: 'ach_lyrics_reader',
+    slug: 'lyrics_reader',
+    title_ru: 'Между строк',
+    title_en: 'Between the Lines',
+    desc_ru: 'Откройте текст песни у любого трека или сингла в дискографии',
+    desc_en: 'Open lyrics for any track or single in the archive',
+    condition_ru: 'Открыть текст песни',
+    condition_en: 'Open track lyrics once',
+    category: 'music',
+    rarity: 'common',
+    difficulty_tier: 'easy',
+    is_secret: 0,
+    icon: 'book-open',
+    xp_reward: 30,
+  },
+  {
+    id: 'ach_easy_first_reply',
+    slug: 'easy_first_reply',
+    title_ru: 'Первый отклик',
+    title_en: 'First Reply',
+    desc_ru: 'Оставьте свой первый комментарий в обсуждении релиза, темы или творчества',
+    desc_en: 'Post your first reply in a discussion',
+    condition_ru: 'Оставить 1 комментарий',
+    condition_en: 'Write 1 comment',
+    category: 'community',
+    rarity: 'common',
+    difficulty_tier: 'easy',
+    is_secret: 0,
+    icon: 'message-square',
+    xp_reward: 30,
+  },
+  {
+    id: 'ach_shadow_identity',
+    slug: 'shadow_identity',
+    title_ru: 'Личный почерк',
+    title_en: 'Personal Mark',
+    desc_ru: 'Заполните раздел «О себе», статус, любимый трек или загрузите свой аватар',
+    desc_en: 'Customize your profile bio, status, favorite track, or avatar',
+    condition_ru: 'Оформить профиль (био, статус или аватар)',
+    condition_en: 'Customize your profile',
+    category: 'getting_started',
+    rarity: 'common',
+    difficulty_tier: 'easy',
+    is_secret: 0,
+    icon: 'feather',
+    xp_reward: 35,
+  },
+  {
+    id: 'ach_first_blood',
+    slug: 'first_blood',
+    title_ru: 'Первый шаг',
+    title_en: 'First Step',
+    desc_ru: 'Сыграйте в любое ежедневное испытание архива',
+    desc_en: 'Play your first interactive challenge',
+    condition_ru: 'Завершить 1 игру',
+    condition_en: 'Complete 1 game',
+    category: 'getting_started',
+    rarity: 'common',
+    difficulty_tier: 'easy',
+    is_secret: 0,
+    icon: 'play',
+    xp_reward: 35,
+  },
+  {
+    id: 'ach_share_card_first',
+    slug: 'share_card_first',
+    title_ru: 'Вестник архива',
+    title_en: 'Archive Herald',
+    desc_ru: 'Сохраните PNG-карточку с цитатой, результатом игры или профилем',
+    desc_en: 'Save a PNG share card of lyrics, game result, or profile',
+    condition_ru: 'Скачать PNG-карточку',
+    condition_en: 'Save 1 PNG share card',
+    category: 'community',
+    rarity: 'common',
+    difficulty_tier: 'easy',
+    is_secret: 0,
+    icon: 'sparkles',
+    xp_reward: 40,
+  },
+  {
+    id: 'ach_quiz_seeker',
+    slug: 'quiz_seeker',
+    title_ru: 'Искатель фактов',
+    title_en: 'Lore Seeker',
+    desc_ru: 'Завершите первую ежедневную викторину архива',
+    desc_en: 'Complete your first Daily Quiz',
+    condition_ru: 'Пройти 1 ежедневную викторину',
+    condition_en: 'Complete 1 Daily Quiz',
+    category: 'quiz',
+    rarity: 'common',
+    difficulty_tier: 'easy',
+    is_secret: 0,
+    icon: 'book-open',
+    xp_reward: 40,
+  },
+  {
+    id: 'ach_collector',
+    slug: 'collector',
+    title_ru: 'Коллекционер',
+    title_en: 'Collector',
+    desc_ru: 'Приобретите первый предмет в магазине кастомизации',
+    desc_en: 'Acquire your first item in the XP Shop',
+    condition_ru: 'Купить 1 предмет в магазине',
+    condition_en: 'Buy 1 shop item',
+    category: 'collector',
+    rarity: 'common',
+    difficulty_tier: 'easy',
+    is_secret: 0,
+    icon: 'tag',
+    xp_reward: 40,
+  },
+  {
+    id: 'ach_first_note',
+    slug: 'first_note',
+    title_ru: 'Узнанный аккорд',
+    title_en: 'Recognized Chord',
+    desc_ru: 'Впервые угадайте трек дня по 5-секундному отрывку',
+    desc_en: 'Correctly guess a Daily Track from its 5-second snippet',
+    condition_ru: '1 победа в «Угадай трек»',
+    condition_en: '1 Guess The Track win',
+    category: 'music',
+    rarity: 'common',
+    difficulty_tier: 'easy',
+    is_secret: 0,
+    icon: 'music',
+    xp_reward: 45,
+  },
+  {
+    id: 'ach_first_chronicle',
+    slug: 'first_chronicle',
+    title_ru: 'Первая запись',
+    title_en: 'First Chronicle',
+    desc_ru: 'Создайте свою первую тему на форуме сообщества',
+    desc_en: 'Publish your first community forum topic',
+    condition_ru: 'Создать 1 тему на форуме',
+    condition_en: 'Create 1 forum topic',
+    category: 'community',
+    rarity: 'common',
+    difficulty_tier: 'easy',
+    is_secret: 0,
+    icon: 'message-square',
+    xp_reward: 45,
+  },
+  {
+    id: 'ach_easy_avid_reader',
+    slug: 'easy_avid_reader',
+    title_ru: 'Читатель форума',
+    title_en: 'Forum Reader',
+    desc_ru: 'Откройте и прочитайте 5 разных тем в сообществе',
+    desc_en: 'Read 5 distinct topics in the community',
+    condition_ru: 'Прочитать 5 тем в сообществе',
+    condition_en: 'Read 5 community topics',
+    category: 'community',
+    rarity: 'common',
+    difficulty_tier: 'easy',
+    is_secret: 0,
+    icon: 'book-open',
+    xp_reward: 45,
+  },
+  {
+    id: 'ach_secret_first_code',
+    slug: 'secret_first_code',
+    title_ru: 'Первый код',
+    title_en: 'First Code',
+    desc_ru: 'Вы нашли и активировали свой первый секретный промокод',
+    desc_en: 'Redeem your first promo code',
+    condition_ru: 'Активировать любой промокод',
+    condition_en: 'Redeem any promo code',
+    category: 'secret',
+    rarity: 'rare',
+    difficulty_tier: 'easy',
+    is_secret: 1,
+    icon: 'tag',
+    xp_reward: 50,
+  },
+  {
+    id: 'ach_track_duo',
+    slug: 'track_duo',
+    title_ru: 'Двойная проба',
+    title_en: 'Double Trial',
+    desc_ru: 'Попробуйте как минимум 2 разных игровых режима архива',
+    desc_en: 'Play at least 2 different archive game modes',
+    condition_ru: 'Сыграть в 2 разных игры',
+    condition_en: 'Play 2 distinct games',
+    category: 'music',
+    rarity: 'common',
+    difficulty_tier: 'easy',
+    is_secret: 0,
+    icon: 'compass',
+    xp_reward: 55,
+  },
+  {
+    id: 'ach_dressed_in_velvet',
+    slug: 'dressed_in_velvet',
+    title_ru: 'Стиль архива',
+    title_en: 'Archive Style',
+    desc_ru: 'Одновременно экипируйте 3 элемента оформления профиля',
+    desc_en: 'Equip 3 customization layers simultaneously',
+    condition_ru: 'Экипировать 3 предмета одновременно',
+    condition_en: 'Equip 3 items at once',
+    category: 'collector',
+    rarity: 'rare',
+    difficulty_tier: 'easy',
+    is_secret: 0,
+    icon: 'sparkles',
+    xp_reward: 60,
+  },
+  {
+    id: 'ach_coven_circle',
+    slug: 'coven_circle',
+    title_ru: 'Свой круг',
+    title_en: 'Inner Circle',
+    desc_ru: 'Наберите 3 подписчиков или подпишитесь на 3 участников',
+    desc_en: 'Reach 3 followers or follow 3 community members',
+    condition_ru: '3 подписчика или 3 подписки',
+    condition_en: '3 followers or following',
+    category: 'community',
+    rarity: 'rare',
+    difficulty_tier: 'easy',
+    is_secret: 0,
+    icon: 'users',
+    xp_reward: 75,
+  },
+
+  // =========================================================================
+  // MEDIUM ('medium') — 19 achievements (150–350 XP)
+  // =========================================================================
+  {
+    id: 'ach_devoted_acolyte',
+    slug: 'devoted_acolyte',
+    title_ru: 'Преданный слушатель',
+    title_en: 'Devoted Listener',
+    desc_ru: 'Поддерживайте серию ежедневной активности 5 дней подряд по МСК',
+    desc_en: 'Maintain a 5-day daily streak',
+    condition_ru: 'Серия 5 дней подряд',
+    condition_en: '5-day daily streak',
+    category: 'consistency',
+    rarity: 'rare',
+    difficulty_tier: 'medium',
+    is_secret: 0,
+    icon: 'calendar',
+    xp_reward: 150,
+  },
+  {
+    id: 'ach_secret_curious_rose',
+    slug: 'secret_curious_rose',
+    title_ru: 'Любопытный',
+    title_en: 'Curious Mind',
+    desc_ru: 'Вы нашли пасхалку и нажали 5 раз на спрятанную деталь в оформлении сайта',
+    desc_en: 'Click 5 times on the hidden rose detail in the header',
+    condition_ru: 'Нажать 5 раз на скрытую розу в шапке сайта',
+    condition_en: 'Click 5 times on the hidden rose emblem',
+    category: 'secret',
+    rarity: 'rare',
+    difficulty_tier: 'medium',
+    is_secret: 1,
+    icon: 'eye',
+    xp_reward: 150,
+  },
+  {
+    id: 'ach_initiate_ritual',
+    slug: 'initiate_ritual',
+    title_ru: 'Чуткий слух',
+    title_en: 'Musical Ear',
+    desc_ru: 'Завершите 10 раундов в ежедневных играх архива',
+    desc_en: 'Complete 10 interactive game sessions',
+    condition_ru: 'Сыграть 10 игр',
+    condition_en: 'Play 10 games',
+    category: 'music',
+    rarity: 'rare',
+    difficulty_tier: 'medium',
+    is_secret: 0,
+    icon: 'headphones',
+    xp_reward: 160,
+  },
+  {
+    id: 'ach_midnight_critic',
+    slug: 'midnight_critic',
+    title_ru: 'Ночной собеседник',
+    title_en: 'Nocturnal Critic',
+    desc_ru: 'Оставьте 10 комментариев в обсуждениях сообщества и релизов',
+    desc_en: 'Post 10 comments across discussions and releases',
+    condition_ru: 'Оставить 10 комментариев',
+    condition_en: 'Write 10 comments',
+    category: 'community',
+    rarity: 'rare',
+    difficulty_tier: 'medium',
+    is_secret: 0,
+    icon: 'feather',
+    xp_reward: 165,
+  },
+  {
+    id: 'ach_vinyl_hunter',
+    slug: 'vinyl_hunter',
+    title_ru: 'Охотник за винилом',
+    title_en: 'Vinyl Hunter',
+    desc_ru: 'Угадайте 5 ежедневных композиций deathmarried в «Угадай трек»',
+    desc_en: 'Guess 5 daily deathmarried tracks correctly',
+    condition_ru: '5 побед в «Угадай трек»',
+    condition_en: '5 Guess The Track wins',
+    category: 'music',
+    rarity: 'rare',
+    difficulty_tier: 'medium',
+    is_secret: 0,
+    icon: 'disc',
+    xp_reward: 180,
+  },
+  {
+    id: 'ach_voice_of_abyss',
+    slug: 'voice_of_abyss',
+    title_ru: 'Голос сообщества',
+    title_en: 'Community Voice',
+    desc_ru: 'Создайте 3 записи на форуме сообщества',
+    desc_en: 'Create 3 community forum discussions',
+    condition_ru: 'Создать 3 темы на форуме',
+    condition_en: 'Create 3 forum topics',
+    category: 'community',
+    rarity: 'rare',
+    difficulty_tier: 'medium',
+    is_secret: 0,
+    icon: 'message-square',
+    xp_reward: 185,
+  },
+  {
+    id: 'ach_gothic_artisan',
+    slug: 'gothic_artisan',
+    title_ru: 'Творец',
+    title_en: 'Creator',
+    desc_ru: 'Опубликуйте свою работу в творческой галерее и пройдите модерацию',
+    desc_en: 'Have your work approved in the Creations gallery',
+    condition_ru: '1 одобренная работа в галерее',
+    condition_en: '1 approved creation',
+    category: 'community',
+    rarity: 'rare',
+    difficulty_tier: 'medium',
+    is_secret: 0,
+    icon: 'sparkles',
+    xp_reward: 190,
+  },
+  {
+    id: 'ach_discography_listener',
+    slug: 'discography_listener',
+    title_ru: 'Хранитель каталога',
+    title_en: 'Catalog Keeper',
+    desc_ru: 'Прослушайте до конца 15 разных композиций из дискографии deathmarried',
+    desc_en: 'Listen to 15 unique tracks from the catalog to completion',
+    condition_ru: 'Дослушать 15 разных треков',
+    condition_en: 'Complete 15 unique tracks',
+    category: 'music',
+    rarity: 'rare',
+    difficulty_tier: 'medium',
+    is_secret: 0,
+    icon: 'disc',
+    xp_reward: 200,
+  },
+  {
+    id: 'ach_all_games_explorer',
+    slug: 'all_games_explorer',
+    title_ru: 'Пять ритуалов',
+    title_en: 'Five Rituals',
+    desc_ru: 'Сыграйте хотя бы по одному разу во все 5 игр архива',
+    desc_en: 'Play every one of the 5 archive games at least once',
+    condition_ru: 'Сыграть во все 5 игр',
+    condition_en: 'Play all 5 game modes',
+    category: 'music',
+    rarity: 'rare',
+    difficulty_tier: 'medium',
+    is_secret: 0,
+    icon: 'compass',
+    xp_reward: 210,
+  },
+  {
+    id: 'ach_lyrics_hunter',
+    slug: 'lyrics_hunter',
+    title_ru: 'Хранитель строчек',
+    title_en: 'Verse Keeper',
+    desc_ru: 'Одержите 5 побед в игре «Угадай строчку»',
+    desc_en: 'Win 5 rounds in Guess the Lyrics',
+    condition_ru: '5 побед в «Угадай строчку»',
+    condition_en: '5 Guess Lyrics wins',
+    category: 'music',
+    rarity: 'rare',
+    difficulty_tier: 'medium',
+    is_secret: 0,
+    icon: 'feather',
+    xp_reward: 220,
+  },
+  {
+    id: 'ach_reverse_decoder',
+    slug: 'reverse_decoder',
+    title_ru: 'Ловец реверса',
+    title_en: 'Reverse Decoder',
+    desc_ru: 'Одержите 5 побед в игре «Задом наперёд»',
+    desc_en: 'Win 5 rounds in Reverse Track',
+    condition_ru: '5 побед в «Задом наперёд»',
+    condition_en: '5 Reverse Track wins',
+    category: 'music',
+    rarity: 'rare',
+    difficulty_tier: 'medium',
+    is_secret: 0,
+    icon: 'headphones',
+    xp_reward: 230,
+  },
+  {
+    id: 'ach_speed_runner',
+    slug: 'speed_runner',
+    title_ru: 'Повелитель темпа',
+    title_en: 'Tempo Weaver',
+    desc_ru: 'Одержите 5 побед в испытании «Трек 0.5x / 2.5x»',
+    desc_en: 'Win 5 rounds in Speed Track 0.5x / 2.5x',
+    condition_ru: '5 побед в «Трек 0.5x / 2.5x»',
+    condition_en: '5 Speed Track wins',
+    category: 'music',
+    rarity: 'rare',
+    difficulty_tier: 'medium',
+    is_secret: 0,
+    icon: 'zap',
+    xp_reward: 230,
+  },
+  {
+    id: 'ach_lore_scholar',
+    slug: 'lore_scholar',
+    title_ru: 'Знаток дискографии',
+    title_en: 'Discography Connoisseur',
+    desc_ru: 'Пройдите ежедневную викторину без единой ошибки',
+    desc_en: 'Achieve a perfect score in Daily Quiz',
+    condition_ru: '100% правильных ответов в викторине',
+    condition_en: 'Perfect score in Daily Quiz',
+    category: 'quiz',
+    rarity: 'rare',
+    difficulty_tier: 'medium',
+    is_secret: 0,
+    icon: 'award',
+    xp_reward: 240,
+  },
+  {
+    id: 'ach_relic_hoarder',
+    slug: 'relic_hoarder',
+    title_ru: 'Собиратель реликвий',
+    title_en: 'Relic Curator',
+    desc_ru: 'Соберите 5 предметов кастомизации в своей коллекции',
+    desc_en: 'Own 5 customization items',
+    condition_ru: 'Собрать 5 предметов коллекции',
+    condition_en: 'Own 5 shop items',
+    category: 'collector',
+    rarity: 'rare',
+    difficulty_tier: 'medium',
+    is_secret: 0,
+    icon: 'gem',
+    xp_reward: 250,
+  },
+  {
+    id: 'ach_win_streak_5',
+    slug: 'win_streak_5',
+    title_ru: 'Пять точных нот',
+    title_en: 'Five in a Row',
+    desc_ru: 'Одержите 5 побед подряд в играх архива без поражений',
+    desc_en: 'Win 5 archive games in a row',
+    condition_ru: 'Серия из 5 побед подряд в играх',
+    condition_en: '5 consecutive game wins',
+    category: 'music',
+    rarity: 'epic',
+    difficulty_tier: 'medium',
+    is_secret: 0,
+    icon: 'flame',
+    xp_reward: 270,
+  },
+  {
+    id: 'ach_cathedral_historian',
+    slug: 'cathedral_historian',
+    title_ru: 'Летописец свода',
+    title_en: 'Cathedral Historian',
+    desc_ru: 'Завершите 10 ежедневных викторин архива',
+    desc_en: 'Complete 10 Daily Quizzes',
+    condition_ru: 'Пройти 10 викторин',
+    condition_en: 'Complete 10 Daily Quizzes',
+    category: 'quiz',
+    rarity: 'epic',
+    difficulty_tier: 'medium',
+    is_secret: 0,
+    icon: 'compass',
+    xp_reward: 280,
+  },
+  {
+    id: 'ach_eternal_vigil',
+    slug: 'eternal_vigil',
+    title_ru: 'Декада в ритме',
+    title_en: 'Ten Nights',
+    desc_ru: 'Поддерживайте серию ежедневной активности 10 дней подряд по МСК',
+    desc_en: 'Maintain a 10-day daily streak',
+    condition_ru: 'Серия 10 дней подряд',
+    condition_en: '10-day daily streak',
+    category: 'consistency',
+    rarity: 'epic',
+    difficulty_tier: 'medium',
+    is_secret: 0,
+    icon: 'shield',
+    xp_reward: 300,
+  },
+  {
+    id: 'ach_dark_apostle',
+    slug: 'dark_apostle',
+    title_ru: 'Мастер звука',
+    title_en: 'Sound Master',
+    desc_ru: 'Наберите 1500 суммарных очков опыта (Total XP)',
+    desc_en: 'Attain 1500 lifetime Total XP',
+    condition_ru: 'Набрать 1500 Total XP',
+    condition_en: 'Reach 1500 Total XP',
+    category: 'veteran',
+    rarity: 'epic',
+    difficulty_tier: 'medium',
+    is_secret: 0,
+    icon: 'trophy',
+    xp_reward: 320,
+  },
+  {
+    id: 'ach_all_games_winner',
+    slug: 'all_games_winner',
+    title_ru: 'Пятикратный триумф',
+    title_en: 'Fivefold Triumph',
+    desc_ru: 'Победите хотя бы по одному разу во всех 5 игровых режимах архива',
+    desc_en: 'Win at least once in each of all 5 game modes',
+    condition_ru: 'Победить в каждой из 5 игр',
+    condition_en: 'Win in all 5 game modes',
+    category: 'music',
+    rarity: 'epic',
+    difficulty_tier: 'medium',
+    is_secret: 0,
+    icon: 'crown',
+    xp_reward: 350,
+  },
+
+  // =========================================================================
+  // HARD ('hard') — 17 achievements (500–1200 XP)
+  // =========================================================================
+  {
+    id: 'ach_hard_community_reader',
+    slug: 'hard_community_reader',
+    title_ru: 'Хроникёр форума',
+    title_en: 'Forum Chronicler',
+    desc_ru: 'Прочитайте 25 разных тем и обсуждений на форуме сообщества',
+    desc_en: 'Read 25 distinct topics in the community',
+    condition_ru: 'Прочитать 25 тем в сообществе',
+    condition_en: 'Read 25 community topics',
+    category: 'community',
+    rarity: 'epic',
+    difficulty_tier: 'hard',
+    is_secret: 0,
+    icon: 'book-open',
+    xp_reward: 500,
+  },
+  {
+    id: 'ach_secret_midnight_visitor',
+    slug: 'secret_midnight_visitor',
+    title_ru: 'Полуночник',
+    title_en: 'Midnight Visitor',
+    desc_ru: 'Вы заглянули в архив в самый тихий час — с 00:00 до 00:15 по МСК',
+    desc_en: 'Visit the archive between 00:00 and 00:15 Moscow time',
+    condition_ru: 'Зайти на сайт с 00:00 до 00:15 по МСК',
+    condition_en: 'Visit between 00:00 and 00:15 MSK',
+    category: 'secret',
+    rarity: 'epic',
+    difficulty_tier: 'hard',
+    is_secret: 1,
+    icon: 'moon',
+    xp_reward: 500,
+  },
+  {
+    id: 'ach_phantom_ear',
+    slug: 'phantom_ear',
+    title_ru: 'Абсолютный слух',
+    title_en: 'Phantom Ear',
+    desc_ru: 'Угадайте 15 ежедневных композиций по 5-секундному фрагменту',
+    desc_en: 'Guess 15 daily tracks from 5-second snippets',
+    condition_ru: '15 побед в «Угадай трек»',
+    condition_en: '15 Guess The Track wins',
+    category: 'music',
+    rarity: 'epic',
+    difficulty_tier: 'hard',
+    is_secret: 0,
+    icon: 'headphones',
+    xp_reward: 550,
+  },
+  {
+    id: 'ach_secret_flawless_quiz',
+    slug: 'secret_flawless_quiz',
+    title_ru: 'Без права на ошибку',
+    title_en: 'Flawless Run',
+    desc_ru: 'Безупречная эрудиция — пройдите ежедневную викторину на 100% трижды',
+    desc_en: 'Complete Daily Quiz with a flawless 100% score 3 times',
+    condition_ru: '3 идеальных прохождения викторины',
+    condition_en: '3 perfect Daily Quiz runs',
+    category: 'secret',
+    rarity: 'legendary',
+    difficulty_tier: 'hard',
+    is_secret: 1,
+    icon: 'crown',
+    xp_reward: 550,
+  },
+  {
+    id: 'ach_ritual_master',
+    slug: 'ritual_master',
+    title_ru: 'Мастер испытаний',
+    title_en: 'Trial Master',
+    desc_ru: 'Примите участие в 40 игровых испытаниях сообщества',
+    desc_en: 'Complete 40 archive game trials',
+    condition_ru: 'Сыграть 40 игр',
+    condition_en: 'Play 40 games',
+    category: 'music',
+    rarity: 'epic',
+    difficulty_tier: 'hard',
+    is_secret: 0,
+    icon: 'zap',
+    xp_reward: 600,
+  },
+  {
+    id: 'ach_creation_idol',
+    slug: 'creation_idol',
+    title_ru: 'Кумир галереи',
+    title_en: 'Gallery Idol',
+    desc_ru: 'Соберите 10 роз от других участников на ваших одобренных работах',
+    desc_en: 'Receive 10 rose reactions from others on approved creations',
+    condition_ru: 'Получить 10 роз на одобренных работах',
+    condition_en: '10 rose reactions on creations',
+    category: 'community',
+    rarity: 'epic',
+    difficulty_tier: 'hard',
+    is_secret: 0,
+    icon: 'sparkles',
+    xp_reward: 600,
+  },
+  {
+    id: 'ach_secret_on_repeat',
+    slug: 'secret_on_repeat',
+    title_ru: 'На репите',
+    title_en: 'On Repeat',
+    desc_ru: 'Вы прослушали один и тот же трек полностью 15 раз',
+    desc_en: 'Listen to any single track to completion 15 times',
+    condition_ru: 'Прослушать один трек полностью 15 раз',
+    condition_en: 'Play any single track to the end 15 times',
+    category: 'secret',
+    rarity: 'epic',
+    difficulty_tier: 'hard',
+    is_secret: 1,
+    icon: 'disc',
+    xp_reward: 650,
+  },
+  {
+    id: 'ach_obsidian_oracle',
+    slug: 'obsidian_oracle',
+    title_ru: 'Обсидиановый оракул',
+    title_en: 'Obsidian Oracle',
+    desc_ru: 'Пройдите ежедневную викторину без ошибок 5 раз',
+    desc_en: 'Score 100% in Daily Quiz 5 times',
+    condition_ru: '5 идеальных прохождений викторины',
+    condition_en: '5 perfect Daily Quiz runs',
+    category: 'quiz',
+    rarity: 'legendary',
+    difficulty_tier: 'hard',
+    is_secret: 0,
+    icon: 'eye',
+    xp_reward: 700,
+  },
+  {
+    id: 'ach_midnight_devotion',
+    slug: 'midnight_devotion',
+    title_ru: 'Полуночная вахта',
+    title_en: 'Midnight Vigil',
+    desc_ru: 'Возвращайтесь в архив 21 день подряд без перерыва',
+    desc_en: 'Maintain a 21-day daily streak',
+    condition_ru: 'Серия 21 день подряд',
+    condition_en: '21-day daily streak',
+    category: 'consistency',
+    rarity: 'epic',
+    difficulty_tier: 'hard',
+    is_secret: 0,
+    icon: 'flame',
+    xp_reward: 700,
+  },
+  {
+    id: 'ach_archive_completionist',
+    slug: 'archive_completionist',
+    title_ru: 'Полная дискография',
+    title_en: 'Complete Discography',
+    desc_ru: 'Прослушайте до конца 25 разных треков и синглов архива',
+    desc_en: 'Listen to 25 unique archive tracks to completion',
+    condition_ru: 'Дослушать 25 разных треков',
+    condition_en: 'Complete 25 unique tracks',
+    category: 'music',
+    rarity: 'legendary',
+    difficulty_tier: 'hard',
+    is_secret: 0,
+    icon: 'music',
+    xp_reward: 750,
+  },
+  {
+    id: 'ach_win_streak_10',
+    slug: 'win_streak_10',
+    title_ru: 'Десять безупречных нот',
+    title_en: 'Ten in a Row',
+    desc_ru: 'Одержите 10 побед подряд в ежедневных играх архива',
+    desc_en: 'Win 10 archive games in a row',
+    condition_ru: 'Серия из 10 побед подряд в играх',
+    condition_en: '10 consecutive game wins',
+    category: 'music',
+    rarity: 'legendary',
+    difficulty_tier: 'hard',
+    is_secret: 0,
+    icon: 'trophy',
+    xp_reward: 800,
+  },
+  {
+    id: 'ach_archon_of_sound',
+    slug: 'archon_of_sound',
+    title_ru: 'Ветеран архива',
+    title_en: 'Archive Veteran',
+    desc_ru: 'Достигните 5000 Total XP или 12-го уровня профиля',
+    desc_en: 'Reach 5000 Total XP or Profile Level 12',
+    condition_ru: '5000 Total XP или 12-й уровень',
+    condition_en: '5000 Total XP or Level 12',
+    category: 'veteran',
+    rarity: 'legendary',
+    difficulty_tier: 'hard',
+    is_secret: 0,
+    icon: 'star',
+    xp_reward: 800,
+  },
+  {
+    id: 'ach_gothic_treasury',
+    slug: 'gothic_treasury',
+    title_ru: 'Большая коллекция',
+    title_en: 'Grand Treasury',
+    desc_ru: 'Соберите 15 предметов оформления в своём инвентаре',
+    desc_en: 'Own 15 customization items',
+    condition_ru: 'Собрать 15 предметов коллекции',
+    condition_en: 'Own 15 shop items',
+    category: 'collector',
+    rarity: 'legendary',
+    difficulty_tier: 'hard',
+    is_secret: 0,
+    icon: 'layers',
+    xp_reward: 850,
+  },
+  {
+    id: 'ach_meta_collector_20',
+    slug: 'meta_collector_20',
+    title_ru: 'Хранитель печатей',
+    title_en: 'Seal Keeper',
+    desc_ru: 'Откройте любые 20 достижений в архиве Apostles of deathmarried',
+    desc_en: 'Unlock any 20 archive achievements',
+    condition_ru: 'Открыть 20 достижений',
+    condition_en: 'Unlock 20 achievements',
+    category: 'veteran',
+    rarity: 'legendary',
+    difficulty_tier: 'hard',
+    is_secret: 0,
+    icon: 'shield',
+    xp_reward: 850,
+  },
+  {
+    id: 'ach_grand_champion',
+    slug: 'grand_champion',
+    title_ru: 'Магистр состязаний',
+    title_en: 'Grand Champion',
+    desc_ru: 'Одержите 50 побед суммарно во всех 5 игровых режимах архива',
+    desc_en: 'Achieve 50 total wins across all 5 archive games',
+    condition_ru: '50 побед в играх архива',
+    condition_en: '50 total game wins',
+    category: 'music',
+    rarity: 'legendary',
+    difficulty_tier: 'hard',
+    is_secret: 0,
+    icon: 'trophy',
+    xp_reward: 900,
+  },
+  {
+    id: 'ach_immortal_flame',
+    slug: 'immortal_flame',
+    title_ru: 'Негасимое пламя',
+    title_en: 'Immortal Flame',
+    desc_ru: 'Выдержите серию ежедневной активности 30 дней подряд',
+    desc_en: 'Maintain a 30-day unbroken daily streak',
+    condition_ru: 'Серия 30 дней подряд',
+    condition_en: '30-day daily streak',
+    category: 'consistency',
+    rarity: 'legendary',
+    difficulty_tier: 'hard',
+    is_secret: 0,
+    icon: 'crown',
+    xp_reward: 1000,
+  },
+  {
+    id: 'ach_meta_legend_35',
+    slug: 'meta_legend_35',
+    title_ru: 'Апостол архива',
+    title_en: 'Apostle of the Archive',
+    desc_ru: 'Откройте 35 достижений и станьте живой легендой Apostles of deathmarried',
+    desc_en: 'Unlock 35 achievements to become a legend of the Archive',
+    condition_ru: 'Открыть 35 достижений',
+    condition_en: 'Unlock 35 achievements',
+    category: 'veteran',
+    rarity: 'legendary',
+    difficulty_tier: 'hard',
+    is_secret: 0,
+    icon: 'crown',
+    xp_reward: 1200,
+  },
+] as const;
+
+export const META_ACHIEVEMENT_SLUGS = new Set(['meta_collector_20', 'meta_legend_35']);
+
 export interface AchievementMetrics {
   isRegistered?: boolean;
   gamesPlayed: number;
@@ -685,6 +1560,8 @@ export interface AchievementMetrics {
   postsCount: number;
   commentsCount: number;
   creationsCount: number;
+  approvedCreationsCount?: number;
+  creationRosesTotal?: number;
   followersCount: number;
   followingCount: number;
   hasCustomProfile?: boolean;
@@ -692,70 +1569,107 @@ export interface AchievementMetrics {
   postsReadCount?: number;
   promoRedeemedCount?: number;
   maxTrackCompletions?: number;
+  uniqueTracksListened?: number;
   visitedMidnightMsk?: boolean;
   clickedSecretRose?: boolean;
+  lyricsOpenedCount?: number;
+  shareCardCount?: number;
+  totalGameWins?: number;
+  distinctGamesPlayed?: number;
+  distinctGamesWon?: number;
+  bestGameWinStreak?: number;
+  guessLyricsWins?: number;
+  reverseTrackWins?: number;
+  speedTrackWins?: number;
+  existingRegularUnlockedCount?: number;
 }
 
 /**
- * Pure server-authoritative achievement evaluator across all easy, hard, and secret achievements.
+ * Pure server-authoritative achievement evaluator across all 52 easy, medium, hard & secret achievements.
  * Never depends on client-supplied unlock flags.
  */
 export function evaluateAchievementSlugs(m: AchievementMetrics): string[] {
-  const slugs: string[] = [];
+  const regularSlugs: string[] = [];
   const postsRead = Number(m.postsReadCount || 0);
   const promoRedeemed = Number(m.promoRedeemedCount || 0);
   const maxTrackCompletions = Number(m.maxTrackCompletions || 0);
+  const uniqueTracks = Number(m.uniqueTracksListened || 0);
+  const lyricsOpened = Number(m.lyricsOpenedCount || 0);
+  const shareCards = Number(m.shareCardCount || 0);
+  const distinctGamesPlayed = Number(m.distinctGamesPlayed || 0);
+  const distinctGamesWon = Number(m.distinctGamesWon || 0);
+  const totalGameWins = Number(m.totalGameWins || 0);
+  const bestGameWinStreak = Number(m.bestGameWinStreak || 0);
+  const guessLyricsWins = Number(m.guessLyricsWins || 0);
+  const reverseTrackWins = Number(m.reverseTrackWins || 0);
+  const speedTrackWins = Number(m.speedTrackWins || 0);
+  const approvedCreations = Number(m.approvedCreationsCount ?? m.creationsCount ?? 0);
+  const creationRoses = Number(m.creationRosesTotal || 0);
 
-  // Getting Started
-  if (m.isRegistered) slugs.push('archive_initiate');
-  if (m.hasCustomProfile) slugs.push('shadow_identity');
-  if (m.gamesPlayed >= 1) slugs.push('first_blood');
+  // Easy Tier
+  if (m.isRegistered) regularSlugs.push('archive_initiate');
+  if (uniqueTracks >= 1) regularSlugs.push('first_listen');
+  if (lyricsOpened >= 1) regularSlugs.push('lyrics_reader');
+  if (m.commentsCount >= 1) regularSlugs.push('easy_first_reply');
+  if (m.hasCustomProfile) regularSlugs.push('shadow_identity');
+  if (m.gamesPlayed >= 1) regularSlugs.push('first_blood');
+  if (shareCards >= 1) regularSlugs.push('share_card_first');
+  if (m.quizPlayed >= 1) regularSlugs.push('quiz_seeker');
+  if (m.purchasesCount >= 1) regularSlugs.push('collector');
+  if (m.guessTrackWins >= 1) regularSlugs.push('first_note');
+  if (m.postsCount >= 1) regularSlugs.push('first_chronicle');
+  if (postsRead >= 5) regularSlugs.push('easy_avid_reader');
+  if (promoRedeemed >= 1) regularSlugs.push('secret_first_code');
+  if (distinctGamesPlayed >= 2) regularSlugs.push('track_duo');
+  if (m.equippedItemsCount >= 3) regularSlugs.push('dressed_in_velvet');
+  if (m.followersCount >= 3 || m.followingCount >= 3) regularSlugs.push('coven_circle');
 
-  // Music / Guess The Track
-  if (m.guessTrackWins >= 1) slugs.push('first_note');
-  if (m.guessTrackWins >= 5) slugs.push('vinyl_hunter');
-  if (m.guessTrackWins >= 15) slugs.push('phantom_ear');
-  if (m.gamesPlayed >= 10) slugs.push('initiate_ritual');
-  if (m.gamesPlayed >= 30) slugs.push('ritual_master');
+  // Medium Tier
+  if (m.dailyStreak >= 5) regularSlugs.push('devoted_acolyte');
+  if (m.clickedSecretRose) regularSlugs.push('secret_curious_rose');
+  if (m.gamesPlayed >= 10) regularSlugs.push('initiate_ritual');
+  if (m.commentsCount >= 10) regularSlugs.push('midnight_critic');
+  if (m.guessTrackWins >= 5) regularSlugs.push('vinyl_hunter');
+  if (m.postsCount >= 3) regularSlugs.push('voice_of_abyss');
+  if (approvedCreations >= 1) regularSlugs.push('gothic_artisan');
+  if (uniqueTracks >= 15) regularSlugs.push('discography_listener');
+  if (distinctGamesPlayed >= 5) regularSlugs.push('all_games_explorer');
+  if (guessLyricsWins >= 5) regularSlugs.push('lyrics_hunter');
+  if (reverseTrackWins >= 5) regularSlugs.push('reverse_decoder');
+  if (speedTrackWins >= 5) regularSlugs.push('speed_runner');
+  if (m.quizPerfectRuns >= 1) regularSlugs.push('lore_scholar');
+  if (m.purchasesCount >= 5) regularSlugs.push('relic_hoarder');
+  if (bestGameWinStreak >= 5) regularSlugs.push('win_streak_5');
+  if (m.quizPlayed >= 10) regularSlugs.push('cathedral_historian');
+  if (m.dailyStreak >= 10) regularSlugs.push('eternal_vigil');
+  if (m.totalXp >= 1500) regularSlugs.push('dark_apostle');
+  if (distinctGamesWon >= 5) regularSlugs.push('all_games_winner');
 
-  // Quiz / Discography Knowledge
-  if (m.quizPlayed >= 1) slugs.push('quiz_seeker');
-  if (m.quizPerfectRuns >= 1) slugs.push('lore_scholar');
-  if (m.quizPerfectRuns >= 3) slugs.push('obsidian_oracle');
-  if (m.quizPlayed >= 10) slugs.push('cathedral_historian');
+  // Hard Tier
+  if (postsRead >= 25) regularSlugs.push('hard_community_reader');
+  if (m.visitedMidnightMsk) regularSlugs.push('secret_midnight_visitor');
+  if (m.guessTrackWins >= 15) regularSlugs.push('phantom_ear');
+  if (m.quizPerfectRuns >= 3) regularSlugs.push('secret_flawless_quiz');
+  if (m.gamesPlayed >= 40) regularSlugs.push('ritual_master');
+  if (creationRoses >= 10) regularSlugs.push('creation_idol');
+  if (maxTrackCompletions >= 15) regularSlugs.push('secret_on_repeat');
+  if (m.quizPerfectRuns >= 5) regularSlugs.push('obsidian_oracle');
+  if (m.dailyStreak >= 21) regularSlugs.push('midnight_devotion');
+  if (uniqueTracks >= 25) regularSlugs.push('archive_completionist');
+  if (bestGameWinStreak >= 10) regularSlugs.push('win_streak_10');
+  if (m.totalXp >= 5000 || m.level >= 12) regularSlugs.push('archon_of_sound');
+  if (m.purchasesCount >= 15) regularSlugs.push('gothic_treasury');
+  if (totalGameWins >= 50) regularSlugs.push('grand_champion');
+  if (m.dailyStreak >= 30) regularSlugs.push('immortal_flame');
 
-  // Consistency / Daily Streaks
-  if (m.dailyStreak >= 3) slugs.push('devoted_acolyte');
-  if (m.dailyStreak >= 7) slugs.push('eternal_vigil');
-  if (m.dailyStreak >= 14) slugs.push('midnight_devotion');
-  if (m.dailyStreak >= 30) slugs.push('immortal_flame');
-
-  // Collector / Customization Shop
-  if (m.purchasesCount >= 1) slugs.push('collector');
-  if (m.purchasesCount >= 5) slugs.push('relic_hoarder');
-  if (m.purchasesCount >= 10) slugs.push('gothic_treasury');
-  if (m.equippedItemsCount >= 3) slugs.push('dressed_in_velvet');
-
-  // Community & Creations
-  if (m.postsCount >= 1) slugs.push('first_chronicle');
-  if (m.postsCount >= 3) slugs.push('voice_of_abyss');
-  if (m.commentsCount >= 1) slugs.push('easy_first_reply');
-  if (m.commentsCount >= 5) slugs.push('midnight_critic');
-  if (postsRead >= 5) slugs.push('easy_avid_reader');
-  if (postsRead >= 20) slugs.push('hard_community_reader');
-  if (m.creationsCount >= 1) slugs.push('gothic_artisan');
-  if (m.followersCount >= 3 || m.followingCount >= 3) slugs.push('coven_circle');
-
-  // Veteran & XP Milestones
-  if (m.totalXp >= 500) slugs.push('dark_apostle');
-  if (m.totalXp >= 1500 || m.level >= 8) slugs.push('archon_of_sound');
-
-  // Secret Easter Eggs (5 required secrets)
-  if (m.visitedMidnightMsk) slugs.push('secret_midnight_visitor');
-  if (maxTrackCompletions >= 10) slugs.push('secret_on_repeat');
-  if (m.clickedSecretRose) slugs.push('secret_curious_rose');
-  if (promoRedeemed >= 1) slugs.push('secret_first_code');
-  if (m.quizPerfectRuns >= 1) slugs.push('secret_flawless_quiz');
+  // Meta Collector Achievements (second pass over unlocked non-meta count)
+  const effectiveRegularCount = Math.max(
+    regularSlugs.length,
+    Number(m.existingRegularUnlockedCount || 0)
+  );
+  const slugs = [...regularSlugs];
+  if (effectiveRegularCount >= 20) slugs.push('meta_collector_20');
+  if (effectiveRegularCount >= 35) slugs.push('meta_legend_35');
 
   return slugs;
 }
@@ -773,79 +1687,124 @@ export function getAchievementProgress(
     target,
   });
 
+  const effectiveRegularCount = Math.max(
+    evaluateAchievementSlugs(m).filter((s) => !META_ACHIEVEMENT_SLUGS.has(s)).length,
+    Number(m.existingRegularUnlockedCount || 0)
+  );
+
   switch (slug) {
+    // Easy
     case 'archive_initiate':
       return clamp(m.isRegistered ? 1 : 0, 1);
+    case 'first_listen':
+      return clamp(Number(m.uniqueTracksListened || 0), 1);
+    case 'lyrics_reader':
+      return clamp(Number(m.lyricsOpenedCount || 0), 1);
+    case 'easy_first_reply':
+      return clamp(m.commentsCount, 1);
     case 'shadow_identity':
       return clamp(m.hasCustomProfile ? 1 : 0, 1);
     case 'first_blood':
       return clamp(m.gamesPlayed, 1);
-    case 'first_note':
-      return clamp(m.guessTrackWins, 1);
-    case 'vinyl_hunter':
-      return clamp(m.guessTrackWins, 5);
-    case 'phantom_ear':
-      return clamp(m.guessTrackWins, 15);
-    case 'initiate_ritual':
-      return clamp(m.gamesPlayed, 10);
-    case 'ritual_master':
-      return clamp(m.gamesPlayed, 30);
+    case 'share_card_first':
+      return clamp(Number(m.shareCardCount || 0), 1);
     case 'quiz_seeker':
       return clamp(m.quizPlayed, 1);
-    case 'lore_scholar':
-      return clamp(m.quizPerfectRuns, 1);
-    case 'obsidian_oracle':
-      return clamp(m.quizPerfectRuns, 3);
-    case 'cathedral_historian':
-      return clamp(m.quizPlayed, 10);
-    case 'devoted_acolyte':
-      return clamp(m.dailyStreak, 3);
-    case 'eternal_vigil':
-      return clamp(m.dailyStreak, 7);
-    case 'midnight_devotion':
-      return clamp(m.dailyStreak, 14);
-    case 'immortal_flame':
-      return clamp(m.dailyStreak, 30);
     case 'collector':
       return clamp(m.purchasesCount, 1);
-    case 'relic_hoarder':
-      return clamp(m.purchasesCount, 5);
-    case 'gothic_treasury':
-      return clamp(m.purchasesCount, 10);
-    case 'dressed_in_velvet':
-      return clamp(m.equippedItemsCount, 3);
+    case 'first_note':
+      return clamp(m.guessTrackWins, 1);
     case 'first_chronicle':
       return clamp(m.postsCount, 1);
-    case 'voice_of_abyss':
-      return clamp(m.postsCount, 3);
-    case 'easy_first_reply':
-      return clamp(m.commentsCount, 1);
-    case 'midnight_critic':
-      return clamp(m.commentsCount, 5);
     case 'easy_avid_reader':
       return clamp(Number(m.postsReadCount || 0), 5);
-    case 'hard_community_reader':
-      return clamp(Number(m.postsReadCount || 0), 20);
-    case 'gothic_artisan':
-      return clamp(m.creationsCount, 1);
-    case 'coven_circle':
-      return clamp(Math.max(m.followersCount, m.followingCount), 3);
-    case 'dark_apostle':
-      return clamp(m.totalXp, 500);
-    case 'archon_of_sound':
-      return clamp(m.level >= 8 ? 1500 : m.totalXp, 1500);
-    case 'secret_midnight_visitor':
-      return clamp(m.visitedMidnightMsk ? 1 : 0, 1);
-    case 'secret_on_repeat':
-      return clamp(Number(m.maxTrackCompletions || 0), 10);
-    case 'secret_curious_rose':
-      return clamp(m.clickedSecretRose ? 1 : 0, 1);
     case 'secret_first_code':
       return clamp(Number(m.promoRedeemedCount || 0), 1);
-    case 'secret_flawless_quiz':
+    case 'track_duo':
+      return clamp(Number(m.distinctGamesPlayed || 0), 2);
+    case 'dressed_in_velvet':
+      return clamp(m.equippedItemsCount, 3);
+    case 'coven_circle':
+      return clamp(Math.max(m.followersCount, m.followingCount), 3);
+
+    // Medium
+    case 'devoted_acolyte':
+      return clamp(m.dailyStreak, 5);
+    case 'secret_curious_rose':
+      return clamp(m.clickedSecretRose ? 1 : 0, 1);
+    case 'initiate_ritual':
+      return clamp(m.gamesPlayed, 10);
+    case 'midnight_critic':
+      return clamp(m.commentsCount, 10);
+    case 'vinyl_hunter':
+      return clamp(m.guessTrackWins, 5);
+    case 'voice_of_abyss':
+      return clamp(m.postsCount, 3);
+    case 'gothic_artisan':
+      return clamp(Number(m.approvedCreationsCount ?? m.creationsCount ?? 0), 1);
+    case 'discography_listener':
+      return clamp(Number(m.uniqueTracksListened || 0), 15);
+    case 'all_games_explorer':
+      return clamp(Number(m.distinctGamesPlayed || 0), 5);
+    case 'lyrics_hunter':
+      return clamp(Number(m.guessLyricsWins || 0), 5);
+    case 'reverse_decoder':
+      return clamp(Number(m.reverseTrackWins || 0), 5);
+    case 'speed_runner':
+      return clamp(Number(m.speedTrackWins || 0), 5);
+    case 'lore_scholar':
       return clamp(m.quizPerfectRuns, 1);
+    case 'relic_hoarder':
+      return clamp(m.purchasesCount, 5);
+    case 'win_streak_5':
+      return clamp(Number(m.bestGameWinStreak || 0), 5);
+    case 'cathedral_historian':
+      return clamp(m.quizPlayed, 10);
+    case 'eternal_vigil':
+      return clamp(m.dailyStreak, 10);
+    case 'dark_apostle':
+      return clamp(m.totalXp, 1500);
+    case 'all_games_winner':
+      return clamp(Number(m.distinctGamesWon || 0), 5);
+
+    // Hard
+    case 'hard_community_reader':
+      return clamp(Number(m.postsReadCount || 0), 25);
+    case 'secret_midnight_visitor':
+      return clamp(m.visitedMidnightMsk ? 1 : 0, 1);
+    case 'phantom_ear':
+      return clamp(m.guessTrackWins, 15);
+    case 'secret_flawless_quiz':
+      return clamp(m.quizPerfectRuns, 3);
+    case 'ritual_master':
+      return clamp(m.gamesPlayed, 40);
+    case 'creation_idol':
+      return clamp(Number(m.creationRosesTotal || 0), 10);
+    case 'secret_on_repeat':
+      return clamp(Number(m.maxTrackCompletions || 0), 15);
+    case 'obsidian_oracle':
+      return clamp(m.quizPerfectRuns, 5);
+    case 'midnight_devotion':
+      return clamp(m.dailyStreak, 21);
+    case 'archive_completionist':
+      return clamp(Number(m.uniqueTracksListened || 0), 25);
+    case 'win_streak_10':
+      return clamp(Number(m.bestGameWinStreak || 0), 10);
+    case 'archon_of_sound':
+      return clamp(m.level >= 12 ? 5000 : m.totalXp, 5000);
+    case 'gothic_treasury':
+      return clamp(m.purchasesCount, 15);
+    case 'meta_collector_20':
+      return clamp(effectiveRegularCount, 20);
+    case 'grand_champion':
+      return clamp(Number(m.totalGameWins || 0), 50);
+    case 'immortal_flame':
+      return clamp(m.dailyStreak, 30);
+    case 'meta_legend_35':
+      return clamp(effectiveRegularCount, 35);
     default:
       return clamp(isUnlocked ? 1 : 0, 1);
   }
 }
+
 

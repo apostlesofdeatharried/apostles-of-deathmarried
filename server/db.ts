@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 import bcrypt from 'bcryptjs';
+import { ACHIEVEMENT_CATALOG } from './accountSecurity.js';
 
 const isVercel = Boolean(process.env.VERCEL);
 const bundledDbPath = path.resolve(process.cwd(), 'data', 'apostles.db');
@@ -357,6 +358,59 @@ export function ensureShopCatalogSeeded(targetDb: Database.Database = db): void 
         );
       `);
     } catch {}
+  })();
+}
+
+/**
+ * Idempotently syncs all 52 achievements (3-tier: easy/medium/hard, including is_secret flags and balanced XP rewards)
+ * without ever deleting existing user_achievements or modifying users' already-earned XP.
+ */
+export function ensureAchievementsCatalogSynced(targetDb: Database.Database = db): void {
+  const findBySlug = targetDb.prepare('SELECT id FROM achievements WHERE slug = ? LIMIT 1');
+  const updateByExistingId = targetDb.prepare(`
+    UPDATE achievements SET
+      title_ru = @title_ru,
+      title_en = @title_en,
+      desc_ru = @desc_ru,
+      desc_en = @desc_en,
+      condition_ru = @condition_ru,
+      condition_en = @condition_en,
+      category = @category,
+      rarity = @rarity,
+      difficulty_tier = @difficulty_tier,
+      is_secret = @is_secret,
+      icon = @icon,
+      xp_reward = @xp_reward
+    WHERE id = @existing_id
+  `);
+  const upsertById = targetDb.prepare(`
+    INSERT INTO achievements (id, slug, title_ru, title_en, desc_ru, desc_en, condition_ru, condition_en, category, rarity, difficulty_tier, is_secret, icon, xp_reward)
+    VALUES (@id, @slug, @title_ru, @title_en, @desc_ru, @desc_en, @condition_ru, @condition_en, @category, @rarity, @difficulty_tier, @is_secret, @icon, @xp_reward)
+    ON CONFLICT(id) DO UPDATE SET
+      slug = excluded.slug,
+      title_ru = excluded.title_ru,
+      title_en = excluded.title_en,
+      desc_ru = excluded.desc_ru,
+      desc_en = excluded.desc_en,
+      condition_ru = excluded.condition_ru,
+      condition_en = excluded.condition_en,
+      category = excluded.category,
+      rarity = excluded.rarity,
+      difficulty_tier = excluded.difficulty_tier,
+      is_secret = excluded.is_secret,
+      icon = excluded.icon,
+      xp_reward = excluded.xp_reward
+  `);
+
+  targetDb.transaction(() => {
+    for (const ach of ACHIEVEMENT_CATALOG) {
+      const existingBySlug = findBySlug.get(ach.slug) as { id: string } | undefined;
+      if (existingBySlug && existingBySlug.id !== ach.id) {
+        updateByExistingId.run({ ...ach, existing_id: existingBySlug.id });
+      } else {
+        upsertById.run(ach);
+      }
+    }
   })();
 }
 
@@ -1235,6 +1289,12 @@ export function ensureSchemaAndMigrations(targetDb: Database.Database = db) {
   ensureColumn('achievements', 'difficulty_tier', "TEXT NOT NULL DEFAULT 'easy'");
   ensureColumn('achievements', 'is_secret', 'INTEGER NOT NULL DEFAULT 0');
 
+  try {
+    ensureAchievementsCatalogSynced(targetDb);
+  } catch (err) {
+    recordMigrationError('achievements:sync_catalog', err);
+  }
+
   ensureColumn('site_news', 'link', "TEXT NOT NULL DEFAULT '/'");
   ensureColumn('site_news', 'sent_count', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('site_news', 'author_id', 'TEXT');
@@ -1455,72 +1515,8 @@ function seedInitialData() {
     insertCategory.run(cat);
   }
 
-  // Seed expanded mechanics-driven Achievements across Easy, Hard, and Secret tiers with balanced XP rewards
-  // NOTE: archive_initiate stays 0 XP so newly registered accounts always start cleanly at 0 XP.
-  const achievements = [
-    // Easy (Лёгкие): 10–25 XP
-    { id: 'ach_archive_initiate', slug: 'archive_initiate', title_ru: 'Участник архива', title_en: 'Archive Member', desc_ru: 'Создайте свой аккаунт в сообществе Apostles of deathmarried', desc_en: 'Create your Apostles of deathmarried account', condition_ru: 'Зарегистрироваться на сайте', condition_en: 'Register an account', category: 'getting_started', rarity: 'common', difficulty_tier: 'easy', is_secret: 0, icon: 'moon', xp_reward: 0 },
-    { id: 'ach_shadow_identity', slug: 'shadow_identity', title_ru: 'Личный почерк', title_en: 'Personal Mark', desc_ru: 'Заполните описание профиля «О себе» или личный статус', desc_en: 'Customize your profile bio or personal status', condition_ru: 'Добавить «О себе» или статус в профиле', condition_en: 'Set a profile bio or custom status', category: 'getting_started', rarity: 'common', difficulty_tier: 'easy', is_secret: 0, icon: 'feather', xp_reward: 15 },
-    { id: 'ach_first_blood', slug: 'first_blood', title_ru: 'Первый шаг', title_en: 'First Step', desc_ru: 'Сыграйте в любое ежедневное испытание архива', desc_en: 'Play your first interactive challenge', condition_ru: 'Завершить 1 игру', condition_en: 'Complete 1 game', category: 'getting_started', rarity: 'common', difficulty_tier: 'easy', is_secret: 0, icon: 'play', xp_reward: 15 },
-    { id: 'ach_first_note', slug: 'first_note', title_ru: 'Узнанный аккорд', title_en: 'Recognized Chord', desc_ru: 'Впервые угадайте трек дня по 5-секундному отрывку', desc_en: 'Correctly guess a Daily Track from its 5-second snippet', condition_ru: '1 правильный ответ в «Угадай трек»', condition_en: '1 correct Guess The Track', category: 'music', rarity: 'common', difficulty_tier: 'easy', is_secret: 0, icon: 'music', xp_reward: 20 },
-    { id: 'ach_quiz_seeker', slug: 'quiz_seeker', title_ru: 'Искатель фактов', title_en: 'Lore Seeker', desc_ru: 'Завершите первую ежедневную викторину архива', desc_en: 'Complete your first Daily Quiz', condition_ru: 'Пройти 1 ежедневную викторину', condition_en: 'Complete 1 Daily Quiz', category: 'quiz', rarity: 'common', difficulty_tier: 'easy', is_secret: 0, icon: 'book-open', xp_reward: 20 },
-    { id: 'ach_devoted_acolyte', slug: 'devoted_acolyte', title_ru: 'Преданный слушатель', title_en: 'Devoted Listener', desc_ru: 'Поддерживайте серию активности 3 дня подряд по МСК', desc_en: 'Maintain a 3-day daily streak', condition_ru: 'Серия 3 дня подряд', condition_en: '3-day daily streak', category: 'consistency', rarity: 'common', difficulty_tier: 'easy', is_secret: 0, icon: 'calendar', xp_reward: 25 },
-    { id: 'ach_collector', slug: 'collector', title_ru: 'Коллекционер', title_en: 'Collector', desc_ru: 'Приобретите первый предмет в магазине кастомизации', desc_en: 'Acquire your first item in the XP Shop', condition_ru: 'Купить 1 предмет в магазине', condition_en: 'Buy 1 shop item', category: 'collector', rarity: 'common', difficulty_tier: 'easy', is_secret: 0, icon: 'tag', xp_reward: 15 },
-    { id: 'ach_first_chronicle', slug: 'first_chronicle', title_ru: 'Первая запись', title_en: 'First Chronicle', desc_ru: 'Создайте свою первую тему в сообществе', desc_en: 'Publish your first community forum topic', condition_ru: 'Создать 1 тему на форуме', condition_en: 'Create 1 forum topic', category: 'community', rarity: 'common', difficulty_tier: 'easy', is_secret: 0, icon: 'message-square', xp_reward: 20 },
-    { id: 'ach_easy_first_reply', slug: 'easy_first_reply', title_ru: 'Первый отклик', title_en: 'First Reply', desc_ru: 'Оставьте свой первый комментарий в теме сообщества', desc_en: 'Post your first reply in a community topic', condition_ru: 'Оставить 1 комментарий', condition_en: 'Write 1 comment', category: 'community', rarity: 'common', difficulty_tier: 'easy', is_secret: 0, icon: 'message-square', xp_reward: 15 },
-    { id: 'ach_midnight_critic', slug: 'midnight_critic', title_ru: 'Ночной собеседник', title_en: 'Nocturnal Critic', desc_ru: 'Оставьте 5 комментариев в обсуждениях сообщества', desc_en: 'Post 5 comments across discussions', condition_ru: 'Оставить 5 комментариев', condition_en: 'Write 5 comments', category: 'community', rarity: 'common', difficulty_tier: 'easy', is_secret: 0, icon: 'feather', xp_reward: 25 },
-    { id: 'ach_easy_avid_reader', slug: 'easy_avid_reader', title_ru: 'Читатель форума', title_en: 'Forum Reader', desc_ru: 'Откройте и прочитайте 5 разных тем в сообществе', desc_en: 'Read 5 distinct topics in the community', condition_ru: 'Прочитать 5 тем в сообществе', condition_en: 'Read 5 community topics', category: 'community', rarity: 'common', difficulty_tier: 'easy', is_secret: 0, icon: 'book-open', xp_reward: 20 },
-    { id: 'ach_gothic_artisan', slug: 'gothic_artisan', title_ru: 'Творец', title_en: 'Creator', desc_ru: 'Опубликуйте свою работу в творческой галерее', desc_en: 'Publish your work in the Creations gallery', condition_ru: 'Опубликовать 1 работу в галерее', condition_en: 'Publish 1 creation', category: 'community', rarity: 'rare', difficulty_tier: 'easy', is_secret: 0, icon: 'sparkles', xp_reward: 25 },
-    { id: 'ach_coven_circle', slug: 'coven_circle', title_ru: 'Свой круг', title_en: 'Inner Circle', desc_ru: 'Наберите 3 подписчиков или подпишитесь на 3 участников', desc_en: 'Reach 3 followers or follow 3 community members', condition_ru: '3 подписчика или 3 подписки', condition_en: '3 followers or following', category: 'community', rarity: 'rare', difficulty_tier: 'easy', is_secret: 0, icon: 'users', xp_reward: 25 },
-    { id: 'ach_dressed_in_velvet', slug: 'dressed_in_velvet', title_ru: 'Стиль архива', title_en: 'Archive Style', desc_ru: 'Одновременно экипируйте 3 элемента оформления профиля', desc_en: 'Equip 3 customization layers simultaneously', condition_ru: 'Экипировать 3 предмета одновременно', condition_en: 'Equip 3 items at once', category: 'collector', rarity: 'rare', difficulty_tier: 'easy', is_secret: 0, icon: 'sparkles', xp_reward: 25 },
-
-    // Hard (Сложные): 40–100 XP
-    { id: 'ach_vinyl_hunter', slug: 'vinyl_hunter', title_ru: 'Охотник за винилом', title_en: 'Vinyl Hunter', desc_ru: 'Угадайте 5 ежедневных композиций deathmarried', desc_en: 'Guess 5 daily deathmarried tracks correctly', condition_ru: '5 побед в «Угадай трек»', condition_en: '5 Guess The Track wins', category: 'music', rarity: 'rare', difficulty_tier: 'hard', is_secret: 0, icon: 'disc', xp_reward: 40 },
-    { id: 'ach_phantom_ear', slug: 'phantom_ear', title_ru: 'Абсолютный слух', title_en: 'Phantom Ear', desc_ru: 'Угадайте 15 ежедневных композиций по 5-секундному фрагменту', desc_en: 'Guess 15 daily tracks from 5-second snippets', condition_ru: '15 побед в «Угадай трек»', condition_en: '15 Guess The Track wins', category: 'music', rarity: 'epic', difficulty_tier: 'hard', is_secret: 0, icon: 'headphones', xp_reward: 75 },
-    { id: 'ach_initiate_ritual', slug: 'initiate_ritual', title_ru: 'Чуткий слух', title_en: 'Musical Ear', desc_ru: 'Завершите 10 раундов в ежедневных играх архива', desc_en: 'Complete 10 interactive game sessions', condition_ru: 'Сыграть 10 игр', condition_en: 'Play 10 games', category: 'music', rarity: 'rare', difficulty_tier: 'hard', is_secret: 0, icon: 'headphones', xp_reward: 40 },
-    { id: 'ach_ritual_master', slug: 'ritual_master', title_ru: 'Мастер испытаний', title_en: 'Trial Master', desc_ru: 'Примите участие в 30 игровых испытаниях сообщества', desc_en: 'Complete 30 archive game trials', condition_ru: 'Сыграть 30 игр', condition_en: 'Play 30 games', category: 'music', rarity: 'epic', difficulty_tier: 'hard', is_secret: 0, icon: 'zap', xp_reward: 80 },
-    { id: 'ach_lore_scholar', slug: 'lore_scholar', title_ru: 'Знаток дискографии', title_en: 'Discography Connoisseur', desc_ru: 'Пройдите ежедневную викторину без единой ошибки', desc_en: 'Achieve a perfect score in Daily Quiz', condition_ru: '100% правильных ответов в викторине', condition_en: 'Perfect score in Daily Quiz', category: 'quiz', rarity: 'rare', difficulty_tier: 'hard', is_secret: 0, icon: 'award', xp_reward: 45 },
-    { id: 'ach_obsidian_oracle', slug: 'obsidian_oracle', title_ru: 'Обсидиановый оракул', title_en: 'Obsidian Oracle', desc_ru: 'Пройдите ежедневную викторину без ошибок 3 раза', desc_en: 'Score 100% in Daily Quiz 3 times', condition_ru: '3 идеальных прохождения викторины', condition_en: '3 perfect Daily Quiz runs', category: 'quiz', rarity: 'epic', difficulty_tier: 'hard', is_secret: 0, icon: 'eye', xp_reward: 75 },
-    { id: 'ach_cathedral_historian', slug: 'cathedral_historian', title_ru: 'Летописец свода', title_en: 'Cathedral Historian', desc_ru: 'Завершите 10 ежедневных викторин архива', desc_en: 'Complete 10 Daily Quizzes', condition_ru: 'Пройти 10 викторин', condition_en: 'Complete 10 Daily Quizzes', category: 'quiz', rarity: 'epic', difficulty_tier: 'hard', is_secret: 0, icon: 'compass', xp_reward: 65 },
-    { id: 'ach_eternal_vigil', slug: 'eternal_vigil', title_ru: 'Неделя в ритме', title_en: 'Seven Nights', desc_ru: 'Поддерживайте серию активности 7 дней подряд по МСК', desc_en: 'Maintain a 7-day daily streak', condition_ru: 'Серия 7 дней подряд', condition_en: '7-day daily streak', category: 'consistency', rarity: 'rare', difficulty_tier: 'hard', is_secret: 0, icon: 'shield', xp_reward: 50 },
-    { id: 'ach_midnight_devotion', slug: 'midnight_devotion', title_ru: 'Полуночная вахта', title_en: 'Midnight Vigil', desc_ru: 'Возвращайтесь в архив 14 дней подряд без перерыва', desc_en: 'Maintain a 14-day daily streak', condition_ru: 'Серия 14 дней подряд', condition_en: '14-day daily streak', category: 'consistency', rarity: 'epic', difficulty_tier: 'hard', is_secret: 0, icon: 'flame', xp_reward: 75 },
-    { id: 'ach_immortal_flame', slug: 'immortal_flame', title_ru: 'Негасимое пламя', title_en: 'Immortal Flame', desc_ru: 'Выдержите серию активности 30 дней подряд', desc_en: 'Maintain a 30-day unbroken daily streak', condition_ru: 'Серия 30 дней подряд', condition_en: '30-day daily streak', category: 'consistency', rarity: 'legendary', difficulty_tier: 'hard', is_secret: 0, icon: 'crown', xp_reward: 100 },
-    { id: 'ach_relic_hoarder', slug: 'relic_hoarder', title_ru: 'Собиратель реликвий', title_en: 'Relic Curator', desc_ru: 'Соберите 5 предметов кастомизации в своей коллекции', desc_en: 'Own 5 customization items', condition_ru: 'Собрать 5 предметов коллекции', condition_en: 'Own 5 items', category: 'collector', rarity: 'rare', difficulty_tier: 'hard', is_secret: 0, icon: 'gem', xp_reward: 45 },
-    { id: 'ach_gothic_treasury', slug: 'gothic_treasury', title_ru: 'Большая коллекция', title_en: 'Grand Treasury', desc_ru: 'Соберите 10 предметов оформления в инвентаре', desc_en: 'Own 10 customization items', condition_ru: 'Собрать 10 предметов коллекции', condition_en: 'Own 10 items', category: 'collector', rarity: 'legendary', difficulty_tier: 'hard', is_secret: 0, icon: 'layers', xp_reward: 90 },
-    { id: 'ach_voice_of_abyss', slug: 'voice_of_abyss', title_ru: 'Голос сообщества', title_en: 'Community Voice', desc_ru: 'Создайте 3 записи на форуме сообщества', desc_en: 'Create 3 community forum discussions', condition_ru: 'Создать 3 темы на форуме', condition_en: 'Create 3 forum topics', category: 'community', rarity: 'rare', difficulty_tier: 'hard', is_secret: 0, icon: 'message-square', xp_reward: 40 },
-    { id: 'ach_hard_community_reader', slug: 'hard_community_reader', title_ru: 'Хроникёр форума', title_en: 'Forum Chronicler', desc_ru: 'Прочитайте 20 разных тем и обсуждений в сообществе', desc_en: 'Read 20 distinct topics in the community', condition_ru: 'Прочитать 20 тем в сообществе', condition_en: 'Read 20 community topics', category: 'community', rarity: 'epic', difficulty_tier: 'hard', is_secret: 0, icon: 'book-open', xp_reward: 50 },
-    { id: 'ach_dark_apostle', slug: 'dark_apostle', title_ru: 'Мастер звука', title_en: 'Sound Master', desc_ru: 'Наберите 500 суммарных очков опыта (Total XP)', desc_en: 'Attain 500 lifetime Total XP', condition_ru: 'Набрать 500 Total XP', condition_en: 'Reach 500 Total XP', category: 'veteran', rarity: 'epic', difficulty_tier: 'hard', is_secret: 0, icon: 'trophy', xp_reward: 60 },
-    { id: 'ach_archon_of_sound', slug: 'archon_of_sound', title_ru: 'Ветеран архива', title_en: 'Archive Veteran', desc_ru: 'Достигните 1500 Total XP или 8-го уровня профиля', desc_en: 'Reach 1500 Total XP or Profile Level 8', condition_ru: '1500 Total XP или 8-й уровень', condition_en: '1500 Total XP or Level 8', category: 'veteran', rarity: 'legendary', difficulty_tier: 'hard', is_secret: 0, icon: 'star', xp_reward: 100 },
-
-    // Secret Easter Eggs (Секретные пасхалки): 35–75 XP (условие скрыто под «???» до получения)
-    { id: 'ach_secret_midnight_visitor', slug: 'secret_midnight_visitor', title_ru: 'Полуночник', title_en: 'Midnight Visitor', desc_ru: 'Вы заглянули в архив в самый тихий час — с 00:00 до 00:15 по МСК', desc_en: 'Visit the archive between 00:00 and 00:15 Moscow time', condition_ru: 'Зайти на сайт с 00:00 до 00:15 по МСК', condition_en: 'Visit between 00:00 and 00:15 MSK', category: 'secret', rarity: 'epic', difficulty_tier: 'secret', is_secret: 1, icon: 'moon', xp_reward: 50 },
-    { id: 'ach_secret_on_repeat', slug: 'secret_on_repeat', title_ru: 'На репите', title_en: 'On Repeat', desc_ru: 'Вы прослушали один и тот же трек полностью 10 раз подряд или за всё время', desc_en: 'Listen to any single track to completion 10 times', condition_ru: 'Прослушать один трек полностью 10 раз', condition_en: 'Play any single track to the end 10 times', category: 'secret', rarity: 'epic', difficulty_tier: 'secret', is_secret: 1, icon: 'disc', xp_reward: 60 },
-    { id: 'ach_secret_curious_rose', slug: 'secret_curious_rose', title_ru: 'Любопытный', title_en: 'Curious Mind', desc_ru: 'Вы нашли пасхалку и нажали 5 раз на спрятанную деталь в оформлении сайта', desc_en: 'Click 5 times on the hidden rose detail in the header', condition_ru: 'Нажать 5 раз на скрытую розу в шапке сайта', condition_en: 'Click 5 times on the hidden rose emblem', category: 'secret', rarity: 'rare', difficulty_tier: 'secret', is_secret: 1, icon: 'eye', xp_reward: 35 },
-    { id: 'ach_secret_first_code', slug: 'secret_first_code', title_ru: 'Первый код', title_en: 'First Code', desc_ru: 'Вы нашли и активировали свой первый секретный промокод', desc_en: 'Redeem your first promo code', condition_ru: 'Активировать любой промокод', condition_en: 'Redeem any promo code', category: 'secret', rarity: 'rare', difficulty_tier: 'secret', is_secret: 1, icon: 'tag', xp_reward: 40 },
-    { id: 'ach_secret_flawless_quiz', slug: 'secret_flawless_quiz', title_ru: 'Без права на ошибку', title_en: 'Flawless Run', desc_ru: 'Безупречное знание архива — ежедневная викторина пройдена на 5/5', desc_en: 'Complete a Daily Quiz with a flawless 5/5 score', condition_ru: 'Пройти ежедневную викторину на 5/5', condition_en: 'Finish Daily Quiz with 5/5 score', category: 'secret', rarity: 'legendary', difficulty_tier: 'secret', is_secret: 1, icon: 'crown', xp_reward: 75 },
-  ];
-
-  const insertAch = db.prepare(`
-    INSERT INTO achievements (id, slug, title_ru, title_en, desc_ru, desc_en, condition_ru, condition_en, category, rarity, difficulty_tier, is_secret, icon, xp_reward)
-    VALUES (@id, @slug, @title_ru, @title_en, @desc_ru, @desc_en, @condition_ru, @condition_en, @category, @rarity, @difficulty_tier, @is_secret, @icon, @xp_reward)
-    ON CONFLICT(id) DO UPDATE SET
-      slug = excluded.slug,
-      title_ru = excluded.title_ru,
-      title_en = excluded.title_en,
-      desc_ru = excluded.desc_ru,
-      desc_en = excluded.desc_en,
-      condition_ru = excluded.condition_ru,
-      condition_en = excluded.condition_en,
-      category = excluded.category,
-      rarity = excluded.rarity,
-      difficulty_tier = excluded.difficulty_tier,
-      is_secret = excluded.is_secret,
-      icon = excluded.icon,
-      xp_reward = excluded.xp_reward
-  `);
-  for (const ach of achievements) {
-    insertAch.run(ach);
-  }
+  // Seed / sync canonical 52-achievement catalog across Easy (25–75 XP, starter 0 XP), Medium (150–350 XP), Hard (500–1200 XP)
+  ensureAchievementsCatalogSynced(db);
 
   // Customization Shop (all 86 items + legacy title_* remap + equipped_banner refresh)
   // is also guaranteed unconditionally inside ensureSchemaAndMigrations() so CloudSync cold-start

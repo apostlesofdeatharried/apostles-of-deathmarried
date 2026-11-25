@@ -1,10 +1,13 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   renderShareCardToBlob,
   blobToDataUrl,
   ShareCardContext,
   ShareCardFormat,
 } from '../utils/shareCardGenerator.js';
+import { useAuth, authFetch } from '../context/AuthContext.js';
+import { safeJson } from '../utils/logic.js';
+import { dispatchAchievementUnlocked } from './AchievementToast.js';
 import {
   Download,
   Share2,
@@ -68,6 +71,7 @@ function triggerDesktopBlobDownload(blob: Blob, fileName: string) {
 }
 
 export const ShareCardModal: React.FC<ShareCardModalProps> = ({ isOpen, context, onClose }) => {
+  const { user, refresh } = useAuth();
   const [format, setFormat] = useState<ShareCardFormat>('story');
   const [pngBlob, setPngBlob] = useState<Blob | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
@@ -77,6 +81,24 @@ export const ShareCardModal: React.FC<ShareCardModalProps> = ({ isOpen, context,
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [copiedLink, setCopiedLink] = useState(false);
+  const shareAchTrackedRef = useRef(false);
+
+  const trackShareCardEvent = async () => {
+    if (!user || shareAchTrackedRef.current) return;
+    shareAchTrackedRef.current = true;
+    try {
+      const res = await authFetch('/api/achievements/track-event', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ event: 'share_card' }),
+      });
+      const data = await safeJson<any>(res, {});
+      if (data?.newly_unlocked_achievements?.length) {
+        dispatchAchievementUnlocked(data.newly_unlocked_achievements);
+        refresh().catch(() => {});
+      }
+    } catch {}
+  };
 
   useEffect(() => {
     if (!isOpen || !context) return;
@@ -181,6 +203,7 @@ export const ShareCardModal: React.FC<ShareCardModalProps> = ({ isOpen, context,
             });
             setSaveSuccess(true);
             window.setTimeout(() => setSaveSuccess(false), 2200);
+            trackShareCardEvent();
             return;
           } catch (shareErr: any) {
             // User explicitly cancelled system share sheet
@@ -197,6 +220,7 @@ export const ShareCardModal: React.FC<ShareCardModalProps> = ({ isOpen, context,
       if (isIos || isTelegram) {
         const fallbackUrl = await blobToDataUrl(activeBlob);
         setIosFallbackDataUrl(fallbackUrl);
+        trackShareCardEvent();
         return;
       }
 
@@ -204,6 +228,7 @@ export const ShareCardModal: React.FC<ShareCardModalProps> = ({ isOpen, context,
       triggerDesktopBlobDownload(activeBlob, fileName);
       setSaveSuccess(true);
       window.setTimeout(() => setSaveSuccess(false), 2200);
+      trackShareCardEvent();
     } catch (err) {
       console.error('[ShareCardModal] PNG download failed:', err);
       // Last-resort attempt to expose inline long-press image if blob already exists

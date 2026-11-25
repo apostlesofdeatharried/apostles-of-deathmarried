@@ -691,4 +691,79 @@ describe('Production fixes: profile email verification, notifications, fast reve
       'sitemap.xml must include seeded releases from DB'
     );
   });
+
+  it('8. Rebalanced 52 achievements: /api/achievements/track-event unlocks lyrics_open & share_card once, and profile returns 3-tier honest progress', async () => {
+    const badRes = await fetch(`${baseUrl}/api/achievements/track-event`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userBToken}` },
+      body: JSON.stringify({ event: 'cheat_instant_unlock' }),
+    });
+    assert.equal(badRes.status, 400, 'Allowlist must reject unknown achievement events');
+
+    const lyricsRes1 = await fetch(`${baseUrl}/api/achievements/track-event`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userBToken}` },
+      body: JSON.stringify({ event: 'lyrics_open' }),
+    });
+    assert.equal(lyricsRes1.status, 200);
+    const lyricsJson1 = (await lyricsRes1.json()) as any;
+    assert.ok(
+      lyricsJson1.newly_unlocked_achievements.some((a: any) => a.slug === 'lyrics_reader'),
+      'First lyrics_open event must unlock lyrics_reader'
+    );
+
+    const lyricsRes2 = await fetch(`${baseUrl}/api/achievements/track-event`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userBToken}` },
+      body: JSON.stringify({ event: 'lyrics_open' }),
+    });
+    assert.equal(lyricsRes2.status, 200);
+    const lyricsJson2 = (await lyricsRes2.json()) as any;
+    assert.equal(
+      lyricsJson2.newly_unlocked_achievements.some((a: any) => a.slug === 'lyrics_reader'),
+      false,
+      'Replaying lyrics_open must not re-unlock lyrics_reader or duplicate XP'
+    );
+
+    const shareRes = await fetch(`${baseUrl}/api/achievements/track-event`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userBToken}` },
+      body: JSON.stringify({ event: 'share_card' }),
+    });
+    assert.equal(shareRes.status, 200);
+    const shareJson = (await shareRes.json()) as any;
+    assert.ok(
+      shareJson.newly_unlocked_achievements.some((a: any) => a.slug === 'share_card_first'),
+      'First share_card event must unlock share_card_first'
+    );
+
+    const profRes = await fetch(`${baseUrl}/api/profiles/bob`, {
+      headers: { Authorization: `Bearer ${userBToken}` },
+    });
+    assert.equal(profRes.status, 200);
+    const profBody = (await profRes.json()) as any;
+    const allAchs: any[] = profBody.profile.allAchievements;
+    assert.equal(allAchs.length, 52, 'Profile must expose all 52 achievements');
+    assert.ok(allAchs.some((a) => a.difficulty_tier === 'medium'), 'Profile must include medium tier');
+    assert.ok(allAchs.some((a) => a.difficulty_tier === 'hard'), 'Profile must include hard tier');
+
+    const lyricsAch = allAchs.find((a) => a.slug === 'lyrics_reader');
+    assert.equal(lyricsAch.is_unlocked, true);
+    assert.equal(lyricsAch.difficulty_tier, 'easy');
+    assert.equal(lyricsAch.xp_reward, 30);
+
+    // Bob played 1 game earlier, so initiate_ritual (10 games) must honestly report in_progress 1/10
+    const ritualAch = allAchs.find((a) => a.slug === 'initiate_ritual');
+    assert.equal(ritualAch.is_unlocked, false);
+    assert.equal(ritualAch.progress.current, 1);
+    assert.equal(ritualAch.progress.target, 10);
+
+    // Secret locked achievement must still mask condition/description
+    const secretVisit = allAchs.find((a) => a.slug === 'secret_midnight_visitor');
+    if (!secretVisit.is_unlocked) {
+      assert.equal(secretVisit.is_secret, true);
+      assert.equal(secretVisit.condition_ru, '???');
+    }
+  });
 });
+

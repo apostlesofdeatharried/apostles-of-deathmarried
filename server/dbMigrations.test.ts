@@ -870,6 +870,110 @@ describe('SQLite additive migrations on legacy Stage 1–6 databases', () => {
       testDb.close();
     }
   });
+
+  it('syncs all 52 three-tier achievements on legacy DB while preserving unlocked user_achievements and user XP', () => {
+    const testDb = new Database(':memory:');
+    try {
+      testDb.exec(`
+        CREATE TABLE roles (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL UNIQUE,
+          description TEXT,
+          level INTEGER NOT NULL DEFAULT 1
+        );
+        INSERT INTO roles (id, name, description, level) VALUES
+          ('admin', 'Admin', 'Admin', 3),
+          ('user', 'User', 'Member', 1);
+        CREATE TABLE users (
+          id TEXT PRIMARY KEY,
+          nickname TEXT NOT NULL UNIQUE,
+          password_hash TEXT NOT NULL,
+          role_id TEXT NOT NULL DEFAULT 'user',
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE profiles (
+          user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+          display_name TEXT,
+          avatar_url TEXT DEFAULT '',
+          bio TEXT DEFAULT '',
+          level INTEGER NOT NULL DEFAULT 1,
+          xp INTEGER NOT NULL DEFAULT 0,
+          total_xp INTEGER NOT NULL DEFAULT 0,
+          daily_streak INTEGER NOT NULL DEFAULT 0,
+          last_active_date TEXT
+        );
+        CREATE TABLE achievements (
+          id TEXT PRIMARY KEY,
+          slug TEXT NOT NULL UNIQUE,
+          title_ru TEXT NOT NULL,
+          title_en TEXT NOT NULL,
+          desc_ru TEXT NOT NULL,
+          desc_en TEXT NOT NULL,
+          condition_ru TEXT,
+          condition_en TEXT,
+          category TEXT NOT NULL DEFAULT 'general',
+          rarity TEXT NOT NULL DEFAULT 'common',
+          difficulty_tier TEXT NOT NULL DEFAULT 'easy',
+          is_secret INTEGER NOT NULL DEFAULT 0,
+          icon TEXT NOT NULL DEFAULT 'rose',
+          xp_reward INTEGER NOT NULL DEFAULT 50
+        );
+        CREATE TABLE user_achievements (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          achievement_id TEXT NOT NULL REFERENCES achievements(id) ON DELETE CASCADE,
+          unlocked_at TEXT NOT NULL DEFAULT (datetime('now')),
+          UNIQUE(user_id, achievement_id)
+        );
+      `);
+
+      testDb.prepare("INSERT INTO users (id, nickname, password_hash, role_id) VALUES ('u_vet', 'vet_user', 'h', 'user')").run();
+      testDb.prepare("INSERT INTO profiles (user_id, display_name, xp, total_xp, level) VALUES ('u_vet', 'Veteran', 420, 920, 4)").run();
+      // Legacy achievement with old XP and old 'secret' difficulty_tier
+      testDb.prepare(`
+        INSERT INTO achievements (id, slug, title_ru, title_en, desc_ru, desc_en, difficulty_tier, is_secret, icon, xp_reward)
+        VALUES
+          ('ach_first_note', 'first_note', 'Old title', 'Old', 'Old d', 'Old d', 'easy', 0, 'music', 20),
+          ('ach_secret_first_code', 'secret_first_code', 'Old code', 'Old', 'Old d', 'Old d', 'secret', 1, 'tag', 40)
+      `).run();
+      testDb.prepare(`
+        INSERT INTO user_achievements (id, user_id, achievement_id)
+        VALUES ('ua_1', 'u_vet', 'ach_first_note'), ('ua_2', 'u_vet', 'ach_secret_first_code')
+      `).run();
+
+      ensureSchemaAndMigrations(testDb);
+      ensureSchemaAndMigrations(testDb);
+
+      const totalAchs = (testDb.prepare('SELECT COUNT(*) as c FROM achievements').get() as { c: number }).c;
+      assert.equal(totalAchs, 52, 'All 52 achievements must be synced on legacy database');
+
+      const tierCounts = Object.fromEntries(
+        (
+          testDb.prepare('SELECT difficulty_tier, COUNT(*) as c FROM achievements GROUP BY difficulty_tier').all() as Array<{
+            difficulty_tier: string;
+            c: number;
+          }>
+        ).map((r) => [r.difficulty_tier, r.c])
+      );
+      assert.deepEqual(tierCounts, { easy: 16, medium: 19, hard: 17 });
+
+      // Legacy user_achievements and XP must remain 100% preserved
+      const unlockedIds = (
+        testDb.prepare('SELECT achievement_id FROM user_achievements WHERE user_id = ? ORDER BY achievement_id').all('u_vet') as Array<{
+          achievement_id: string;
+        }>
+      ).map((r) => r.achievement_id);
+      assert.deepEqual(unlockedIds, ['ach_first_note', 'ach_secret_first_code']);
+
+      const prof = testDb.prepare('SELECT xp, total_xp, level FROM profiles WHERE user_id = ?').get('u_vet') as any;
+      assert.equal(prof.xp, 420);
+      assert.equal(prof.total_xp, 920);
+      assert.equal(prof.level, 4);
+    } finally {
+      testDb.close();
+    }
+  });
 });
+
 
 

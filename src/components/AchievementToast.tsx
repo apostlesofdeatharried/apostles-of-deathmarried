@@ -10,6 +10,7 @@ export interface UnlockedAchievementToastItem {
   xp_reward?: number;
   rarity?: string;
   difficulty_tier?: string;
+  is_secret?: boolean;
   icon?: string;
 }
 
@@ -92,16 +93,16 @@ export const AchievementToastContainer: React.FC = () => {
       aria-live="polite"
     >
       {toasts.map((toast) => {
-        const isSecret = toast.difficulty_tier === 'secret';
-        const isLegendary = toast.rarity === 'legendary';
+        const isSecret = Boolean(toast.is_secret) || toast.difficulty_tier === 'secret';
+        const isHardOrLegendary = toast.difficulty_tier === 'hard' || toast.rarity === 'legendary';
         const accentBorder = isSecret
           ? 'border-[#9c5de0]/45'
-          : isLegendary
+          : isHardOrLegendary
             ? 'border-[#d4af68]/45'
             : 'border-[#821c2c]/55';
         const iconBg = isSecret
           ? 'bg-[#211530] text-[#d0b4fa] border-[#9c5de0]/35'
-          : isLegendary
+          : isHardOrLegendary
             ? 'bg-[#262014] text-[#f0d599] border-[#d4af68]/35'
             : 'bg-[#221015] text-[#eb9aa7] border-[#821c2c]/40';
 

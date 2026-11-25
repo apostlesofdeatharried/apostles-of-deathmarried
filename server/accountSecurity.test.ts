@@ -15,6 +15,7 @@ import {
   createSignedEmailVerificationToken,
   verifySignedEmailVerificationToken,
   normalizePromoCode,
+  ACHIEVEMENT_CATALOG,
   evaluateAchievementSlugs,
   getAchievementProgress,
 } from './accountSecurity';
@@ -162,6 +163,52 @@ test('stateless HMAC email verification tokens validate email, code, purpose, us
   assert.equal(normalizePromoCode('DeathMarried'), 'deathmarried');
 });
 
+test('ACHIEVEMENT_CATALOG preserves all 35 legacy slugs and enforces 3-tier balance (52 total)', () => {
+  assert.ok(ACHIEVEMENT_CATALOG.length >= 45, `Expected >= 45 achievements, got ${ACHIEVEMENT_CATALOG.length}`);
+  assert.equal(ACHIEVEMENT_CATALOG.length, 52);
+
+  const ids = new Set<string>();
+  const slugs = new Set<string>();
+  const byTier: Record<'easy' | 'medium' | 'hard', number> = { easy: 0, medium: 0, hard: 0 };
+
+  for (const a of ACHIEVEMENT_CATALOG) {
+    assert.ok(!ids.has(a.id), `Duplicate achievement id: ${a.id}`);
+    assert.ok(!slugs.has(a.slug), `Duplicate achievement slug: ${a.slug}`);
+    ids.add(a.id);
+    slugs.add(a.slug);
+    assert.ok(a.difficulty_tier === 'easy' || a.difficulty_tier === 'medium' || a.difficulty_tier === 'hard');
+    byTier[a.difficulty_tier] += 1;
+
+    if (a.slug === 'archive_initiate') {
+      assert.equal(a.xp_reward, 0, 'Starter archive_initiate must stay 0 XP for clean 0-XP registration');
+    } else if (a.difficulty_tier === 'easy') {
+      assert.ok(a.xp_reward >= 25 && a.xp_reward <= 75, `Easy ${a.slug} XP out of 25-75: ${a.xp_reward}`);
+    } else if (a.difficulty_tier === 'medium') {
+      assert.ok(a.xp_reward >= 150 && a.xp_reward <= 350, `Medium ${a.slug} XP out of 150-350: ${a.xp_reward}`);
+    } else if (a.difficulty_tier === 'hard') {
+      assert.ok(a.xp_reward >= 500 && a.xp_reward <= 1200, `Hard ${a.slug} XP out of 500-1200: ${a.xp_reward}`);
+    }
+  }
+
+  assert.equal(byTier.easy, 16);
+  assert.equal(byTier.medium, 19);
+  assert.equal(byTier.hard, 17);
+
+  // Every single one of the 35 legacy slugs must remain present
+  const legacySlugs = [
+    'archive_initiate', 'shadow_identity', 'first_blood', 'first_note', 'quiz_seeker',
+    'devoted_acolyte', 'collector', 'first_chronicle', 'easy_first_reply', 'midnight_critic',
+    'easy_avid_reader', 'gothic_artisan', 'coven_circle', 'dressed_in_velvet', 'vinyl_hunter',
+    'phantom_ear', 'initiate_ritual', 'ritual_master', 'lore_scholar', 'obsidian_oracle',
+    'cathedral_historian', 'eternal_vigil', 'midnight_devotion', 'immortal_flame', 'relic_hoarder',
+    'gothic_treasury', 'voice_of_abyss', 'hard_community_reader', 'dark_apostle', 'archon_of_sound',
+    'secret_midnight_visitor', 'secret_on_repeat', 'secret_curious_rose', 'secret_first_code', 'secret_flawless_quiz',
+  ];
+  for (const leg of legacySlugs) {
+    assert.ok(slugs.has(leg), `Missing legacy achievement slug: ${leg}`);
+  }
+});
+
 test('evaluateAchievementSlugs unlocks server-authoritative achievements accurately', () => {
   const fresh = evaluateAchievementSlugs({
     isRegistered: true,
@@ -186,69 +233,77 @@ test('evaluateAchievementSlugs unlocks server-authoritative achievements accurat
   const veteran = evaluateAchievementSlugs({
     isRegistered: true,
     hasCustomProfile: true,
-    gamesPlayed: 32,
+    gamesPlayed: 45,
     guessTrackPlayed: 18,
     guessTrackWins: 16,
+    guessLyricsWins: 6,
+    reverseTrackWins: 6,
+    speedTrackWins: 6,
     quizPlayed: 12,
-    quizPerfectRuns: 4,
+    quizPerfectRuns: 5,
     dailyStreak: 30,
-    totalXp: 1800,
-    level: 9,
-    purchasesCount: 10,
+    totalXp: 5200,
+    level: 12,
+    purchasesCount: 15,
     equippedItemsCount: 4,
     postsCount: 4,
-    commentsCount: 8,
+    commentsCount: 12,
     creationsCount: 2,
+    approvedCreationsCount: 2,
+    creationRosesTotal: 12,
     followersCount: 5,
     followingCount: 4,
     postsReadCount: 25,
     promoRedeemedCount: 1,
-    maxTrackCompletions: 10,
+    maxTrackCompletions: 15,
+    uniqueTracksListened: 26,
     visitedMidnightMsk: true,
     clickedSecretRose: true,
+    lyricsOpenedCount: 2,
+    shareCardCount: 1,
+    totalGameWins: 55,
+    distinctGamesPlayed: 5,
+    distinctGamesWon: 5,
+    bestGameWinStreak: 11,
   });
-  assert.ok(veteran.includes('first_note'));
-  assert.ok(veteran.includes('phantom_ear'));
-  assert.ok(veteran.includes('obsidian_oracle'));
-  assert.ok(veteran.includes('immortal_flame'));
-  assert.ok(veteran.includes('gothic_treasury'));
-  assert.ok(veteran.includes('dressed_in_velvet'));
-  assert.ok(veteran.includes('archon_of_sound'));
-  // New community & secret easter egg achievements
-  assert.ok(veteran.includes('easy_first_reply'));
-  assert.ok(veteran.includes('easy_avid_reader'));
-  assert.ok(veteran.includes('hard_community_reader'));
-  assert.ok(veteran.includes('secret_midnight_visitor'));
-  assert.ok(veteran.includes('secret_on_repeat'));
-  assert.ok(veteran.includes('secret_curious_rose'));
-  assert.ok(veteran.includes('secret_first_code'));
-  assert.ok(veteran.includes('secret_flawless_quiz'));
-  assert.equal(veteran.length, 35);
+  assert.ok(veteran.includes('first_listen'));
+  assert.ok(veteran.includes('lyrics_reader'));
+  assert.ok(veteran.includes('share_card_first'));
+  assert.ok(veteran.includes('all_games_explorer'));
+  assert.ok(veteran.includes('all_games_winner'));
+  assert.ok(veteran.includes('win_streak_5'));
+  assert.ok(veteran.includes('win_streak_10'));
+  assert.ok(veteran.includes('creation_idol'));
+  assert.ok(veteran.includes('meta_collector_20'));
+  assert.ok(veteran.includes('meta_legend_35'));
+  assert.equal(veteran.length, 52);
 
   // Verify numeric progress reporting
-  const prog = getAchievementProgress(
-    'secret_on_repeat',
-    {
-      isRegistered: true,
-      gamesPlayed: 0,
-      guessTrackPlayed: 0,
-      guessTrackWins: 0,
-      quizPlayed: 0,
-      quizPerfectRuns: 0,
-      dailyStreak: 0,
-      totalXp: 0,
-      level: 1,
-      purchasesCount: 0,
-      equippedItemsCount: 0,
-      postsCount: 0,
-      commentsCount: 0,
-      creationsCount: 0,
-      followersCount: 0,
-      followingCount: 0,
-      maxTrackCompletions: 7,
-    },
-    false
-  );
-  assert.deepEqual(prog, { current: 7, target: 10 });
+  const partialMetrics = {
+    isRegistered: true,
+    gamesPlayed: 3,
+    guessTrackPlayed: 2,
+    guessTrackWins: 2,
+    quizPlayed: 1,
+    quizPerfectRuns: 0,
+    dailyStreak: 2,
+    totalXp: 300,
+    level: 2,
+    purchasesCount: 1,
+    equippedItemsCount: 1,
+    postsCount: 0,
+    commentsCount: 0,
+    creationsCount: 0,
+    followersCount: 0,
+    followingCount: 0,
+    maxTrackCompletions: 7,
+    bestGameWinStreak: 3,
+    uniqueTracksListened: 4,
+  };
+  assert.deepEqual(getAchievementProgress('secret_on_repeat', partialMetrics, false), { current: 7, target: 15 });
+  assert.deepEqual(getAchievementProgress('win_streak_5', partialMetrics, false), { current: 3, target: 5 });
+  assert.deepEqual(getAchievementProgress('discography_listener', partialMetrics, false), { current: 4, target: 15 });
+  assert.deepEqual(getAchievementProgress('meta_collector_20', partialMetrics, false), { current: 6, target: 20 });
 });
+
 

@@ -59,8 +59,8 @@ interface ProfileViewProps {
 }
 
 type ProfileTab = 'overview' | 'achievements' | 'community' | 'history' | 'inventory' | 'settings';
-type AchTierFilter = 'all' | 'easy' | 'hard' | 'secret';
-type AchStatusFilter = 'all' | 'unlocked' | 'locked';
+type AchTierFilter = 'all' | 'easy' | 'medium' | 'hard';
+type AchStatusFilter = 'all' | 'unlocked' | 'in_progress' | 'locked';
 
 const DEFAULT_AVATAR = '/assets/aistudio/photo_2026-09-21_19-56-44_8c854c0f.jpg';
 
@@ -651,17 +651,36 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
     : getStreakBonusPercent(streakDays);
 
   const allAchievements: any[] = Array.isArray(profile.allAchievements) ? profile.allAchievements : [];
-  const unlockedCount = allAchievements.filter((a) => a.is_unlocked).length;
+  const getAchBucket = (a: any): 'unlocked' | 'in_progress' | 'locked' => {
+    if (a.is_unlocked) return 'unlocked';
+    const isSecretLocked = Boolean(a.is_secret);
+    const currentProg = Number(a.progress?.current || 0);
+    if (!isSecretLocked && currentProg > 0) return 'in_progress';
+    return 'locked';
+  };
+  const unlockedCount = allAchievements.filter((a) => getAchBucket(a) === 'unlocked').length;
+  const inProgressCount = allAchievements.filter((a) => getAchBucket(a) === 'in_progress').length;
+  const lockedCount = allAchievements.filter((a) => getAchBucket(a) === 'locked').length;
+  const achievementXpTotal = allAchievements
+    .filter((a) => a.is_unlocked)
+    .reduce((sum, a) => sum + Number(a.xp_reward || 0), 0);
   const easyCount = allAchievements.filter((a) => a.difficulty_tier === 'easy').length;
+  const mediumCount = allAchievements.filter((a) => a.difficulty_tier === 'medium').length;
   const hardCount = allAchievements.filter((a) => a.difficulty_tier === 'hard').length;
-  const secretCount = allAchievements.filter((a) => a.difficulty_tier === 'secret').length;
 
   const filteredAchievements = allAchievements.filter((a) => {
     if (achTier !== 'all' && a.difficulty_tier !== achTier) return false;
-    if (achStatus === 'unlocked' && !a.is_unlocked) return false;
-    if (achStatus === 'locked' && a.is_unlocked) return false;
+    const bucket = getAchBucket(a);
+    if (achStatus !== 'all' && bucket !== achStatus) return false;
     return true;
   });
+
+  const tierFilteredAchievements = allAchievements.filter((a) =>
+    achTier === 'all' ? true : a.difficulty_tier === achTier
+  );
+  const tierUnlockedCount = tierFilteredAchievements.filter((a) => getAchBucket(a) === 'unlocked').length;
+  const tierInProgressCount = tierFilteredAchievements.filter((a) => getAchBucket(a) === 'in_progress').length;
+  const tierLockedCount = tierFilteredAchievements.filter((a) => getAchBucket(a) === 'locked').length;
 
   const featuredList: any[] = Array.isArray(profile.featuredAchievements) ? profile.featuredAchievements : [];
   const featuredSlugs: string[] = Array.isArray(profile.featured_achievements) ? profile.featured_achievements : [];
@@ -1120,187 +1139,321 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
       )}
 
       {/* TAB 2: ДОСТИЖЕНИЯ */}
-      {activeTab === 'achievements' && (
-        <div className="space-y-4">
-          {/* Tier Filter Sub-tabs + Status Filter */}
-          <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-white/[0.08] bg-[#0e0d12] p-3">
-            <div className="flex flex-wrap items-center gap-1.5 font-mono text-xs">
-              {(
-                [
-                  { id: 'all', label: lang === 'ru' ? `Все (${allAchievements.length})` : `All (${allAchievements.length})` },
-                  { id: 'easy', label: lang === 'ru' ? `Лёгкие (${easyCount})` : `Easy (${easyCount})` },
-                  { id: 'hard', label: lang === 'ru' ? `Сложные (${hardCount})` : `Hard (${hardCount})` },
-                  { id: 'secret', label: lang === 'ru' ? `Секретные (${secretCount})` : `Secret (${secretCount})` },
-                ] as Array<{ id: AchTierFilter; label: string }>
-              ).map((f) => (
-                <button
-                  key={f.id}
-                  type="button"
-                  onClick={() => setAchTier(f.id)}
-                  className={`px-3 py-1.5 rounded-md transition-colors cursor-pointer ${
-                    achTier === f.id
-                      ? 'bg-[#821c2c]/30 text-[#f2eee9] border border-[#c96075]/45'
-                      : 'text-[#8e877e] hover:text-[#ded8ce] border border-transparent hover:bg-white/[0.04]'
-                  }`}
-                >
-                  {f.label}
-                </button>
-              ))}
-            </div>
+      {activeTab === 'achievements' && (() => {
+        const completionPct = allAchievements.length > 0
+          ? Math.round((unlockedCount / allAchievements.length) * 100)
+          : 0;
 
-            <div className="flex items-center gap-1 font-mono text-[11px]">
-              {(
-                [
-                  { id: 'all', label: lang === 'ru' ? 'Все' : 'All' },
-                  { id: 'unlocked', label: lang === 'ru' ? 'Открытые' : 'Unlocked' },
-                  { id: 'locked', label: lang === 'ru' ? 'В процессе' : 'In Progress' },
-                ] as Array<{ id: AchStatusFilter; label: string }>
-              ).map((st) => (
-                <button
-                  key={st.id}
-                  type="button"
-                  onClick={() => setAchStatus(st.id)}
-                  className={`px-2.5 py-1 rounded transition-colors cursor-pointer ${
-                    achStatus === st.id
-                      ? 'bg-white/[0.1] text-white'
-                      : 'text-[#736c64] hover:text-[#ded8ce]'
-                  }`}
-                >
-                  {st.label}
-                </button>
-              ))}
-            </div>
-          </div>
+        const renderAchievementCard = (ach: any) => {
+          const bucket = getAchBucket(ach);
+          const isUnlocked = bucket === 'unlocked';
+          const isInProgress = bucket === 'in_progress';
+          const isSecret = Boolean(ach.is_secret) || ach.difficulty_tier === 'secret';
+          const isSecretLocked = isSecret && !isUnlocked;
+          const isPinned = featuredSlugs.includes(ach.slug);
+          const progCurrent = Number(ach.progress?.current ?? (isUnlocked ? 1 : 0));
+          const progTarget = Math.max(1, Number(ach.progress?.target ?? 1));
+          const progPct = isSecretLocked ? 0 : Math.min(100, Math.round((progCurrent / progTarget) * 100));
 
-          {/* Achievements Grid */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            {filteredAchievements.map((ach: any) => {
-              const isUnlocked = Boolean(ach.is_unlocked);
-              const isSecret = ach.difficulty_tier === 'secret' || Boolean(ach.is_secret);
-              const isSecretLocked = isSecret && !isUnlocked;
-              const isPinned = featuredSlugs.includes(ach.slug);
-              const progCurrent = Number(ach.progress?.current ?? (isUnlocked ? 1 : 0));
-              const progTarget = Math.max(1, Number(ach.progress?.target ?? 1));
-              const progPct = isSecretLocked ? 0 : Math.min(100, Math.round((progCurrent / progTarget) * 100));
+          const tierBadge =
+            ach.difficulty_tier === 'hard'
+              ? { label: lang === 'ru' ? 'Сложное' : 'Hard', cls: 'text-[#f0c784] border-[#d4af68]/35 bg-[#221b11]' }
+              : ach.difficulty_tier === 'medium'
+                ? { label: lang === 'ru' ? 'Среднее' : 'Medium', cls: 'text-[#9ac2f2] border-[#4d7cb8]/40 bg-[#111927]' }
+                : { label: lang === 'ru' ? 'Лёгкое' : 'Easy', cls: 'text-[#b5aea4] border-white/[0.12] bg-white/[0.04]' };
 
-              const tierBadge =
-                ach.difficulty_tier === 'secret'
-                  ? { label: lang === 'ru' ? 'Секретное' : 'Secret', cls: 'text-[#d0b4fa] border-[#9c5de0]/40 bg-[#1c1329]' }
-                  : ach.difficulty_tier === 'hard'
-                    ? { label: lang === 'ru' ? 'Сложное' : 'Hard', cls: 'text-[#f0c784] border-[#d4af68]/35 bg-[#221b11]' }
-                    : { label: lang === 'ru' ? 'Лёгкое' : 'Easy', cls: 'text-[#b5aea4] border-white/[0.12] bg-white/[0.04]' };
+          const statusTag = isUnlocked
+            ? { label: lang === 'ru' ? 'Открыто' : 'Unlocked', cls: 'text-[#7ed6a3] border-[#2f5e42]/70 bg-[#102016]' }
+            : isInProgress
+              ? { label: lang === 'ru' ? 'В процессе' : 'In Progress', cls: 'text-[#f0c784] border-[#d4af68]/35 bg-[#221b11]' }
+              : { label: lang === 'ru' ? 'Закрыто' : 'Locked', cls: 'text-[#7b746b] border-white/[0.08] bg-white/[0.03]' };
 
-              return (
+          return (
+            <div
+              key={ach.slug}
+              className={`rounded-lg border p-3.5 transition-colors flex flex-col justify-between gap-3 ${
+                isUnlocked
+                  ? 'border-white/[0.14] bg-[#121118]'
+                  : isInProgress
+                    ? 'border-[#821c2c]/35 bg-[#100f15]'
+                    : 'border-white/[0.06] bg-[#0c0b10]/90 opacity-85'
+              }`}
+            >
+              <div className="flex items-start gap-3">
                 <div
-                  key={ach.slug}
-                  className={`rounded-lg border p-3.5 transition-colors flex flex-col justify-between gap-3 ${
+                  className={`w-10 h-10 rounded-md border flex items-center justify-center shrink-0 ${
                     isUnlocked
-                      ? 'border-white/[0.13] bg-[#121118]'
-                      : 'border-white/[0.06] bg-[#0c0b10]/90 opacity-85'
+                      ? isSecret
+                        ? 'bg-[#211530] border-[#9c5de0]/40 text-[#d0b4fa]'
+                        : 'bg-[#221117] border-[#821c2c]/45 text-[#eb9aa7]'
+                      : isInProgress
+                        ? 'bg-[#1c1319] border-[#821c2c]/35 text-[#c98b96]'
+                        : 'bg-[#15141c] border-white/[0.08] text-[#635d54]'
                   }`}
                 >
-                  <div className="flex items-start gap-3">
-                    <div
-                      className={`w-10 h-10 rounded-md border flex items-center justify-center shrink-0 ${
-                        isUnlocked
-                          ? isSecret
-                            ? 'bg-[#211530] border-[#9c5de0]/40 text-[#d0b4fa]'
-                            : 'bg-[#221117] border-[#821c2c]/45 text-[#eb9aa7]'
-                          : 'bg-[#15141c] border-white/[0.08] text-[#635d54]'
-                      }`}
-                    >
-                      {isSecretLocked ? <Lock className="w-4 h-4" /> : renderAchievementIcon(ach.icon, 'w-4 h-4')}
+                  {isSecretLocked ? <Lock className="w-4 h-4" /> : renderAchievementIcon(ach.icon, 'w-4 h-4')}
+                </div>
+
+                <div className="min-w-0 flex-1 space-y-1.5">
+                  <div className="flex flex-wrap items-center justify-between gap-1.5">
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <span className={`text-sm font-medium truncate ${isUnlocked ? 'text-[#f2eee9]' : isInProgress ? 'text-[#ddd6cc]' : 'text-[#9e968b]'}`}>
+                        {lang === 'ru' ? ach.title_ru : ach.title_en}
+                      </span>
+                      {isUnlocked && <CheckCircle2 className="w-3.5 h-3.5 text-[#7ed6a3] shrink-0" />}
                     </div>
 
-                    <div className="min-w-0 flex-1 space-y-1">
-                      <div className="flex flex-wrap items-center justify-between gap-1.5">
-                        <div className="flex items-center gap-1.5 min-w-0">
-                          <span className={`text-sm font-medium truncate ${isUnlocked ? 'text-[#f2eee9]' : 'text-[#b5aea4]'}`}>
-                            {lang === 'ru' ? ach.title_ru : ach.title_en}
-                          </span>
-                          {isUnlocked && <CheckCircle2 className="w-3.5 h-3.5 text-[#7ed6a3] shrink-0" />}
-                        </div>
-                        <div className="flex items-center gap-1.5 shrink-0 font-mono text-[10px]">
-                          <span className={`px-1.5 py-0.5 rounded border ${tierBadge.cls}`}>
-                            {tierBadge.label}
-                          </span>
-                          {Number(ach.xp_reward || 0) > 0 && (
-                            <span className="px-1.5 py-0.5 rounded border border-[#2f5e42] bg-[#102016] text-[#7ed6a3] tabular-nums">
-                              +{ach.xp_reward} XP
-                            </span>
-                          )}
-                        </div>
-                      </div>
-
-                      <p className="text-xs text-[#9c9488] leading-relaxed">
-                        {isSecretLocked
-                          ? '???'
-                          : lang === 'ru'
-                            ? ach.desc_ru
-                            : ach.desc_en}
-                      </p>
+                    <div className="flex flex-wrap items-center gap-1 shrink-0 font-mono text-[10px]">
+                      <span className={`px-1.5 py-0.5 rounded border ${tierBadge.cls}`}>
+                        {tierBadge.label}
+                      </span>
+                      {isSecret && (
+                        <span className="px-1.5 py-0.5 rounded border text-[#d0b4fa] border-[#9c5de0]/40 bg-[#1c1329]">
+                          {lang === 'ru' ? 'Секретное' : 'Secret'}
+                        </span>
+                      )}
+                      {Number(ach.xp_reward || 0) > 0 ? (
+                        <span className="px-1.5 py-0.5 rounded border border-[#2f5e42] bg-[#102016] text-[#7ed6a3] tabular-nums">
+                          +{ach.xp_reward} XP
+                        </span>
+                      ) : (
+                        <span className="px-1.5 py-0.5 rounded border border-white/[0.1] bg-white/[0.03] text-[#8e877e] tabular-nums">
+                          0 XP
+                        </span>
+                      )}
                     </div>
                   </div>
 
-                  {/* Progress Bar & Owner Pin Action */}
-                  <div className="space-y-1.5 pt-1 border-t border-white/[0.05]">
-                    <div className="flex items-center justify-between font-mono text-[10px] text-[#8e877e] tabular-nums">
-                      <span className="truncate pr-2">
-                        {isSecretLocked
-                          ? lang === 'ru'
-                            ? 'Условие: ???'
-                            : 'Condition: ???'
-                          : lang === 'ru'
-                            ? ach.condition_ru || ach.desc_ru
-                            : ach.condition_en || ach.desc_en}
-                      </span>
-                      <span className={isUnlocked ? 'text-[#7ed6a3] shrink-0' : 'text-[#a39b8b] shrink-0'}>
-                        {isSecretLocked ? '???' : `${progCurrent} / ${progTarget}`}
-                      </span>
-                    </div>
+                  <p className="text-xs text-[#9c9488] leading-relaxed">
+                    {isSecretLocked
+                      ? '???'
+                      : lang === 'ru'
+                        ? ach.desc_ru
+                        : ach.desc_en}
+                  </p>
+                </div>
+              </div>
 
-                    <div className="h-1 w-full rounded-full bg-white/[0.07] overflow-hidden">
-                      <div
-                        className={`h-full transition-all duration-300 ${
-                          isUnlocked ? 'bg-[#4fb37a]' : 'bg-[#821c2c]'
-                        }`}
-                        style={{ width: `${progPct}%` }}
-                      />
-                    </div>
-
-                    {isOwnProfile && isUnlocked && (
-                      <div className="flex items-center justify-between pt-1">
-                        <span className="font-mono text-[10px] text-[#6e675e]">
-                          {ach.unlocked_at ? new Date(ach.unlocked_at).toLocaleDateString('ru-RU') : ''}
-                        </span>
-                        <button
-                          type="button"
-                          disabled={pinSaving === ach.slug}
-                          onClick={() => handleToggleFeaturedAchievement(ach.slug)}
-                          className={`inline-flex items-center gap-1 font-mono text-[10px] px-2 py-0.5 rounded border transition-colors cursor-pointer ${
-                            isPinned
-                              ? 'border-[#d4af68]/45 bg-[#241d11] text-[#f0d599]'
-                              : 'border-white/[0.09] text-[#8e877e] hover:text-white'
-                          }`}
-                        >
-                          <Pin className="w-2.5 h-2.5" />
-                          {isPinned
-                            ? lang === 'ru'
-                              ? 'В витрине'
-                              : 'Pinned'
-                            : lang === 'ru'
-                              ? 'На витрину'
-                              : 'Pin'}
-                        </button>
-                      </div>
-                    )}
+              {/* Progress Bar, Status Tag & Owner Pin Action */}
+              <div className="space-y-1.5 pt-2 border-t border-white/[0.05]">
+                <div className="flex items-center justify-between gap-2 font-mono text-[10px] text-[#8e877e] tabular-nums">
+                  <span className="truncate">
+                    {isSecretLocked
+                      ? lang === 'ru'
+                        ? 'Условие: ???'
+                        : 'Condition: ???'
+                      : lang === 'ru'
+                        ? ach.condition_ru || ach.desc_ru
+                        : ach.condition_en || ach.desc_en}
+                  </span>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <span className={`px-1.5 py-0.2 rounded border text-[9px] uppercase tracking-wider ${statusTag.cls}`}>
+                      {statusTag.label}
+                    </span>
+                    <span className={isUnlocked ? 'text-[#7ed6a3]' : isInProgress ? 'text-[#f0c784]' : 'text-[#7b746b]'}>
+                      {isSecretLocked ? '???' : `${progCurrent} / ${progTarget}`}
+                    </span>
                   </div>
                 </div>
-              );
-            })}
+
+                <div className="h-1.5 w-full rounded-full bg-white/[0.07] overflow-hidden">
+                  <div
+                    className={`h-full transition-all duration-300 ${
+                      isUnlocked ? 'bg-[#4fb37a]' : isInProgress ? 'bg-[#a4283c]' : 'bg-white/[0.15]'
+                    }`}
+                    style={{ width: `${progPct}%` }}
+                  />
+                </div>
+
+                {isOwnProfile && isUnlocked && (
+                  <div className="flex items-center justify-between pt-1">
+                    <span className="font-mono text-[10px] text-[#6e675e]">
+                      {ach.unlocked_at ? new Date(ach.unlocked_at).toLocaleDateString('ru-RU') : ''}
+                    </span>
+                    <button
+                      type="button"
+                      disabled={pinSaving === ach.slug}
+                      onClick={() => handleToggleFeaturedAchievement(ach.slug)}
+                      className={`inline-flex items-center gap-1 font-mono text-[10px] px-2 py-0.5 rounded border transition-colors cursor-pointer ${
+                        isPinned
+                          ? 'border-[#d4af68]/45 bg-[#241d11] text-[#f0d599]'
+                          : 'border-white/[0.09] text-[#8e877e] hover:text-white'
+                      }`}
+                    >
+                      <Pin className="w-2.5 h-2.5" />
+                      {isPinned
+                        ? lang === 'ru'
+                          ? 'В витрине'
+                          : 'Pinned'
+                        : lang === 'ru'
+                          ? 'На витрину'
+                          : 'Pin'}
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        };
+
+        const unlockedItems = filteredAchievements.filter((a) => getAchBucket(a) === 'unlocked');
+        const inProgressItems = filteredAchievements.filter((a) => getAchBucket(a) === 'in_progress');
+        const lockedItems = filteredAchievements.filter((a) => getAchBucket(a) === 'locked');
+
+        return (
+          <div className="space-y-4">
+            {/* Summary Strip */}
+            <div className="rounded-lg border border-white/[0.08] bg-[#0e0d12] p-4 space-y-3">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 font-mono tabular-nums">
+                <div className="rounded-md border border-white/[0.06] bg-[#121118] px-3 py-2.5">
+                  <div className="text-[10px] uppercase tracking-wider text-[#736c64]">
+                    {lang === 'ru' ? 'Открыто' : 'Unlocked'}
+                  </div>
+                  <div className="text-lg font-semibold text-[#7ed6a3] mt-0.5">
+                    {unlockedCount} <span className="text-xs text-[#736c64]">/ {allAchievements.length}</span>
+                  </div>
+                </div>
+                <div className="rounded-md border border-white/[0.06] bg-[#121118] px-3 py-2.5">
+                  <div className="text-[10px] uppercase tracking-wider text-[#736c64]">
+                    {lang === 'ru' ? 'В процессе' : 'In Progress'}
+                  </div>
+                  <div className="text-lg font-semibold text-[#f0c784] mt-0.5">{inProgressCount}</div>
+                </div>
+                <div className="rounded-md border border-white/[0.06] bg-[#121118] px-3 py-2.5">
+                  <div className="text-[10px] uppercase tracking-wider text-[#736c64]">
+                    {lang === 'ru' ? 'Закрыто' : 'Locked'}
+                  </div>
+                  <div className="text-lg font-semibold text-[#b5aea4] mt-0.5">{lockedCount}</div>
+                </div>
+                <div className="rounded-md border border-white/[0.06] bg-[#121118] px-3 py-2.5">
+                  <div className="text-[10px] uppercase tracking-wider text-[#736c64]">
+                    {lang === 'ru' ? 'XP с ачивок' : 'Achievement XP'}
+                  </div>
+                  <div className="text-lg font-semibold text-[#f2eee9] mt-0.5">+{achievementXpTotal} XP</div>
+                </div>
+              </div>
+
+              <div className="space-y-1">
+                <div className="flex items-center justify-between font-mono text-[10px] text-[#8e877e] tabular-nums">
+                  <span>{lang === 'ru' ? 'Общий прогресс коллекции достижений' : 'Overall achievement completion'}</span>
+                  <span className="text-[#f2eee9]">{completionPct}%</span>
+                </div>
+                <div className="h-1.5 w-full rounded-full bg-white/[0.07] overflow-hidden">
+                  <div
+                    className="h-full bg-[#4fb37a] transition-all duration-300"
+                    style={{ width: `${completionPct}%` }}
+                  />
+                </div>
+              </div>
+            </div>
+
+            {/* Tier Filter Sub-tabs + Status Filter */}
+            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 rounded-lg border border-white/[0.08] bg-[#0e0d12] p-3">
+              <div className="flex flex-wrap items-center gap-1.5 font-mono text-xs">
+                {(
+                  [
+                    { id: 'all', label: lang === 'ru' ? `Все (${allAchievements.length})` : `All (${allAchievements.length})` },
+                    { id: 'easy', label: lang === 'ru' ? `Лёгкие (${easyCount})` : `Easy (${easyCount})` },
+                    { id: 'medium', label: lang === 'ru' ? `Средние (${mediumCount})` : `Medium (${mediumCount})` },
+                    { id: 'hard', label: lang === 'ru' ? `Сложные (${hardCount})` : `Hard (${hardCount})` },
+                  ] as Array<{ id: AchTierFilter; label: string }>
+                ).map((f) => (
+                  <button
+                    key={f.id}
+                    type="button"
+                    onClick={() => setAchTier(f.id)}
+                    className={`px-3 py-1.5 rounded-md transition-colors cursor-pointer ${
+                      achTier === f.id
+                        ? 'bg-[#821c2c]/30 text-[#f2eee9] border border-[#c96075]/45'
+                        : 'text-[#8e877e] hover:text-[#ded8ce] border border-transparent hover:bg-white/[0.04]'
+                    }`}
+                  >
+                    {f.label}
+                  </button>
+                ))}
+              </div>
+
+              <div className="flex flex-wrap items-center gap-1 font-mono text-[11px]">
+                {(
+                  [
+                    { id: 'all', label: lang === 'ru' ? `Все (${tierFilteredAchievements.length})` : `All (${tierFilteredAchievements.length})` },
+                    { id: 'unlocked', label: lang === 'ru' ? `Открытые (${tierUnlockedCount})` : `Unlocked (${tierUnlockedCount})` },
+                    { id: 'in_progress', label: lang === 'ru' ? `В процессе (${tierInProgressCount})` : `In Progress (${tierInProgressCount})` },
+                    { id: 'locked', label: lang === 'ru' ? `Закрытые (${tierLockedCount})` : `Locked (${tierLockedCount})` },
+                  ] as Array<{ id: AchStatusFilter; label: string }>
+                ).map((st) => (
+                  <button
+                    key={st.id}
+                    type="button"
+                    onClick={() => setAchStatus(st.id)}
+                    className={`px-2.5 py-1 rounded transition-colors cursor-pointer ${
+                      achStatus === st.id
+                        ? 'bg-white/[0.1] text-white'
+                        : 'text-[#736c64] hover:text-[#ded8ce]'
+                    }`}
+                  >
+                    {st.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Achievements Grid (Grouped cleanly when Status = 'all') */}
+            {filteredAchievements.length === 0 ? (
+              <div className="rounded-lg border border-white/[0.07] bg-[#0e0d12] px-4 py-10 text-center font-mono text-xs text-[#736c64]">
+                {lang === 'ru'
+                  ? 'В этой категории пока нет достижений.'
+                  : 'No achievements in this category yet.'}
+              </div>
+            ) : achStatus === 'all' ? (
+              <div className="space-y-6">
+                {unlockedItems.length > 0 && (
+                  <section className="space-y-2.5">
+                    <div className="flex items-center justify-between px-1">
+                      <h3 className="font-mono text-[11px] uppercase tracking-[0.16em] text-[#7ed6a3]">
+                        {lang === 'ru' ? `Открытые (${unlockedItems.length})` : `Unlocked (${unlockedItems.length})`}
+                      </h3>
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      {unlockedItems.map(renderAchievementCard)}
+                    </div>
+                  </section>
+                )}
+
+                {inProgressItems.length > 0 && (
+                  <section className="space-y-2.5">
+                    <div className="flex items-center justify-between px-1">
+                      <h3 className="font-mono text-[11px] uppercase tracking-[0.16em] text-[#f0c784]">
+                        {lang === 'ru' ? `В процессе (${inProgressItems.length})` : `In Progress (${inProgressItems.length})`}
+                      </h3>
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      {inProgressItems.map(renderAchievementCard)}
+                    </div>
+                  </section>
+                )}
+
+                {lockedItems.length > 0 && (
+                  <section className="space-y-2.5">
+                    <div className="flex items-center justify-between px-1">
+                      <h3 className="font-mono text-[11px] uppercase tracking-[0.16em] text-[#8e877e]">
+                        {lang === 'ru' ? `Закрытые (${lockedItems.length})` : `Locked (${lockedItems.length})`}
+                      </h3>
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      {lockedItems.map(renderAchievementCard)}
+                    </div>
+                  </section>
+                )}
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                {filteredAchievements.map(renderAchievementCard)}
+              </div>
+            )}
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* TAB 3: СООБЩЕСТВО (COMPACT, STABLE, REAL DB STATS) */}
       {activeTab === 'community' && (

@@ -1099,7 +1099,29 @@ export const AdminUserEditorModal: React.FC<Props> = ({
                             {lang === 'ru' ? ach.condition_ru : ach.condition_en}
                           </div>
                         )}
-                        <div className="font-mono text-[10px] flex items-center gap-2 pt-0.5">
+                        <div className="font-mono text-[10px] flex flex-wrap items-center gap-1.5 pt-0.5">
+                          <span
+                            className={`px-1.5 py-0.5 rounded border ${
+                              ach.difficulty_tier === 'hard'
+                                ? 'border-[#d4af68]/35 bg-[#221b11] text-[#f0c784]'
+                                : ach.difficulty_tier === 'medium'
+                                  ? 'border-[#4d7cb8]/40 bg-[#111927] text-[#9ac2f2]'
+                                  : 'border-white/[0.12] bg-white/[0.04] text-[#b5aea4]'
+                            }`}
+                          >
+                            {ach.difficulty_tier === 'hard'
+                              ? lang === 'ru'
+                                ? 'Сложное'
+                                : 'Hard'
+                              : ach.difficulty_tier === 'medium'
+                                ? lang === 'ru'
+                                  ? 'Среднее'
+                                  : 'Medium'
+                                : lang === 'ru'
+                                  ? 'Лёгкое'
+                                  : 'Easy'}
+                          </span>
+                          <span className="text-ash/50">·</span>
                           <span className={rCfg.textClass}>{lang === 'ru' ? rCfg.labelRu : rCfg.labelEn}</span>
                           <span className="text-ash/50">·</span>
                           <span className="text-amber-300/90">+{ach.xp_reward || 0} XP</span>

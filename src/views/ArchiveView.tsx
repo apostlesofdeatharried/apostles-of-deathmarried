@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useI18n } from '../context/I18nContext.js';
 import { usePlayer } from '../context/PlayerContext.js';
 import { useAuth, authFetch } from '../context/AuthContext.js';
@@ -7,6 +7,7 @@ import { formatDuration, safeJson } from '../utils/logic.js';
 import { CoverArt } from '../components/CoverArt.js';
 import { ReleaseComments } from '../components/ReleaseComments.js';
 import { ShareCardModal } from '../components/ShareCardModal.js';
+import { dispatchAchievementUnlocked } from '../components/AchievementToast.js';
 import type { ShareCardContext } from '../utils/shareCardGenerator.js';
 import {
   Play,
@@ -84,7 +85,8 @@ export const StreamingBadges: React.FC<{ links?: StreamingLinks; compact?: boole
 export const ArchiveView: React.FC = () => {
   const { t, lang } = useI18n();
   const { playTrack, currentTrack } = usePlayer();
-  const { user } = useAuth();
+  const { user, refresh } = useAuth();
+  const lyricsEventTrackedRef = useRef<string | null>(null);
 
   const [albums, setAlbums] = useState<Album[]>([]);
   const [singles, setSingles] = useState<Single[]>([]);
@@ -139,6 +141,29 @@ export const ArchiveView: React.FC = () => {
   useEffect(() => {
     setSelectedLyricIndices([]);
   }, [selectedLyricsTrack?.id, selectedSingle?.id]);
+
+  // Server-authoritative achievement check when an authenticated user opens track or single lyrics
+  useEffect(() => {
+    if (!user?.id) return;
+    const hasOpenLyrics = Boolean(selectedLyricsTrack?.lyrics || selectedSingle?.lyrics);
+    if (!hasOpenLyrics) return;
+    if (lyricsEventTrackedRef.current === user.id) return;
+    lyricsEventTrackedRef.current = user.id;
+
+    authFetch('/api/achievements/track-event', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ event: 'lyrics_open' }),
+    })
+      .then((res) => safeJson<any>(res, {}))
+      .then((data) => {
+        if (data?.newly_unlocked_achievements?.length) {
+          dispatchAchievementUnlocked(data.newly_unlocked_achievements);
+          refresh().catch(() => {});
+        }
+      })
+      .catch(() => {});
+  }, [user?.id, selectedLyricsTrack?.id, selectedLyricsTrack?.lyrics, selectedSingle?.id, selectedSingle?.lyrics, refresh]);
 
   // Deep-link from URL query (?album=... / ?single=...) or notification click
   useEffect(() => {

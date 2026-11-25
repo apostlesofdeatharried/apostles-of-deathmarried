@@ -131,6 +131,12 @@ export interface Achievement {
   condition_en?: string;
   category?: string;
   rarity?: AchievementRarity;
+  difficulty_tier?: 'easy' | 'medium' | 'hard';
+  is_secret?: boolean;
+  progress?: {
+    current: number;
+    target: number;
+  };
   icon: string;
   unlocked_at?: string | null;
   is_unlocked?: boolean;
