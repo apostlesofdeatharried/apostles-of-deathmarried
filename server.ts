@@ -9278,6 +9278,115 @@ app.use('/api', (err: any, _req: Request, res: Response, _next: NextFunction) =>
 });
 
 // ----------------------------------------------------------------------------
+// SEO: DYNAMIC ROBOTS.TXT & SITEMAP.XML
+// ----------------------------------------------------------------------------
+
+const SITE_CANONICAL_ORIGIN = 'https://apostlesofdeathmarried.ru';
+
+function escapeXmlValue(str: string): string {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+function toSitemapDate(raw?: string | null): string | undefined {
+  if (!raw || typeof raw !== 'string') return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  if (/^\d{4}-\d{2}-\d{2}/.test(trimmed)) {
+    return trimmed.slice(0, 10);
+  }
+  const parsed = Date.parse(trimmed);
+  if (!Number.isNaN(parsed)) {
+    return new Date(parsed).toISOString().slice(0, 10);
+  }
+  return undefined;
+}
+
+app.get('/robots.txt', (_req: Request, res: Response) => {
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=3600');
+  res.send(
+    [
+      'User-agent: *',
+      'Allow: /',
+      'Disallow: /api/',
+      'Disallow: /admin',
+      '',
+      `Sitemap: ${SITE_CANONICAL_ORIGIN}/sitemap.xml`,
+      `Host: ${SITE_CANONICAL_ORIGIN}`,
+    ].join('\n')
+  );
+});
+
+app.get('/sitemap.xml', (_req: Request, res: Response) => {
+  const urls: Array<{ loc: string; lastmod?: string; changefreq: string; priority: string }> = [
+    { loc: `${SITE_CANONICAL_ORIGIN}/`, changefreq: 'weekly', priority: '1.0' },
+    { loc: `${SITE_CANONICAL_ORIGIN}/archive`, changefreq: 'weekly', priority: '0.9' },
+    { loc: `${SITE_CANONICAL_ORIGIN}/community`, changefreq: 'daily', priority: '0.8' },
+    { loc: `${SITE_CANONICAL_ORIGIN}/creations`, changefreq: 'daily', priority: '0.8' },
+    { loc: `${SITE_CANONICAL_ORIGIN}/games`, changefreq: 'weekly', priority: '0.7' },
+  ];
+
+  try {
+    const activeDb = getDb();
+    const albumRows = activeDb
+      .prepare('SELECT id, updated_at, created_at, release_date FROM albums ORDER BY sort_order ASC, release_year DESC')
+      .all() as Array<{ id: string; updated_at?: string | null; created_at?: string | null; release_date?: string | null }>;
+    for (const album of albumRows) {
+      if (!album?.id) continue;
+      urls.push({
+        loc: `${SITE_CANONICAL_ORIGIN}/archive?album=${encodeURIComponent(album.id)}`,
+        lastmod: toSitemapDate(album.updated_at) || toSitemapDate(album.created_at) || toSitemapDate(album.release_date),
+        changefreq: 'weekly',
+        priority: '0.8',
+      });
+    }
+
+    const singleRows = activeDb
+      .prepare('SELECT id, updated_at, created_at, release_date FROM singles ORDER BY sort_order ASC, release_year DESC')
+      .all() as Array<{ id: string; updated_at?: string | null; created_at?: string | null; release_date?: string | null }>;
+    for (const single of singleRows) {
+      if (!single?.id) continue;
+      urls.push({
+        loc: `${SITE_CANONICAL_ORIGIN}/archive?single=${encodeURIComponent(single.id)}`,
+        lastmod: toSitemapDate(single.updated_at) || toSitemapDate(single.created_at) || toSitemapDate(single.release_date),
+        changefreq: 'weekly',
+        priority: '0.8',
+      });
+    }
+  } catch (err) {
+    console.warn('[SEO] Failed to include dynamic releases in sitemap.xml:', err);
+  }
+
+  const xmlBody = [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
+    ...urls.map((entry) => {
+      const lines = [
+        '  <url>',
+        `    <loc>${escapeXmlValue(entry.loc)}</loc>`,
+      ];
+      if (entry.lastmod) {
+        lines.push(`    <lastmod>${escapeXmlValue(entry.lastmod)}</lastmod>`);
+      }
+      lines.push(`    <changefreq>${escapeXmlValue(entry.changefreq)}</changefreq>`);
+      lines.push(`    <priority>${escapeXmlValue(entry.priority)}</priority>`);
+      lines.push('  </url>');
+      return lines.join('\n');
+    }),
+    '</urlset>',
+  ].join('\n');
+
+  res.setHeader('Content-Type', 'application/xml; charset=utf-8');
+  res.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=3600');
+  res.send(xmlBody);
+});
+
+// ----------------------------------------------------------------------------
 // VITE INTEGRATION & SSR / SPA SERVING
 // ----------------------------------------------------------------------------
 

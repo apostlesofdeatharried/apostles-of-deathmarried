@@ -25,7 +25,7 @@ import { ProfileView } from './views/ProfileView.js';
 import { AdminView } from './views/AdminView.js';
 
 const TAB_TITLES: Record<AppTab, string> = {
-  home: 'Apostles of deathmarried',
+  home: 'Apostles of deathmarried — Архив, дискография, тексты треков и игры',
   archive: 'Дискография — Apostles of deathmarried',
   games: 'Игры — Apostles of deathmarried',
   community: 'Сообщество — Apostles of deathmarried',
@@ -95,7 +95,7 @@ function MainApp() {
       : route.profileNickname
         ? `${route.profileNickname} — Apostles of deathmarried`
         : route.tab === 'admin' && !isAdminOrMod
-          ? 'Apostles of deathmarried'
+          ? TAB_TITLES.home
           : TAB_TITLES[route.tab];
     document.title = nextTitle;
 
@@ -106,6 +106,8 @@ function MainApp() {
     if (ogUrlEl) ogUrlEl.setAttribute('content', canonicalUrl);
     const ogTitleEl = document.querySelector('meta[property="og:title"]');
     if (ogTitleEl) ogTitleEl.setAttribute('content', nextTitle);
+    const twitterTitleEl = document.querySelector('meta[name="twitter:title"]');
+    if (twitterTitleEl) twitterTitleEl.setAttribute('content', nextTitle);
   }, [route, showNotFound, isAdminOrMod]);
 
   useEffect(() => {

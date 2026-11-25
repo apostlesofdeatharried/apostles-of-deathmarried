@@ -655,5 +655,40 @@ describe('Production fixes: profile email verification, notifications, fast reve
         .get('usr_a_test', targetShopItem.id) as { c: number }
     ).c;
     assert.equal(invCount, 1, 'Concurrent buy must insert strictly 1 inventory row');
+
+    // 7. SEO endpoints: /robots.txt and /sitemap.xml
+    const robotsRes = await fetch(`${baseUrl}/robots.txt`);
+    assert.equal(robotsRes.status, 200);
+    assert.ok(
+      (robotsRes.headers.get('content-type') || '').includes('text/plain'),
+      'robots.txt must return text/plain'
+    );
+    const robotsText = await robotsRes.text();
+    assert.ok(robotsText.includes('User-agent: *'));
+    assert.ok(robotsText.includes('Allow: /'));
+    assert.ok(robotsText.includes('Disallow: /api/'));
+    assert.ok(robotsText.includes('Disallow: /admin'));
+    assert.ok(robotsText.includes('Sitemap: https://apostlesofdeathmarried.ru/sitemap.xml'));
+    assert.ok(robotsText.includes('Host: https://apostlesofdeathmarried.ru'));
+
+    const sitemapRes = await fetch(`${baseUrl}/sitemap.xml`);
+    assert.equal(sitemapRes.status, 200);
+    assert.ok(
+      (sitemapRes.headers.get('content-type') || '').includes('application/xml'),
+      'sitemap.xml must return application/xml'
+    );
+    const sitemapXml = await sitemapRes.text();
+    assert.ok(sitemapXml.startsWith('<?xml version="1.0" encoding="UTF-8"?>'));
+    assert.ok(sitemapXml.includes('<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'));
+    assert.ok(sitemapXml.includes('<loc>https://apostlesofdeathmarried.ru/</loc>'));
+    assert.ok(sitemapXml.includes('<loc>https://apostlesofdeathmarried.ru/archive</loc>'));
+    assert.ok(sitemapXml.includes('<loc>https://apostlesofdeathmarried.ru/games</loc>'));
+    assert.ok(sitemapXml.includes('<loc>https://apostlesofdeathmarried.ru/community</loc>'));
+    assert.ok(sitemapXml.includes('<loc>https://apostlesofdeathmarried.ru/creations</loc>'));
+    assert.ok(
+      sitemapXml.includes('https://apostlesofdeathmarried.ru/archive?album=') ||
+        sitemapXml.includes('https://apostlesofdeathmarried.ru/archive?single='),
+      'sitemap.xml must include seeded releases from DB'
+    );
   });
 });

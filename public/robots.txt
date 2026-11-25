@@ -1,6 +1,7 @@
 User-agent: *
 Allow: /
-Disallow: /admin
 Disallow: /api/
+Disallow: /admin
 
 Sitemap: https://apostlesofdeathmarried.ru/sitemap.xml
+Host: https://apostlesofdeathmarried.ru
