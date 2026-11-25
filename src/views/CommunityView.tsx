@@ -216,11 +216,21 @@ export const CommunityView: React.FC = () => {
     setLoadingThread(true);
     try {
       const res = await authFetch(`/api/community/posts/${postId}`);
-      const data = await safeJson<{ post?: Post; comments?: Comment[]; userReaction?: string | null; error?: string } | null>(res, null);
+      const data = await safeJson<{
+        post?: Post;
+        comments?: Comment[];
+        userReaction?: string | null;
+        newly_unlocked_achievements?: any[];
+        error?: string;
+      } | null>(res, null);
       if (res.ok && data?.post) {
         setActivePost(data.post);
         setComments(data.comments || []);
         setUserReaction(data.userReaction ?? null);
+        if (data.newly_unlocked_achievements?.length) {
+          dispatchAchievementUnlocked(data.newly_unlocked_achievements);
+          refresh();
+        }
       } else {
         showError(data?.error || (lang === 'ru' ? 'Не удалось открыть обсуждение' : 'Failed to open thread'));
       }
@@ -287,7 +297,13 @@ export const CommunityView: React.FC = () => {
           media_type: newPostMediaUrl.trim() ? newPostMediaType : null,
         }),
       });
-      const data = await safeJson<{ ok?: boolean; id?: string; status?: string; error?: string } | null>(res, null);
+      const data = await safeJson<{
+        ok?: boolean;
+        id?: string;
+        status?: string;
+        newly_unlocked_achievements?: any[];
+        error?: string;
+      } | null>(res, null);
       if (res.ok && data?.id) {
         setCreateModalOpen(false);
         setNewPostTitle('');
@@ -299,6 +315,9 @@ export const CommunityView: React.FC = () => {
           showToast(lang === 'ru' ? 'Тема отправлена на модерацию' : 'Post submitted for moderation');
         } else {
           showToast(lang === 'ru' ? 'Тема опубликована' : 'Topic published');
+        }
+        if (data.newly_unlocked_achievements?.length) {
+          dispatchAchievementUnlocked(data.newly_unlocked_achievements);
         }
         refresh();
         await fetchPosts();
@@ -477,10 +496,13 @@ export const CommunityView: React.FC = () => {
           parent_id: replyToCommentId,
         }),
       });
-      const data = await safeJson<{ error?: string } | null>(res, null);
+      const data = await safeJson<{ error?: string; newly_unlocked_achievements?: any[] } | null>(res, null);
       if (res.ok) {
         setNewComment('');
         setReplyToCommentId(null);
+        if (data?.newly_unlocked_achievements?.length) {
+          dispatchAchievementUnlocked(data.newly_unlocked_achievements);
+        }
         refresh();
         await loadPostThread(activePost.id);
         fetchPosts();

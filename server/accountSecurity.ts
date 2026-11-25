@@ -692,14 +692,15 @@ export interface AchievementDefinition {
 
 /**
  * Single-source canonical catalog of all 52 achievements across 3 balanced difficulty tiers:
- * - Easy ('easy'): 25–75 XP (starter 'archive_initiate' stays 0 XP so newly registered accounts start at 0 XP)
- * - Medium ('medium'): 150–350 XP
- * - Hard ('hard'): 500–1200 XP
+ * - Easy ('easy'): 10–25 XP (starter 'archive_initiate' stays 0 XP so newly registered accounts start at 0 XP;
+ *   aligns with a single mini-game round 15–20 XP and shop common tier 100–250 XP)
+ * - Medium ('medium'): 50–150 XP (aligns with 1–2 Rare or 1 Epic shop item 400–850 XP across several days)
+ * - Hard ('hard'): 250–800 XP (long-term mastery & community contribution without flooding the XP economy)
  * All 35 legacy `id` and `slug` identifiers are preserved 1:1 so existing user unlocks stay intact.
  */
 export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
   // =========================================================================
-  // EASY ('easy') — 16 achievements (1 starter at 0 XP + 15 in 25–75 XP)
+  // EASY ('easy') — 16 achievements (1 starter at 0 XP + 15 in 10–25 XP)
   // =========================================================================
   {
     id: 'ach_archive_initiate',
@@ -731,7 +732,7 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'easy',
     is_secret: 0,
     icon: 'play',
-    xp_reward: 30,
+    xp_reward: 15,
   },
   {
     id: 'ach_lyrics_reader',
@@ -747,7 +748,7 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'easy',
     is_secret: 0,
     icon: 'book-open',
-    xp_reward: 30,
+    xp_reward: 15,
   },
   {
     id: 'ach_easy_first_reply',
@@ -763,7 +764,7 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'easy',
     is_secret: 0,
     icon: 'message-square',
-    xp_reward: 30,
+    xp_reward: 15,
   },
   {
     id: 'ach_shadow_identity',
@@ -779,7 +780,7 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'easy',
     is_secret: 0,
     icon: 'feather',
-    xp_reward: 35,
+    xp_reward: 15,
   },
   {
     id: 'ach_first_blood',
@@ -795,7 +796,7 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'easy',
     is_secret: 0,
     icon: 'play',
-    xp_reward: 35,
+    xp_reward: 15,
   },
   {
     id: 'ach_share_card_first',
@@ -811,7 +812,7 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'easy',
     is_secret: 0,
     icon: 'sparkles',
-    xp_reward: 40,
+    xp_reward: 15,
   },
   {
     id: 'ach_quiz_seeker',
@@ -827,7 +828,7 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'easy',
     is_secret: 0,
     icon: 'book-open',
-    xp_reward: 40,
+    xp_reward: 15,
   },
   {
     id: 'ach_collector',
@@ -843,7 +844,7 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'easy',
     is_secret: 0,
     icon: 'tag',
-    xp_reward: 40,
+    xp_reward: 15,
   },
   {
     id: 'ach_first_note',
@@ -859,7 +860,7 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'easy',
     is_secret: 0,
     icon: 'music',
-    xp_reward: 45,
+    xp_reward: 20,
   },
   {
     id: 'ach_first_chronicle',
@@ -875,23 +876,23 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'easy',
     is_secret: 0,
     icon: 'message-square',
-    xp_reward: 45,
+    xp_reward: 20,
   },
   {
     id: 'ach_easy_avid_reader',
     slug: 'easy_avid_reader',
     title_ru: 'Читатель форума',
     title_en: 'Forum Reader',
-    desc_ru: 'Откройте и прочитайте 5 разных тем в сообществе',
-    desc_en: 'Read 5 distinct topics in the community',
-    condition_ru: 'Прочитать 5 тем в сообществе',
-    condition_en: 'Read 5 community topics',
+    desc_ru: 'Откройте и прочитайте любое обсуждение на форуме сообщества',
+    desc_en: 'Open and read any topic in the community forum',
+    condition_ru: 'Прочитать 1 тему на форуме',
+    condition_en: 'Read 1 community topic',
     category: 'community',
     rarity: 'common',
     difficulty_tier: 'easy',
     is_secret: 0,
     icon: 'book-open',
-    xp_reward: 45,
+    xp_reward: 15,
   },
   {
     id: 'ach_secret_first_code',
@@ -907,7 +908,7 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'easy',
     is_secret: 1,
     icon: 'tag',
-    xp_reward: 50,
+    xp_reward: 20,
   },
   {
     id: 'ach_track_duo',
@@ -923,7 +924,7 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'easy',
     is_secret: 0,
     icon: 'compass',
-    xp_reward: 55,
+    xp_reward: 20,
   },
   {
     id: 'ach_dressed_in_velvet',
@@ -939,7 +940,7 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'easy',
     is_secret: 0,
     icon: 'sparkles',
-    xp_reward: 60,
+    xp_reward: 20,
   },
   {
     id: 'ach_coven_circle',
@@ -955,11 +956,11 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'easy',
     is_secret: 0,
     icon: 'users',
-    xp_reward: 75,
+    xp_reward: 25,
   },
 
   // =========================================================================
-  // MEDIUM ('medium') — 19 achievements (150–350 XP)
+  // MEDIUM ('medium') — 19 achievements (50–150 XP)
   // =========================================================================
   {
     id: 'ach_devoted_acolyte',
@@ -968,14 +969,14 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     title_en: 'Devoted Listener',
     desc_ru: 'Поддерживайте серию ежедневной активности 5 дней подряд по МСК',
     desc_en: 'Maintain a 5-day daily streak',
+    category: 'consistency',
     condition_ru: 'Серия 5 дней подряд',
     condition_en: '5-day daily streak',
-    category: 'consistency',
     rarity: 'rare',
     difficulty_tier: 'medium',
     is_secret: 0,
     icon: 'calendar',
-    xp_reward: 150,
+    xp_reward: 60,
   },
   {
     id: 'ach_secret_curious_rose',
@@ -991,7 +992,7 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'medium',
     is_secret: 1,
     icon: 'eye',
-    xp_reward: 150,
+    xp_reward: 50,
   },
   {
     id: 'ach_initiate_ritual',
@@ -1007,7 +1008,7 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'medium',
     is_secret: 0,
     icon: 'headphones',
-    xp_reward: 160,
+    xp_reward: 70,
   },
   {
     id: 'ach_midnight_critic',
@@ -1023,7 +1024,7 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'medium',
     is_secret: 0,
     icon: 'feather',
-    xp_reward: 165,
+    xp_reward: 70,
   },
   {
     id: 'ach_vinyl_hunter',
@@ -1039,7 +1040,7 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'medium',
     is_secret: 0,
     icon: 'disc',
-    xp_reward: 180,
+    xp_reward: 80,
   },
   {
     id: 'ach_voice_of_abyss',
@@ -1055,7 +1056,7 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'medium',
     is_secret: 0,
     icon: 'message-square',
-    xp_reward: 185,
+    xp_reward: 80,
   },
   {
     id: 'ach_gothic_artisan',
@@ -1071,23 +1072,23 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'medium',
     is_secret: 0,
     icon: 'sparkles',
-    xp_reward: 190,
+    xp_reward: 85,
   },
   {
     id: 'ach_discography_listener',
     slug: 'discography_listener',
     title_ru: 'Хранитель каталога',
     title_en: 'Catalog Keeper',
-    desc_ru: 'Прослушайте до конца 15 разных композиций из дискографии deathmarried',
-    desc_en: 'Listen to 15 unique tracks from the catalog to completion',
-    condition_ru: 'Дослушать 15 разных треков',
-    condition_en: 'Complete 15 unique tracks',
+    desc_ru: 'Прослушайте до конца 3 разные аудиокомпозиции в плеере архива',
+    desc_en: 'Listen to 3 unique playable tracks in the archive to completion',
+    condition_ru: 'Дослушать 3 разных трека',
+    condition_en: 'Complete 3 unique tracks',
     category: 'music',
     rarity: 'rare',
     difficulty_tier: 'medium',
     is_secret: 0,
     icon: 'disc',
-    xp_reward: 200,
+    xp_reward: 90,
   },
   {
     id: 'ach_all_games_explorer',
@@ -1103,7 +1104,7 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'medium',
     is_secret: 0,
     icon: 'compass',
-    xp_reward: 210,
+    xp_reward: 90,
   },
   {
     id: 'ach_lyrics_hunter',
@@ -1119,7 +1120,7 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'medium',
     is_secret: 0,
     icon: 'feather',
-    xp_reward: 220,
+    xp_reward: 95,
   },
   {
     id: 'ach_reverse_decoder',
@@ -1135,7 +1136,7 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'medium',
     is_secret: 0,
     icon: 'headphones',
-    xp_reward: 230,
+    xp_reward: 100,
   },
   {
     id: 'ach_speed_runner',
@@ -1151,7 +1152,7 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'medium',
     is_secret: 0,
     icon: 'zap',
-    xp_reward: 230,
+    xp_reward: 100,
   },
   {
     id: 'ach_lore_scholar',
@@ -1167,7 +1168,7 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'medium',
     is_secret: 0,
     icon: 'award',
-    xp_reward: 240,
+    xp_reward: 110,
   },
   {
     id: 'ach_relic_hoarder',
@@ -1183,7 +1184,7 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'medium',
     is_secret: 0,
     icon: 'gem',
-    xp_reward: 250,
+    xp_reward: 100,
   },
   {
     id: 'ach_win_streak_5',
@@ -1199,7 +1200,7 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'medium',
     is_secret: 0,
     icon: 'flame',
-    xp_reward: 270,
+    xp_reward: 120,
   },
   {
     id: 'ach_cathedral_historian',
@@ -1215,7 +1216,7 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'medium',
     is_secret: 0,
     icon: 'compass',
-    xp_reward: 280,
+    xp_reward: 110,
   },
   {
     id: 'ach_eternal_vigil',
@@ -1231,23 +1232,23 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'medium',
     is_secret: 0,
     icon: 'shield',
-    xp_reward: 300,
+    xp_reward: 125,
   },
   {
     id: 'ach_dark_apostle',
     slug: 'dark_apostle',
     title_ru: 'Мастер звука',
     title_en: 'Sound Master',
-    desc_ru: 'Наберите 1500 суммарных очков опыта (Total XP)',
-    desc_en: 'Attain 1500 lifetime Total XP',
-    condition_ru: 'Набрать 1500 Total XP',
-    condition_en: 'Reach 1500 Total XP',
+    desc_ru: 'Наберите 1000 суммарных очков опыта (Total XP)',
+    desc_en: 'Attain 1000 lifetime Total XP',
+    condition_ru: 'Набрать 1000 Total XP',
+    condition_en: 'Reach 1000 Total XP',
     category: 'veteran',
     rarity: 'epic',
     difficulty_tier: 'medium',
     is_secret: 0,
     icon: 'trophy',
-    xp_reward: 320,
+    xp_reward: 130,
   },
   {
     id: 'ach_all_games_winner',
@@ -1263,27 +1264,27 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'medium',
     is_secret: 0,
     icon: 'crown',
-    xp_reward: 350,
+    xp_reward: 150,
   },
 
   // =========================================================================
-  // HARD ('hard') — 17 achievements (500–1200 XP)
+  // HARD ('hard') — 17 achievements (250–800 XP)
   // =========================================================================
   {
     id: 'ach_hard_community_reader',
     slug: 'hard_community_reader',
     title_ru: 'Хроникёр форума',
     title_en: 'Forum Chronicler',
-    desc_ru: 'Прочитайте 25 разных тем и обсуждений на форуме сообщества',
-    desc_en: 'Read 25 distinct topics in the community',
-    condition_ru: 'Прочитать 25 тем в сообществе',
-    condition_en: 'Read 25 community topics',
+    desc_ru: 'Опубликуйте 5 одобренных тем на форуме или оставьте 20 комментариев',
+    desc_en: 'Publish 5 approved forum topics or write 20 comments',
+    condition_ru: '5 одобренных тем или 20 комментариев',
+    condition_en: '5 approved topics or 20 comments',
     category: 'community',
     rarity: 'epic',
     difficulty_tier: 'hard',
     is_secret: 0,
     icon: 'book-open',
-    xp_reward: 500,
+    xp_reward: 300,
   },
   {
     id: 'ach_secret_midnight_visitor',
@@ -1299,7 +1300,7 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'hard',
     is_secret: 1,
     icon: 'moon',
-    xp_reward: 500,
+    xp_reward: 250,
   },
   {
     id: 'ach_phantom_ear',
@@ -1315,7 +1316,7 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'hard',
     is_secret: 0,
     icon: 'headphones',
-    xp_reward: 550,
+    xp_reward: 350,
   },
   {
     id: 'ach_secret_flawless_quiz',
@@ -1331,23 +1332,23 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'hard',
     is_secret: 1,
     icon: 'crown',
-    xp_reward: 550,
+    xp_reward: 350,
   },
   {
     id: 'ach_ritual_master',
     slug: 'ritual_master',
     title_ru: 'Мастер испытаний',
     title_en: 'Trial Master',
-    desc_ru: 'Примите участие в 40 игровых испытаниях сообщества',
-    desc_en: 'Complete 40 archive game trials',
-    condition_ru: 'Сыграть 40 игр',
-    condition_en: 'Play 40 games',
+    desc_ru: 'Одержите 20 побед в любых ежедневных играх архива',
+    desc_en: 'Win 20 archive game challenges',
+    condition_ru: 'Одержать 20 побед в играх',
+    condition_en: 'Win 20 games',
     category: 'music',
     rarity: 'epic',
     difficulty_tier: 'hard',
     is_secret: 0,
     icon: 'zap',
-    xp_reward: 600,
+    xp_reward: 350,
   },
   {
     id: 'ach_creation_idol',
@@ -1363,23 +1364,23 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'hard',
     is_secret: 0,
     icon: 'sparkles',
-    xp_reward: 600,
+    xp_reward: 380,
   },
   {
     id: 'ach_secret_on_repeat',
     slug: 'secret_on_repeat',
-    title_ru: 'На репите',
-    title_en: 'On Repeat',
-    desc_ru: 'Вы прослушали один и тот же трек полностью 15 раз',
-    desc_en: 'Listen to any single track to completion 15 times',
-    condition_ru: 'Прослушать один трек полностью 15 раз',
-    condition_en: 'Play any single track to the end 15 times',
+    title_ru: 'Резонанс слуха',
+    title_en: 'Audio Resonance',
+    desc_ru: 'Прослушайте 3 разные композиции до конца и одержите 6 побед в аудио-играх',
+    desc_en: 'Complete 3 unique archive tracks and win 6 audio-based games',
+    condition_ru: 'Дослушать 3 трека и выиграть 6 аудио-игр',
+    condition_en: 'Complete 3 tracks & win 6 audio games',
     category: 'secret',
     rarity: 'epic',
     difficulty_tier: 'hard',
     is_secret: 1,
     icon: 'disc',
-    xp_reward: 650,
+    xp_reward: 350,
   },
   {
     id: 'ach_obsidian_oracle',
@@ -1395,7 +1396,7 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'hard',
     is_secret: 0,
     icon: 'eye',
-    xp_reward: 700,
+    xp_reward: 420,
   },
   {
     id: 'ach_midnight_devotion',
@@ -1411,23 +1412,23 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'hard',
     is_secret: 0,
     icon: 'flame',
-    xp_reward: 700,
+    xp_reward: 450,
   },
   {
     id: 'ach_archive_completionist',
     slug: 'archive_completionist',
     title_ru: 'Полная дискография',
     title_en: 'Complete Discography',
-    desc_ru: 'Прослушайте до конца 25 разных треков и синглов архива',
-    desc_en: 'Listen to 25 unique archive tracks to completion',
-    condition_ru: 'Дослушать 25 разных треков',
-    condition_en: 'Complete 25 unique tracks',
+    desc_ru: 'Изучите тексты 12 разных композиций из дискографии deathmarried',
+    desc_en: 'Read lyrics of 12 unique tracks in the deathmarried archive',
+    condition_ru: 'Изучить тексты 12 разных треков',
+    condition_en: 'Read 12 unique track lyrics',
     category: 'music',
     rarity: 'legendary',
     difficulty_tier: 'hard',
     is_secret: 0,
     icon: 'music',
-    xp_reward: 750,
+    xp_reward: 450,
   },
   {
     id: 'ach_win_streak_10',
@@ -1443,23 +1444,23 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'hard',
     is_secret: 0,
     icon: 'trophy',
-    xp_reward: 800,
+    xp_reward: 500,
   },
   {
     id: 'ach_archon_of_sound',
     slug: 'archon_of_sound',
     title_ru: 'Ветеран архива',
     title_en: 'Archive Veteran',
-    desc_ru: 'Достигните 5000 Total XP или 12-го уровня профиля',
-    desc_en: 'Reach 5000 Total XP or Profile Level 12',
-    condition_ru: '5000 Total XP или 12-й уровень',
-    condition_en: '5000 Total XP or Level 12',
+    desc_ru: 'Достигните 3500 Total XP или 10-го уровня профиля',
+    desc_en: 'Reach 3500 Total XP or Profile Level 10',
+    condition_ru: '3500 Total XP или 10-й уровень',
+    condition_en: '3500 Total XP or Level 10',
     category: 'veteran',
     rarity: 'legendary',
     difficulty_tier: 'hard',
     is_secret: 0,
     icon: 'star',
-    xp_reward: 800,
+    xp_reward: 500,
   },
   {
     id: 'ach_gothic_treasury',
@@ -1475,7 +1476,7 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'hard',
     is_secret: 0,
     icon: 'layers',
-    xp_reward: 850,
+    xp_reward: 500,
   },
   {
     id: 'ach_meta_collector_20',
@@ -1491,23 +1492,23 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'hard',
     is_secret: 0,
     icon: 'shield',
-    xp_reward: 850,
+    xp_reward: 500,
   },
   {
     id: 'ach_grand_champion',
     slug: 'grand_champion',
     title_ru: 'Магистр состязаний',
     title_en: 'Grand Champion',
-    desc_ru: 'Одержите 50 побед суммарно во всех 5 игровых режимах архива',
-    desc_en: 'Achieve 50 total wins across all 5 archive games',
-    condition_ru: '50 побед в играх архива',
-    condition_en: '50 total game wins',
+    desc_ru: 'Одержите минимум по 3 победы в каждом из всех 5 игровых режимов архива',
+    desc_en: 'Achieve at least 3 wins in each of all 5 archive game modes',
+    condition_ru: 'По 3 победы в каждой из 5 игр',
+    condition_en: '3 wins in all 5 game modes',
     category: 'music',
     rarity: 'legendary',
     difficulty_tier: 'hard',
     is_secret: 0,
     icon: 'trophy',
-    xp_reward: 900,
+    xp_reward: 600,
   },
   {
     id: 'ach_immortal_flame',
@@ -1523,7 +1524,7 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'hard',
     is_secret: 0,
     icon: 'crown',
-    xp_reward: 1000,
+    xp_reward: 700,
   },
   {
     id: 'ach_meta_legend_35',
@@ -1539,7 +1540,7 @@ export const ACHIEVEMENT_CATALOG: readonly AchievementDefinition[] = [
     difficulty_tier: 'hard',
     is_secret: 0,
     icon: 'crown',
-    xp_reward: 1200,
+    xp_reward: 800,
   },
 ] as const;
 
@@ -1551,6 +1552,7 @@ export interface AchievementMetrics {
   guessTrackPlayed: number;
   guessTrackWins: number;
   quizPlayed: number;
+  quizWins?: number;
   quizPerfectRuns: number;
   dailyStreak: number;
   totalXp: number;
@@ -1558,6 +1560,7 @@ export interface AchievementMetrics {
   purchasesCount: number;
   equippedItemsCount: number;
   postsCount: number;
+  approvedPostsCount?: number;
   commentsCount: number;
   creationsCount: number;
   approvedCreationsCount?: number;
@@ -1584,15 +1587,32 @@ export interface AchievementMetrics {
   existingRegularUnlockedCount?: number;
 }
 
+function getAllModeWinCounts(m: AchievementMetrics): [number, number, number, number, number] {
+  return [
+    Math.max(0, Number(m.guessTrackWins || 0)),
+    Math.max(0, Number(m.guessLyricsWins || 0)),
+    Math.max(0, Number(m.reverseTrackWins || 0)),
+    Math.max(0, Number(m.speedTrackWins || 0)),
+    Math.max(0, Number(m.quizWins ?? m.quizPerfectRuns ?? 0)),
+  ];
+}
+
+function getAudioGamesWon(m: AchievementMetrics): number {
+  return (
+    Math.max(0, Number(m.guessTrackWins || 0)) +
+    Math.max(0, Number(m.reverseTrackWins || 0)) +
+    Math.max(0, Number(m.speedTrackWins || 0))
+  );
+}
+
 /**
  * Pure server-authoritative achievement evaluator across all 52 easy, medium, hard & secret achievements.
- * Never depends on client-supplied unlock flags.
+ * Never depends on client-supplied unlock flags or mindless repeat farming.
  */
 export function evaluateAchievementSlugs(m: AchievementMetrics): string[] {
   const regularSlugs: string[] = [];
   const postsRead = Number(m.postsReadCount || 0);
   const promoRedeemed = Number(m.promoRedeemedCount || 0);
-  const maxTrackCompletions = Number(m.maxTrackCompletions || 0);
   const uniqueTracks = Number(m.uniqueTracksListened || 0);
   const lyricsOpened = Number(m.lyricsOpenedCount || 0);
   const shareCards = Number(m.shareCardCount || 0);
@@ -1603,8 +1623,12 @@ export function evaluateAchievementSlugs(m: AchievementMetrics): string[] {
   const guessLyricsWins = Number(m.guessLyricsWins || 0);
   const reverseTrackWins = Number(m.reverseTrackWins || 0);
   const speedTrackWins = Number(m.speedTrackWins || 0);
+  const approvedPosts = Number(m.approvedPostsCount ?? m.postsCount ?? 0);
   const approvedCreations = Number(m.approvedCreationsCount ?? m.creationsCount ?? 0);
   const creationRoses = Number(m.creationRosesTotal || 0);
+  const audioGamesWon = getAudioGamesWon(m);
+  const modeWins = getAllModeWinCounts(m);
+  const minWinsAll5 = Math.min(...modeWins);
 
   // Easy Tier
   if (m.isRegistered) regularSlugs.push('archive_initiate');
@@ -1618,7 +1642,7 @@ export function evaluateAchievementSlugs(m: AchievementMetrics): string[] {
   if (m.purchasesCount >= 1) regularSlugs.push('collector');
   if (m.guessTrackWins >= 1) regularSlugs.push('first_note');
   if (m.postsCount >= 1) regularSlugs.push('first_chronicle');
-  if (postsRead >= 5) regularSlugs.push('easy_avid_reader');
+  if (postsRead >= 1) regularSlugs.push('easy_avid_reader');
   if (promoRedeemed >= 1) regularSlugs.push('secret_first_code');
   if (distinctGamesPlayed >= 2) regularSlugs.push('track_duo');
   if (m.equippedItemsCount >= 3) regularSlugs.push('dressed_in_velvet');
@@ -1632,7 +1656,7 @@ export function evaluateAchievementSlugs(m: AchievementMetrics): string[] {
   if (m.guessTrackWins >= 5) regularSlugs.push('vinyl_hunter');
   if (m.postsCount >= 3) regularSlugs.push('voice_of_abyss');
   if (approvedCreations >= 1) regularSlugs.push('gothic_artisan');
-  if (uniqueTracks >= 15) regularSlugs.push('discography_listener');
+  if (uniqueTracks >= 3) regularSlugs.push('discography_listener');
   if (distinctGamesPlayed >= 5) regularSlugs.push('all_games_explorer');
   if (guessLyricsWins >= 5) regularSlugs.push('lyrics_hunter');
   if (reverseTrackWins >= 5) regularSlugs.push('reverse_decoder');
@@ -1642,24 +1666,24 @@ export function evaluateAchievementSlugs(m: AchievementMetrics): string[] {
   if (bestGameWinStreak >= 5) regularSlugs.push('win_streak_5');
   if (m.quizPlayed >= 10) regularSlugs.push('cathedral_historian');
   if (m.dailyStreak >= 10) regularSlugs.push('eternal_vigil');
-  if (m.totalXp >= 1500) regularSlugs.push('dark_apostle');
+  if (m.totalXp >= 1000) regularSlugs.push('dark_apostle');
   if (distinctGamesWon >= 5) regularSlugs.push('all_games_winner');
 
   // Hard Tier
-  if (postsRead >= 25) regularSlugs.push('hard_community_reader');
+  if (approvedPosts >= 5 || m.commentsCount >= 20) regularSlugs.push('hard_community_reader');
   if (m.visitedMidnightMsk) regularSlugs.push('secret_midnight_visitor');
   if (m.guessTrackWins >= 15) regularSlugs.push('phantom_ear');
   if (m.quizPerfectRuns >= 3) regularSlugs.push('secret_flawless_quiz');
-  if (m.gamesPlayed >= 40) regularSlugs.push('ritual_master');
+  if (totalGameWins >= 20) regularSlugs.push('ritual_master');
   if (creationRoses >= 10) regularSlugs.push('creation_idol');
-  if (maxTrackCompletions >= 15) regularSlugs.push('secret_on_repeat');
+  if (uniqueTracks >= 3 && audioGamesWon >= 6) regularSlugs.push('secret_on_repeat');
   if (m.quizPerfectRuns >= 5) regularSlugs.push('obsidian_oracle');
   if (m.dailyStreak >= 21) regularSlugs.push('midnight_devotion');
-  if (uniqueTracks >= 25) regularSlugs.push('archive_completionist');
+  if (lyricsOpened >= 12) regularSlugs.push('archive_completionist');
   if (bestGameWinStreak >= 10) regularSlugs.push('win_streak_10');
-  if (m.totalXp >= 5000 || m.level >= 12) regularSlugs.push('archon_of_sound');
+  if (m.totalXp >= 3500 || m.level >= 10) regularSlugs.push('archon_of_sound');
   if (m.purchasesCount >= 15) regularSlugs.push('gothic_treasury');
-  if (totalGameWins >= 50) regularSlugs.push('grand_champion');
+  if (minWinsAll5 >= 3) regularSlugs.push('grand_champion');
   if (m.dailyStreak >= 30) regularSlugs.push('immortal_flame');
 
   // Meta Collector Achievements (second pass over unlocked non-meta count)
@@ -1717,7 +1741,7 @@ export function getAchievementProgress(
     case 'first_chronicle':
       return clamp(m.postsCount, 1);
     case 'easy_avid_reader':
-      return clamp(Number(m.postsReadCount || 0), 5);
+      return clamp(Number(m.postsReadCount || 0), 1);
     case 'secret_first_code':
       return clamp(Number(m.promoRedeemedCount || 0), 1);
     case 'track_duo':
@@ -1743,7 +1767,7 @@ export function getAchievementProgress(
     case 'gothic_artisan':
       return clamp(Number(m.approvedCreationsCount ?? m.creationsCount ?? 0), 1);
     case 'discography_listener':
-      return clamp(Number(m.uniqueTracksListened || 0), 15);
+      return clamp(Number(m.uniqueTracksListened || 0), 3);
     case 'all_games_explorer':
       return clamp(Number(m.distinctGamesPlayed || 0), 5);
     case 'lyrics_hunter':
@@ -1763,13 +1787,15 @@ export function getAchievementProgress(
     case 'eternal_vigil':
       return clamp(m.dailyStreak, 10);
     case 'dark_apostle':
-      return clamp(m.totalXp, 1500);
+      return clamp(m.totalXp, 1000);
     case 'all_games_winner':
       return clamp(Number(m.distinctGamesWon || 0), 5);
 
     // Hard
-    case 'hard_community_reader':
-      return clamp(Number(m.postsReadCount || 0), 25);
+    case 'hard_community_reader': {
+      const approvedPosts = Number(m.approvedPostsCount ?? m.postsCount ?? 0);
+      return clamp(Math.max(approvedPosts * 4, Number(m.commentsCount || 0)), 20);
+    }
     case 'secret_midnight_visitor':
       return clamp(m.visitedMidnightMsk ? 1 : 0, 1);
     case 'phantom_ear':
@@ -1777,27 +1803,33 @@ export function getAchievementProgress(
     case 'secret_flawless_quiz':
       return clamp(m.quizPerfectRuns, 3);
     case 'ritual_master':
-      return clamp(m.gamesPlayed, 40);
+      return clamp(Number(m.totalGameWins || 0), 20);
     case 'creation_idol':
       return clamp(Number(m.creationRosesTotal || 0), 10);
-    case 'secret_on_repeat':
-      return clamp(Number(m.maxTrackCompletions || 0), 15);
+    case 'secret_on_repeat': {
+      const audioWinsPart = Math.min(6, getAudioGamesWon(m));
+      const tracksPart = Math.min(3, Number(m.uniqueTracksListened || 0));
+      return clamp(audioWinsPart + tracksPart, 9);
+    }
     case 'obsidian_oracle':
       return clamp(m.quizPerfectRuns, 5);
     case 'midnight_devotion':
       return clamp(m.dailyStreak, 21);
     case 'archive_completionist':
-      return clamp(Number(m.uniqueTracksListened || 0), 25);
+      return clamp(Number(m.lyricsOpenedCount || 0), 12);
     case 'win_streak_10':
       return clamp(Number(m.bestGameWinStreak || 0), 10);
     case 'archon_of_sound':
-      return clamp(m.level >= 12 ? 5000 : m.totalXp, 5000);
+      return clamp(m.level >= 10 ? 3500 : m.totalXp, 3500);
     case 'gothic_treasury':
       return clamp(m.purchasesCount, 15);
     case 'meta_collector_20':
       return clamp(effectiveRegularCount, 20);
-    case 'grand_champion':
-      return clamp(Number(m.totalGameWins || 0), 50);
+    case 'grand_champion': {
+      const modeWins = getAllModeWinCounts(m);
+      const sumProgress = modeWins.reduce((acc, val) => acc + Math.min(3, val), 0);
+      return clamp(sumProgress, 15);
+    }
     case 'immortal_flame':
       return clamp(m.dailyStreak, 30);
     case 'meta_legend_35':

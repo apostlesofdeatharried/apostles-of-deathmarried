@@ -969,6 +969,26 @@ describe('SQLite additive migrations on legacy Stage 1–6 databases', () => {
       assert.equal(prof.xp, 420);
       assert.equal(prof.total_xp, 920);
       assert.equal(prof.level, 4);
+
+      const evTable = testDb
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='user_achievement_events'")
+        .get() as { name?: string } | undefined;
+      assert.equal(evTable?.name, 'user_achievement_events');
+
+      testDb
+        .prepare("INSERT INTO user_achievement_events (user_id, event_type, target_id) VALUES ('u_vet', 'lyrics_open', 'trk_nm_01')")
+        .run();
+      const resetRes = executeAdminUserReset(testDb, {
+        adminUserId: 'u_admin',
+        mode: 'single',
+        targetUserId: 'u_vet',
+        scopes: { xp: false, achievements: true, cosmetics: false, games: false },
+      });
+      assert.equal(resetRes.ok, true);
+      const remainingEvents = (
+        testDb.prepare('SELECT COUNT(*) as c FROM user_achievement_events WHERE user_id = ?').get('u_vet') as { c: number }
+      ).c;
+      assert.equal(remainingEvents, 0);
     } finally {
       testDb.close();
     }

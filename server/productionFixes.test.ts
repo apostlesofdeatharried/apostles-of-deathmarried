@@ -692,7 +692,7 @@ describe('Production fixes: profile email verification, notifications, fast reve
     );
   });
 
-  it('8. Rebalanced 52 achievements: /api/achievements/track-event unlocks lyrics_open & share_card once, and profile returns 3-tier honest progress', async () => {
+  it('8. Rebalanced 52 achievements: anti-farm event deduplication, playback completion, in-app notifications, and 3-tier honest progress', async () => {
     const badRes = await fetch(`${baseUrl}/api/achievements/track-event`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userBToken}` },
@@ -700,41 +700,85 @@ describe('Production fixes: profile email verification, notifications, fast reve
     });
     assert.equal(badRes.status, 400, 'Allowlist must reject unknown achievement events');
 
+    const missingTargetRes = await fetch(`${baseUrl}/api/achievements/track-event`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userBToken}` },
+      body: JSON.stringify({ event: 'lyrics_open' }),
+    });
+    assert.equal(missingTargetRes.status, 400, 'lyrics_open must require target_id');
+
+    const ghostTargetRes = await fetch(`${baseUrl}/api/achievements/track-event`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userBToken}` },
+      body: JSON.stringify({ event: 'lyrics_open', target_id: 'nonexistent_track_xyz' }),
+    });
+    assert.equal(ghostTargetRes.status, 404, 'lyrics_open must reject unknown track ids');
+
+    const lyricTracks = dbMod.db
+      .prepare("SELECT id FROM tracks WHERE trim(COALESCE(lyrics, '')) != '' LIMIT 2")
+      .all() as Array<{ id: string }>;
+    assert.equal(lyricTracks.length, 2, 'Seeded DB must contain at least 2 tracks with lyrics');
+
     const lyricsRes1 = await fetch(`${baseUrl}/api/achievements/track-event`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userBToken}` },
-      body: JSON.stringify({ event: 'lyrics_open' }),
+      body: JSON.stringify({ event: 'lyrics_open', target_id: lyricTracks[0].id }),
     });
     assert.equal(lyricsRes1.status, 200);
     const lyricsJson1 = (await lyricsRes1.json()) as any;
+    assert.equal(lyricsJson1.counted, true);
     assert.ok(
       lyricsJson1.newly_unlocked_achievements.some((a: any) => a.slug === 'lyrics_reader'),
-      'First lyrics_open event must unlock lyrics_reader'
+      'First valid lyrics_open event must unlock lyrics_reader'
     );
 
+    // Repeating same track must NOT increment unique lyrics count or re-unlock
     const lyricsRes2 = await fetch(`${baseUrl}/api/achievements/track-event`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userBToken}` },
-      body: JSON.stringify({ event: 'lyrics_open' }),
+      body: JSON.stringify({ event: 'lyrics_open', target_id: lyricTracks[0].id }),
     });
     assert.equal(lyricsRes2.status, 200);
     const lyricsJson2 = (await lyricsRes2.json()) as any;
+    assert.equal(lyricsJson2.counted, false, 'Re-opening the exact same track lyrics must be deduplicated');
     assert.equal(
       lyricsJson2.newly_unlocked_achievements.some((a: any) => a.slug === 'lyrics_reader'),
       false,
       'Replaying lyrics_open must not re-unlock lyrics_reader or duplicate XP'
     );
 
+    // Opening a 2nd distinct track increments unique lyrics progress cleanly
+    const lyricsRes3 = await fetch(`${baseUrl}/api/achievements/track-event`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userBToken}` },
+      body: JSON.stringify({ event: 'lyrics_open', target_id: lyricTracks[1].id }),
+    });
+    assert.equal(lyricsRes3.status, 200);
+    const lyricsJson3 = (await lyricsRes3.json()) as any;
+    assert.equal(lyricsJson3.counted, true);
+
     const shareRes = await fetch(`${baseUrl}/api/achievements/track-event`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userBToken}` },
-      body: JSON.stringify({ event: 'share_card' }),
+      body: JSON.stringify({ event: 'share_card', target_id: `lyrics:${lyricTracks[0].id}` }),
     });
     assert.equal(shareRes.status, 200);
     const shareJson = (await shareRes.json()) as any;
     assert.ok(
       shareJson.newly_unlocked_achievements.some((a: any) => a.slug === 'share_card_first'),
       'First share_card event must unlock share_card_first'
+    );
+
+    const completeRes = await fetch(`${baseUrl}/api/achievements/track-complete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userBToken}` },
+      body: JSON.stringify({ track_id: lyricTracks[0].id, listened_seconds: 120, duration_seconds: 120 }),
+    });
+    assert.equal(completeRes.status, 200);
+    const completeJson = (await completeRes.json()) as any;
+    assert.ok(
+      completeJson.newly_unlocked_achievements.some((a: any) => a.slug === 'first_listen'),
+      'Completing track playback must unlock first_listen'
     );
 
     const profRes = await fetch(`${baseUrl}/api/profiles/bob`, {
@@ -750,7 +794,12 @@ describe('Production fixes: profile email verification, notifications, fast reve
     const lyricsAch = allAchs.find((a) => a.slug === 'lyrics_reader');
     assert.equal(lyricsAch.is_unlocked, true);
     assert.equal(lyricsAch.difficulty_tier, 'easy');
-    assert.equal(lyricsAch.xp_reward, 30);
+    assert.equal(lyricsAch.xp_reward, 15);
+
+    const completionistAch = allAchs.find((a) => a.slug === 'archive_completionist');
+    assert.equal(completionistAch.is_unlocked, false);
+    assert.equal(completionistAch.progress.current, 2, 'Duplicate opens of track 1 must not inflate 2/12');
+    assert.equal(completionistAch.progress.target, 12);
 
     // Bob played 1 game earlier, so initiate_ritual (10 games) must honestly report in_progress 1/10
     const ritualAch = allAchs.find((a) => a.slug === 'initiate_ritual');
@@ -764,6 +813,18 @@ describe('Production fixes: profile email verification, notifications, fast reve
       assert.equal(secretVisit.is_secret, true);
       assert.equal(secretVisit.condition_ru, '???');
     }
+
+    // Verify persistent in-app bell notification was created for unlocked achievements
+    const notifsRes = await fetch(`${baseUrl}/api/notifications`, {
+      headers: { Authorization: `Bearer ${userBToken}` },
+    });
+    assert.equal(notifsRes.status, 200);
+    const notifsJson = (await notifsRes.json()) as any;
+    const achNotif = (notifsJson.notifications || []).find(
+      (n: any) => n.type === 'achievement' && n.target_type === 'achievement'
+    );
+    assert.ok(achNotif, 'Unlocking an achievement must create a persistent in-app notification');
+    assert.equal(achNotif.target_link, '/profile?tab=achievements');
   });
 });
 

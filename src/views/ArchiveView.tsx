@@ -86,7 +86,7 @@ export const ArchiveView: React.FC = () => {
   const { t, lang } = useI18n();
   const { playTrack, currentTrack } = usePlayer();
   const { user, refresh } = useAuth();
-  const lyricsEventTrackedRef = useRef<string | null>(null);
+  const lyricsEventTrackedRef = useRef<Set<string>>(new Set());
 
   const [albums, setAlbums] = useState<Album[]>([]);
   const [singles, setSingles] = useState<Single[]>([]);
@@ -145,15 +145,21 @@ export const ArchiveView: React.FC = () => {
   // Server-authoritative achievement check when an authenticated user opens track or single lyrics
   useEffect(() => {
     if (!user?.id) return;
-    const hasOpenLyrics = Boolean(selectedLyricsTrack?.lyrics || selectedSingle?.lyrics);
-    if (!hasOpenLyrics) return;
-    if (lyricsEventTrackedRef.current === user.id) return;
-    lyricsEventTrackedRef.current = user.id;
+    const targetId = selectedLyricsTrack?.lyrics
+      ? selectedLyricsTrack.id
+      : selectedSingle?.lyrics
+        ? selectedSingle.id
+        : '';
+    if (!targetId) return;
+
+    const dedupeKey = `${user.id}:${targetId}`;
+    if (lyricsEventTrackedRef.current.has(dedupeKey)) return;
+    lyricsEventTrackedRef.current.add(dedupeKey);
 
     authFetch('/api/achievements/track-event', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ event: 'lyrics_open' }),
+      body: JSON.stringify({ event: 'lyrics_open', target_id: targetId }),
     })
       .then((res) => safeJson<any>(res, {}))
       .then((data) => {

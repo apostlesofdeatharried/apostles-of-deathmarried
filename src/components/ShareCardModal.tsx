@@ -81,16 +81,25 @@ export const ShareCardModal: React.FC<ShareCardModalProps> = ({ isOpen, context,
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [copiedLink, setCopiedLink] = useState(false);
-  const shareAchTrackedRef = useRef(false);
+  const shareAchTrackedRef = useRef<Set<string>>(new Set());
 
   const trackShareCardEvent = async () => {
-    if (!user || shareAchTrackedRef.current) return;
-    shareAchTrackedRef.current = true;
+    if (!user || !context) return;
+    const targetKey =
+      context.type === 'game'
+        ? `game:${context.gameTitle}`
+        : context.type === 'profile'
+          ? `profile:${context.nickname}`
+          : `lyrics:${context.trackTitle}`;
+    const cleanTargetId = targetKey.replace(/[^a-zA-Z0-9_:.-]/g, '_').slice(0, 100) || 'general';
+    const dedupeKey = `${user.id}:${cleanTargetId}`;
+    if (shareAchTrackedRef.current.has(dedupeKey)) return;
+    shareAchTrackedRef.current.add(dedupeKey);
     try {
       const res = await authFetch('/api/achievements/track-event', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ event: 'share_card' }),
+        body: JSON.stringify({ event: 'share_card', target_id: cleanTargetId }),
       });
       const data = await safeJson<any>(res, {});
       if (data?.newly_unlocked_achievements?.length) {

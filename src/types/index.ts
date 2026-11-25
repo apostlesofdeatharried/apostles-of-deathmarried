@@ -261,7 +261,7 @@ export interface AppNotification {
   actor_nickname: string;
   actor_name: string;
   type: string;
-  target_type: 'post' | 'creation' | 'album' | 'single' | 'news';
+  target_type: 'post' | 'creation' | 'album' | 'single' | 'news' | 'achievement';
   target_id: string;
   target_title: string;
   target_link: string;

@@ -182,11 +182,11 @@ test('ACHIEVEMENT_CATALOG preserves all 35 legacy slugs and enforces 3-tier bala
     if (a.slug === 'archive_initiate') {
       assert.equal(a.xp_reward, 0, 'Starter archive_initiate must stay 0 XP for clean 0-XP registration');
     } else if (a.difficulty_tier === 'easy') {
-      assert.ok(a.xp_reward >= 25 && a.xp_reward <= 75, `Easy ${a.slug} XP out of 25-75: ${a.xp_reward}`);
+      assert.ok(a.xp_reward >= 10 && a.xp_reward <= 25, `Easy ${a.slug} XP out of 10-25: ${a.xp_reward}`);
     } else if (a.difficulty_tier === 'medium') {
-      assert.ok(a.xp_reward >= 150 && a.xp_reward <= 350, `Medium ${a.slug} XP out of 150-350: ${a.xp_reward}`);
+      assert.ok(a.xp_reward >= 50 && a.xp_reward <= 150, `Medium ${a.slug} XP out of 50-150: ${a.xp_reward}`);
     } else if (a.difficulty_tier === 'hard') {
-      assert.ok(a.xp_reward >= 500 && a.xp_reward <= 1200, `Hard ${a.slug} XP out of 500-1200: ${a.xp_reward}`);
+      assert.ok(a.xp_reward >= 250 && a.xp_reward <= 800, `Hard ${a.slug} XP out of 250-800: ${a.xp_reward}`);
     }
   }
 
@@ -233,41 +233,47 @@ test('evaluateAchievementSlugs unlocks server-authoritative achievements accurat
   const veteran = evaluateAchievementSlugs({
     isRegistered: true,
     hasCustomProfile: true,
-    gamesPlayed: 45,
+    gamesPlayed: 25,
     guessTrackPlayed: 18,
     guessTrackWins: 16,
-    guessLyricsWins: 6,
-    reverseTrackWins: 6,
-    speedTrackWins: 6,
-    quizPlayed: 12,
+    guessLyricsWins: 5,
+    reverseTrackWins: 5,
+    speedTrackWins: 5,
+    quizPlayed: 10,
+    quizWins: 5,
     quizPerfectRuns: 5,
     dailyStreak: 30,
-    totalXp: 5200,
-    level: 12,
+    totalXp: 3600,
+    level: 10,
     purchasesCount: 15,
     equippedItemsCount: 4,
-    postsCount: 4,
+    postsCount: 5,
+    approvedPostsCount: 5,
     commentsCount: 12,
     creationsCount: 2,
     approvedCreationsCount: 2,
     creationRosesTotal: 12,
     followersCount: 5,
     followingCount: 4,
-    postsReadCount: 25,
+    postsReadCount: 3,
     promoRedeemedCount: 1,
-    maxTrackCompletions: 15,
-    uniqueTracksListened: 26,
+    maxTrackCompletions: 4,
+    uniqueTracksListened: 3,
     visitedMidnightMsk: true,
     clickedSecretRose: true,
-    lyricsOpenedCount: 2,
+    lyricsOpenedCount: 12,
     shareCardCount: 1,
-    totalGameWins: 55,
+    totalGameWins: 36,
     distinctGamesPlayed: 5,
     distinctGamesWon: 5,
     bestGameWinStreak: 11,
   });
   assert.ok(veteran.includes('first_listen'));
   assert.ok(veteran.includes('lyrics_reader'));
+  assert.ok(veteran.includes('archive_completionist'));
+  assert.ok(veteran.includes('discography_listener'));
+  assert.ok(veteran.includes('secret_on_repeat'));
+  assert.ok(veteran.includes('grand_champion'));
   assert.ok(veteran.includes('share_card_first'));
   assert.ok(veteran.includes('all_games_explorer'));
   assert.ok(veteran.includes('all_games_winner'));
@@ -284,7 +290,10 @@ test('evaluateAchievementSlugs unlocks server-authoritative achievements accurat
     gamesPlayed: 3,
     guessTrackPlayed: 2,
     guessTrackWins: 2,
+    reverseTrackWins: 1,
+    speedTrackWins: 1,
     quizPlayed: 1,
+    quizWins: 1,
     quizPerfectRuns: 0,
     dailyStreak: 2,
     totalXp: 300,
@@ -296,14 +305,15 @@ test('evaluateAchievementSlugs unlocks server-authoritative achievements accurat
     creationsCount: 0,
     followersCount: 0,
     followingCount: 0,
-    maxTrackCompletions: 7,
+    lyricsOpenedCount: 4,
     bestGameWinStreak: 3,
-    uniqueTracksListened: 4,
+    uniqueTracksListened: 2,
   };
-  assert.deepEqual(getAchievementProgress('secret_on_repeat', partialMetrics, false), { current: 7, target: 15 });
+  assert.deepEqual(getAchievementProgress('secret_on_repeat', partialMetrics, false), { current: 6, target: 9 });
   assert.deepEqual(getAchievementProgress('win_streak_5', partialMetrics, false), { current: 3, target: 5 });
-  assert.deepEqual(getAchievementProgress('discography_listener', partialMetrics, false), { current: 4, target: 15 });
-  assert.deepEqual(getAchievementProgress('meta_collector_20', partialMetrics, false), { current: 6, target: 20 });
+  assert.deepEqual(getAchievementProgress('discography_listener', partialMetrics, false), { current: 2, target: 3 });
+  assert.deepEqual(getAchievementProgress('archive_completionist', partialMetrics, false), { current: 4, target: 12 });
+  assert.deepEqual(getAchievementProgress('meta_collector_20', partialMetrics, false), { current: 7, target: 20 });
 });
 
 

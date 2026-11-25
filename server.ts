@@ -316,6 +316,7 @@ const authRateLimit = createRateLimiter('auth', 40, 60 * 1000);
 const emailCodeRateLimit = createRateLimiter('email_code', 5, 10 * 60 * 1000);
 const promoRateLimit = createRateLimiter('promo', 15, 60 * 1000);
 const uploadRateLimit = createRateLimiter('upload', 30, 60 * 1000);
+const trackEventRateLimit = createRateLimiter('ach_event', 60, 60 * 1000);
 
 // Static uploads folder (uses /tmp/uploads on Vercel read-only filesystem)
 const uploadDir = isVercel
@@ -1514,8 +1515,8 @@ function normalizeMultilineText(raw: unknown, maxLength: number): string {
 function createNotificationRecord(params: {
   recipientUserId: string;
   actor: { id: string; nickname: string; display_name?: string };
-  type: 'reply' | 'new_post' | 'new_creation' | 'new_comment' | 'news';
-  targetType: 'post' | 'creation' | 'album' | 'single' | 'news';
+  type: 'reply' | 'new_post' | 'new_creation' | 'new_comment' | 'news' | 'achievement';
+  targetType: 'post' | 'creation' | 'album' | 'single' | 'news' | 'achievement';
   targetId: string;
   targetTitle: string;
   targetLink: string;
@@ -4580,6 +4581,7 @@ function collectUserAchievementMetrics(userId: string): AchievementMetrics | nul
       (SELECT COUNT(*) FROM user_inventory WHERE user_id = ?) as purchases_count,
       (SELECT COUNT(*) FROM user_inventory WHERE user_id = ? AND is_equipped = 1) as equipped_count,
       (SELECT COUNT(*) FROM posts WHERE user_id = ?) as posts_count,
+      (SELECT COUNT(*) FROM posts WHERE user_id = ? AND status = 'approved') as approved_posts_count,
       (SELECT COUNT(*) FROM comments WHERE user_id = ?) as comments_count,
       (SELECT COUNT(*) FROM creations WHERE user_id = ?) as creations_count,
       (SELECT COUNT(*) FROM creations WHERE user_id = ? AND status = 'approved') as approved_creations_count,
@@ -4601,8 +4603,14 @@ function collectUserAchievementMetrics(userId: string): AchievementMetrics | nul
       (SELECT COUNT(*) FROM user_track_plays WHERE user_id = ? AND completions >= 1) as unique_tracks_listened,
       (SELECT COUNT(*) FROM user_secret_flags WHERE user_id = ? AND flag_key = 'midnight_msk') as visited_midnight_msk,
       (SELECT COUNT(*) FROM user_secret_flags WHERE user_id = ? AND flag_key = 'curious_rose') as clicked_secret_rose,
-      (SELECT COALESCE(MAX(count), 0) FROM user_secret_flags WHERE user_id = ? AND flag_key = 'lyrics_opened') as lyrics_opened_count,
-      (SELECT COALESCE(MAX(count), 0) FROM user_secret_flags WHERE user_id = ? AND flag_key = 'share_card') as share_card_count
+      MAX(
+        (SELECT COUNT(DISTINCT target_id) FROM user_achievement_events WHERE user_id = ? AND event_type = 'lyrics_open'),
+        CASE WHEN EXISTS(SELECT 1 FROM user_secret_flags WHERE user_id = ? AND flag_key = 'lyrics_opened' AND count > 0) THEN 1 ELSE 0 END
+      ) as lyrics_opened_count,
+      MAX(
+        (SELECT COUNT(DISTINCT target_id) FROM user_achievement_events WHERE user_id = ? AND event_type = 'share_card'),
+        CASE WHEN EXISTS(SELECT 1 FROM user_secret_flags WHERE user_id = ? AND flag_key = 'share_card' AND count > 0) THEN 1 ELSE 0 END
+      ) as share_card_count
     FROM profiles p
     WHERE p.user_id = ?
   `).get(
@@ -4610,7 +4618,7 @@ function collectUserAchievementMetrics(userId: string): AchievementMetrics | nul
     userId, userId, userId, userId, userId, userId,
     userId, userId, userId, userId, userId, userId,
     userId, userId, userId, userId, userId, userId,
-    userId, userId
+    userId, userId, userId, userId, userId
   ) as any;
 
   if (!row) return null;
@@ -4625,6 +4633,7 @@ function collectUserAchievementMetrics(userId: string): AchievementMetrics | nul
   const playedSet = new Set<string>();
   const wonSet = new Set<string>();
   let totalGameWins = 0;
+  let quizWins = 0;
   let currentWinStreak = 0;
   let bestGameWinStreak = 0;
 
@@ -4633,6 +4642,7 @@ function collectUserAchievementMetrics(userId: string): AchievementMetrics | nul
     const won = isGameAttemptWin(att.game_id, Number(att.score || 0), att.details_json);
     if (won) {
       totalGameWins += 1;
+      if (att.game_id === 'daily-quiz') quizWins += 1;
       if (att.game_id) wonSet.add(att.game_id);
       currentWinStreak += 1;
       if (currentWinStreak > bestGameWinStreak) bestGameWinStreak = currentWinStreak;
@@ -4668,6 +4678,7 @@ function collectUserAchievementMetrics(userId: string): AchievementMetrics | nul
     reverseTrackWins: Number(row.reverse_track_wins || 0),
     speedTrackWins: Number(row.speed_track_wins || 0),
     quizPlayed: Number(row.quiz_played || 0),
+    quizWins,
     quizPerfectRuns: Number(row.quiz_perfect || 0),
     dailyStreak: Number(row.daily_streak || 0),
     totalXp: Number(row.total_xp || 0),
@@ -4675,6 +4686,7 @@ function collectUserAchievementMetrics(userId: string): AchievementMetrics | nul
     purchasesCount: Number(row.purchases_count || 0),
     equippedItemsCount: Number(row.equipped_count || 0),
     postsCount: Number(row.posts_count || 0),
+    approvedPostsCount: Number(row.approved_posts_count || 0),
     commentsCount: Number(row.comments_count || 0),
     creationsCount: Number(row.creations_count || 0),
     approvedCreationsCount: Number(row.approved_creations_count || 0),
@@ -4721,6 +4733,23 @@ function unlockAchievement(userId: string, achievementSlug: string): UnlockedAch
       source: 'achievement',
       details: `Достижение «${ach.title_ru}»`,
       referenceKey: `ach:${userId}:${ach.slug}`,
+    });
+  }
+
+  // Persist an in-app bell notification for earned achievements (skip signup 0-XP milestone)
+  if (ach.slug !== 'archive_initiate') {
+    createNotificationRecord({
+      recipientUserId: userId,
+      actor: { id: userId, nickname: 'archive', display_name: 'Архив' },
+      type: 'achievement',
+      targetType: 'achievement',
+      targetId: ach.id,
+      targetTitle: ach.title_ru,
+      targetLink: '/profile?tab=achievements',
+      excerpt: reward > 0
+        ? `Получено достижение «${ach.title_ru}» (+${reward} XP)`
+        : `Получено достижение «${ach.title_ru}»`,
+      allowSelf: true,
     });
   }
 
@@ -4895,34 +4924,63 @@ app.post('/api/achievements/easter-egg', requireAuth, async (req: AuthRequest, r
   });
 });
 
-app.post('/api/achievements/track-event', requireAuth, async (req: AuthRequest, res: Response) => {
+app.post('/api/achievements/track-event', requireAuth, trackEventRateLimit, async (req: AuthRequest, res: Response) => {
   const userId = req.user!.id;
   const rawEvent = String(req.body?.event || '').trim();
-  const flagKey =
-    rawEvent === 'lyrics_open'
-      ? 'lyrics_opened'
-      : rawEvent === 'share_card'
-        ? 'share_card'
-        : null;
-
-  if (!flagKey) {
+  if (rawEvent !== 'lyrics_open' && rawEvent !== 'share_card') {
     res.status(400).json({ error: 'Unsupported achievement event.' });
     return;
   }
 
+  const rawTarget = String(req.body?.target_id || '').trim().slice(0, 120);
+  let cleanTargetId = '';
+
+  if (rawEvent === 'lyrics_open') {
+    if (!rawTarget) {
+      res.status(400).json({ error: 'target_id is required for lyrics_open.' });
+      return;
+    }
+    const trackRow = db
+      .prepare('SELECT id, lyrics FROM tracks WHERE id = ?')
+      .get(rawTarget) as { id: string; lyrics?: string | null } | undefined;
+    const singleRow = !trackRow
+      ? (db.prepare('SELECT id, lyrics FROM singles WHERE id = ?').get(rawTarget) as
+          | { id: string; lyrics?: string | null }
+          | undefined)
+      : undefined;
+
+    const foundRow = trackRow || singleRow;
+    if (!foundRow) {
+      res.status(404).json({ error: 'Track or single not found.' });
+      return;
+    }
+    if (!foundRow.lyrics || !String(foundRow.lyrics).trim()) {
+      res.status(400).json({ error: 'Target does not have lyrics.' });
+      return;
+    }
+    cleanTargetId = foundRow.id;
+  } else {
+    cleanTargetId = rawTarget.replace(/[^a-zA-Z0-9_:.-]/g, '').slice(0, 100) || 'general';
+  }
+
+  let counted = false;
   let newlyUnlocked: UnlockedAchievementInfo[] = [];
   db.transaction(() => {
-    db.prepare(`
-      INSERT INTO user_secret_flags (user_id, flag_key, count)
-      VALUES (?, ?, 1)
-      ON CONFLICT(user_id, flag_key) DO UPDATE SET count = count + 1
-    `).run(userId, flagKey);
+    const insertEvent = db
+      .prepare(`
+        INSERT OR IGNORE INTO user_achievement_events (user_id, event_type, target_id)
+        VALUES (?, ?, ?)
+      `)
+      .run(userId, rawEvent, cleanTargetId);
+    counted = insertEvent.changes > 0;
     newlyUnlocked = evaluateUserAchievements(userId);
   })();
 
   await flushCloudBackupAndRespond(res, {
     ok: true,
+    counted,
     event: rawEvent,
+    target_id: cleanTargetId,
     newly_unlocked_achievements: newlyUnlocked,
   });
 });
@@ -5516,9 +5574,11 @@ app.get('/api/community/posts/:id', (req: Request, res: Response) => {
 
   // Increment view count & lightweight unique post_reads counter (strictly 0 XP)
   db.prepare('UPDATE posts SET views_count = views_count + 1 WHERE id = ?').run(post.id);
+  let newlyUnlocked: UnlockedAchievementInfo[] = [];
   if (user) {
     try {
       db.prepare('INSERT OR IGNORE INTO post_reads (user_id, post_id) VALUES (?, ?)').run(user.id, post.id);
+      newlyUnlocked = evaluateUserAchievements(user.id);
     } catch {}
   }
 
@@ -5558,6 +5618,7 @@ app.get('/api/community/posts/:id', (req: Request, res: Response) => {
     },
     comments,
     userReaction,
+    ...(newlyUnlocked.length > 0 ? { newly_unlocked_achievements: newlyUnlocked } : {}),
   });
 });
 
@@ -5594,6 +5655,7 @@ app.post('/api/community/posts', requireAuth, async (req: AuthRequest, res: Resp
   const status = isStaff ? 'approved' : 'pending';
   const id = 'post_' + crypto.randomUUID().slice(0, 8);
   let awardedXp = 0;
+  let newlyUnlocked: UnlockedAchievementInfo[] = [];
 
   db.transaction(() => {
     db.prepare(`
@@ -5616,7 +5678,7 @@ app.post('/api/community/posts', requireAuth, async (req: AuthRequest, res: Resp
         }
       }
 
-      evaluateUserAchievements(req.user!.id);
+      newlyUnlocked = evaluateUserAchievements(req.user!.id);
       notifyFollowers({
         author: req.user!,
         type: 'new_post',
@@ -5626,10 +5688,18 @@ app.post('/api/community/posts', requireAuth, async (req: AuthRequest, res: Resp
         targetLink: `/community?post=${encodeURIComponent(id)}`,
         excerpt: cleanContent,
       });
+    } else {
+      newlyUnlocked = evaluateUserAchievements(req.user!.id);
     }
   })();
 
-  await flushCloudBackupAndRespond(res, { ok: true, id, status, xp_earned: awardedXp });
+  await flushCloudBackupAndRespond(res, {
+    ok: true,
+    id,
+    status,
+    xp_earned: awardedXp,
+    ...(newlyUnlocked.length > 0 ? { newly_unlocked_achievements: newlyUnlocked } : {}),
+  });
 });
 
 app.put('/api/community/posts/:id', requireAuth, (req: AuthRequest, res: Response) => {
@@ -6362,6 +6432,7 @@ app.post('/api/creations', requireAuth, async (req: AuthRequest, res: Response) 
   const id = 'cr_' + crypto.randomUUID().slice(0, 8);
   const cleanDesc = description ? String(description).slice(0, 3000) : '';
   let awardedXp = 0;
+  let newlyUnlocked: UnlockedAchievementInfo[] = [];
 
   db.transaction(() => {
     db.prepare(`
@@ -6386,7 +6457,7 @@ app.post('/api/creations', requireAuth, async (req: AuthRequest, res: Response) 
         }
       }
 
-      evaluateUserAchievements(req.user!.id);
+      newlyUnlocked = evaluateUserAchievements(req.user!.id);
       notifyFollowers({
         author: req.user!,
         type: 'new_creation',
@@ -6399,7 +6470,13 @@ app.post('/api/creations', requireAuth, async (req: AuthRequest, res: Response) 
     }
   })();
 
-  await flushCloudBackupAndRespond(res, { ok: true, id, status, xp_earned: awardedXp });
+  await flushCloudBackupAndRespond(res, {
+    ok: true,
+    id,
+    status,
+    xp_earned: awardedXp,
+    ...(newlyUnlocked.length > 0 ? { newly_unlocked_achievements: newlyUnlocked } : {}),
+  });
 });
 
 app.put('/api/creations/:id', requireAuth, (req: AuthRequest, res: Response) => {
@@ -8026,23 +8103,29 @@ app.post('/api/admin/users/:id/achievements', requireAdmin, async (req: AuthRequ
         xpChanged = -resRevoke.amount;
       }
 
-      // Allow natural re-earning and clean featured showcase & secret progress flags
+      // Allow natural re-earning and clean featured showcase, notifications & secret progress flags
       db.prepare('DELETE FROM xp_transactions WHERE user_id = ? AND reference_key = ?').run(
         targetId,
         `ach:${targetId}:${ach.slug}`
       );
-      if (ach.slug === 'secret_on_repeat') {
+      db.prepare("DELETE FROM notifications WHERE user_id = ? AND target_type = 'achievement' AND target_id = ?").run(
+        targetId,
+        ach.id
+      );
+      if (ach.slug === 'secret_on_repeat' || ach.slug === 'first_listen' || ach.slug === 'discography_listener') {
         db.prepare('DELETE FROM user_track_plays WHERE user_id = ?').run(targetId);
       } else if (ach.slug === 'secret_curious_rose') {
         db.prepare("DELETE FROM user_secret_flags WHERE user_id = ? AND flag_key = 'curious_rose'").run(targetId);
-      } else if (ach.slug === 'easy_avid_reader' || ach.slug === 'hard_community_reader') {
+      } else if (ach.slug === 'easy_avid_reader') {
         db.prepare('DELETE FROM post_reads WHERE user_id = ?').run(targetId);
       } else if (ach.slug === 'secret_midnight_visitor') {
         db.prepare("DELETE FROM user_secret_flags WHERE user_id = ? AND flag_key = 'midnight_msk'").run(targetId);
-      } else if (ach.slug === 'lyrics_reader') {
+      } else if (ach.slug === 'lyrics_reader' || ach.slug === 'archive_completionist') {
         db.prepare("DELETE FROM user_secret_flags WHERE user_id = ? AND flag_key = 'lyrics_opened'").run(targetId);
+        db.prepare("DELETE FROM user_achievement_events WHERE user_id = ? AND event_type = 'lyrics_open'").run(targetId);
       } else if (ach.slug === 'share_card_first') {
         db.prepare("DELETE FROM user_secret_flags WHERE user_id = ? AND flag_key = 'share_card'").run(targetId);
+        db.prepare("DELETE FROM user_achievement_events WHERE user_id = ? AND event_type = 'share_card'").run(targetId);
       }
 
       const profRow = db.prepare('SELECT featured_achievements_json FROM profiles WHERE user_id = ?').get(targetId) as

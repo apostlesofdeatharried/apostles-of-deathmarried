@@ -21,6 +21,7 @@ export function dispatchAchievementUnlocked(
 ): void {
   if (!Array.isArray(items) || items.length === 0 || typeof window === 'undefined') return;
   window.dispatchEvent(new CustomEvent(EVENT_NAME, { detail: items }));
+  window.dispatchEvent(new Event('aod-notifications-refresh'));
 }
 
 function renderToastIcon(icon?: string) {
@@ -61,12 +62,21 @@ export const AchievementToastContainer: React.FC = () => {
       const list = Array.isArray(custom.detail) ? custom.detail : [];
       if (list.length === 0) return;
 
-      const entries: ToastEntry[] = list.map((item, idx) => ({
+      const uniqueItems = list.filter(
+        (item, idx, arr) => item?.slug && arr.findIndex((x) => x?.slug === item.slug) === idx
+      );
+      if (uniqueItems.length === 0) return;
+
+      const entries: ToastEntry[] = uniqueItems.map((item, idx) => ({
         ...item,
         toastId: `${item.slug}_${Date.now()}_${idx}`,
       }));
 
-      setToasts((prev) => [...prev, ...entries].slice(-4));
+      setToasts((prev) => {
+        const activeSlugs = new Set(prev.map((t) => t.slug));
+        const filteredNew = entries.filter((e) => !activeSlugs.has(e.slug));
+        return [...prev, ...filteredNew].slice(-4);
+      });
 
       entries.forEach((entry, idx) => {
         const timerId = window.setTimeout(() => {
@@ -89,7 +99,7 @@ export const AchievementToastContainer: React.FC = () => {
 
   return (
     <div
-      className="fixed bottom-28 sm:bottom-24 left-3 right-3 sm:left-auto sm:right-6 z-[70] flex flex-col gap-2.5 sm:max-w-xs w-auto sm:w-80 pointer-events-none"
+      className="fixed bottom-28 sm:bottom-24 left-3 right-3 sm:left-auto sm:right-6 z-[200] flex flex-col gap-2.5 sm:max-w-xs w-auto sm:w-80 pointer-events-none"
       aria-live="polite"
     >
       {toasts.map((toast) => {

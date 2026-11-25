@@ -193,6 +193,7 @@ export function executeAdminUserReset(
   const hasUserTrackPlays = tableExists(targetDb, 'user_track_plays');
   const hasPostReads = tableExists(targetDb, 'post_reads');
   const hasUserSecretFlags = tableExists(targetDb, 'user_secret_flags');
+  const hasUserAchievementEvents = tableExists(targetDb, 'user_achievement_events');
   const hasUserInventory = tableExists(targetDb, 'user_inventory');
   const hasGameAttempts = tableExists(targetDb, 'game_attempts');
   const hasDailyTrackAttempts = tableExists(targetDb, 'daily_track_attempts');
@@ -260,8 +261,10 @@ export function executeAdminUserReset(
           targetDb.prepare('DELETE FROM user_achievements WHERE user_id = ?').run(uid);
         }
         if (profileCols.has('featured_achievements_json')) {
+          const assigns = ["featured_achievements_json = '[]'"];
+          if (profileCols.has('updated_at')) assigns.push("updated_at = datetime('now')");
           targetDb
-            .prepare("UPDATE profiles SET featured_achievements_json = '[]', updated_at = datetime('now') WHERE user_id = ?")
+            .prepare(`UPDATE profiles SET ${assigns.join(', ')} WHERE user_id = ?`)
             .run(uid);
         }
         if (hasUserTrackPlays) {
@@ -272,6 +275,9 @@ export function executeAdminUserReset(
         }
         if (hasUserSecretFlags) {
           targetDb.prepare('DELETE FROM user_secret_flags WHERE user_id = ?').run(uid);
+        }
+        if (hasUserAchievementEvents) {
+          targetDb.prepare('DELETE FROM user_achievement_events WHERE user_id = ?').run(uid);
         }
       }
 

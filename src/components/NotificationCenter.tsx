@@ -44,6 +44,8 @@ function getNotificationActionText(n: AppNotification): { nativeTitle: string; v
       return { nativeTitle: `${n.actor_name} оставил комментарий`, verb: 'оставил комментарий' };
     case 'news':
       return { nativeTitle: `Новости сайта: ${n.target_title}`, verb: 'Новости и обновления сайта', hideActorPrefix: true };
+    case 'achievement':
+      return { nativeTitle: `Достижение получено: ${n.target_title}`, verb: 'Достижение получено', hideActorPrefix: true };
     default:
       return { nativeTitle: `${n.actor_name} ответил вам`, verb: 'ответил' };
   }
@@ -96,6 +98,8 @@ function targetTypeLabel(type: AppNotification['target_type']): string {
       return 'Сингл';
     case 'news':
       return 'Новости';
+    case 'achievement':
+      return 'Достижение';
     default:
       return 'Ответ';
   }
@@ -363,7 +367,11 @@ export const NotificationCenter: React.FC = () => {
 
       if (initializedRef.current) {
         const freshUnread = dedupedList.filter(
-          (item) => !item.is_read && !knownIdsRef.current.has(item.id) && !shownToasts.has(item.id)
+          (item) =>
+            !item.is_read &&
+            !knownIdsRef.current.has(item.id) &&
+            !shownToasts.has(item.id) &&
+            item.type !== 'achievement'
         );
         if (freshUnread.length > 0) {
           const preferred = freshUnread.find((item) => item.type === 'news') || freshUnread[0];
@@ -671,7 +679,9 @@ export const NotificationCenter: React.FC = () => {
                 <span className="truncate">
                   {toastNotif.type === 'news'
                     ? (lang === 'ru' ? 'Новости сайта' : 'Site News')
-                    : `${toastNotif.actor_name} · ${targetTypeLabel(toastNotif.target_type)}`}
+                    : toastNotif.type === 'achievement'
+                      ? (lang === 'ru' ? 'Достижение получено' : 'Achievement Unlocked')
+                      : `${toastNotif.actor_name} · ${targetTypeLabel(toastNotif.target_type)}`}
                 </span>
               </div>
               <div

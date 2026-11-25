@@ -106,6 +106,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     refresh();
   }, [refresh]);
 
+  useEffect(() => {
+    const handleAchievementUnlock = () => {
+      refresh().catch(() => {});
+    };
+    window.addEventListener('aod:achievement-unlocked', handleAchievementUnlock);
+    return () => window.removeEventListener('aod:achievement-unlocked', handleAchievementUnlock);
+  }, [refresh]);
+
   const saveSession = (authToken?: string, userData?: UserProfile) => {
     if (authToken) {
       setToken(authToken);

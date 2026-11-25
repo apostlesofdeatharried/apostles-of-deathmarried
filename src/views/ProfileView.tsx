@@ -196,6 +196,16 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
     fetchProfile();
   }, [fetchProfile]);
 
+  useEffect(() => {
+    const handleAchUnlocked = () => {
+      if (user?.id && (!targetNickname || (profile?.id && user.id === profile.id))) {
+        fetchProfile();
+      }
+    };
+    window.addEventListener('aod:achievement-unlocked', handleAchUnlocked);
+    return () => window.removeEventListener('aod:achievement-unlocked', handleAchUnlocked);
+  }, [fetchProfile, user?.id, targetNickname, profile?.id]);
+
   // Listen for notification / external profile subtab deep links
   useEffect(() => {
     const handleOpenSection = (ev: Event) => {

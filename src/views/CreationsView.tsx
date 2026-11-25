@@ -263,7 +263,7 @@ export const CreationsView: React.FC = () => {
           media_type: newMediaType,
         }),
       });
-      const data = await safeJson<{ status?: string; error?: string }>(res, {});
+      const data = await safeJson<{ status?: string; newly_unlocked_achievements?: any[]; error?: string }>(res, {});
       if (res.ok) {
         setPublishModalOpen(false);
         setNewTitle('');
@@ -277,6 +277,9 @@ export const CreationsView: React.FC = () => {
             : (lang === 'ru' ? 'Публикация добавлена' : 'Creation published'),
           4000
         );
+        if (data.newly_unlocked_achievements?.length) {
+          dispatchAchievementUnlocked(data.newly_unlocked_achievements);
+        }
         fetchCreations();
         refresh();
       } else {
@@ -537,10 +540,13 @@ export const CreationsView: React.FC = () => {
           parent_id: replyToCommentId,
         }),
       });
-      const data = await safeJson<{ error?: string }>(res, {});
+      const data = await safeJson<{ error?: string; newly_unlocked_achievements?: any[] }>(res, {});
       if (res.ok) {
         setNewComment('');
         setReplyToCommentId(null);
+        if (data.newly_unlocked_achievements?.length) {
+          dispatchAchievementUnlocked(data.newly_unlocked_achievements);
+        }
         refresh();
         openCreationDetail(activeCreation);
       } else {

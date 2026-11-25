@@ -874,6 +874,16 @@ export function ensureSchemaAndMigrations(targetDb: Database.Database = db) {
       PRIMARY KEY (user_id, flag_key)
     );
 
+    CREATE TABLE IF NOT EXISTS user_achievement_events (
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      event_type TEXT NOT NULL,
+      target_id TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (user_id, event_type, target_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_user_achievement_events_lookup
+      ON user_achievement_events(user_id, event_type);
+
     CREATE TABLE IF NOT EXISTS notifications (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,

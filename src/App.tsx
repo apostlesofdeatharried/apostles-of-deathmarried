@@ -140,7 +140,9 @@ function MainApp() {
             ? 'creations'
             : targetType === 'album' || targetType === 'single'
               ? 'archive'
-              : 'home';
+              : targetType === 'achievement'
+                ? 'profile'
+                : 'home';
 
       let tab: AppTab = fallbackTab;
       let profileNickname: string | undefined;
