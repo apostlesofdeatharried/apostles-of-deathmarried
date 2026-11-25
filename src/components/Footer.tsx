@@ -47,7 +47,7 @@ export const Footer: React.FC = () => {
         </div>
 
         {/* Legal & DMCA Notice */}
-        <div className="space-y-2 text-center md:text-left max-w-4xl">
+        <div data-nosnippet="" className="space-y-2 text-center md:text-left max-w-4xl">
           <div className="flex items-center justify-center md:justify-start gap-1.5 text-[11px] text-[#a84450] tracking-wider uppercase">
             <ShieldAlert className="w-3.5 h-3.5 shrink-0" />
             <span>DISCLAIMER & DMCA</span>

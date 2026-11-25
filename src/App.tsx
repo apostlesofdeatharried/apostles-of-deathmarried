@@ -25,13 +25,13 @@ import { ProfileView } from './views/ProfileView.js';
 import { AdminView } from './views/AdminView.js';
 
 const TAB_TITLES: Record<AppTab, string> = {
-  home: 'Apostles of deathmarried — Архив, дискография, тексты треков и игры',
-  archive: 'Дискография — Apostles of deathmarried',
-  games: 'Игры — Apostles of deathmarried',
-  community: 'Сообщество — Apostles of deathmarried',
-  creations: 'Творчество — Apostles of deathmarried',
-  profile: 'Профиль — Apostles of deathmarried',
-  admin: 'Админ-панель — Apostles of deathmarried',
+  home: 'apostles of deathmarried',
+  archive: 'Дискография — apostles of deathmarried',
+  games: 'Игры — apostles of deathmarried',
+  community: 'Сообщество — apostles of deathmarried',
+  creations: 'Творчество — apostles of deathmarried',
+  profile: 'Профиль — apostles of deathmarried',
+  admin: 'Админ-панель — apostles of deathmarried',
 };
 
 function MainApp() {
@@ -91,9 +91,9 @@ function MainApp() {
 
   useEffect(() => {
     const nextTitle = showNotFound
-      ? `404 — Apostles of deathmarried`
+      ? `404 — apostles of deathmarried`
       : route.profileNickname
-        ? `${route.profileNickname} — Apostles of deathmarried`
+        ? `${route.profileNickname} — apostles of deathmarried`
         : route.tab === 'admin' && !isAdminOrMod
           ? TAB_TITLES.home
           : TAB_TITLES[route.tab];
