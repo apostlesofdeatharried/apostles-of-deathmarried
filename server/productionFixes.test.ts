@@ -826,5 +826,81 @@ describe('Production fixes: profile email verification, notifications, fast reve
     assert.ok(achNotif, 'Unlocking an achievement must create a persistent in-app notification');
     assert.equal(achNotif.target_link, '/profile?tab=achievements');
   });
+
+  it('9. Secret achievements privacy: stripped from non-owner/anon profiles & showcases, rejected in PUT /api/profiles/me showcase, visible to owner', async () => {
+    // Redeem promo code as bob to unlock secret achievement 'secret_first_code'
+    const redeemRes = await fetch(`${baseUrl}/api/promo/redeem`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userBToken}` },
+      body: JSON.stringify({ code: 'apostles' }),
+    });
+    assert.equal(redeemRes.status, 200);
+
+    // Confirm bob sees the unlocked secret achievement on his OWN profile
+    const ownerRes = await fetch(`${baseUrl}/api/profiles/bob`, {
+      headers: { Authorization: `Bearer ${userBToken}` },
+    });
+    assert.equal(ownerRes.status, 200);
+    const ownerBody = (await ownerRes.json()) as any;
+    assert.ok(
+      ownerBody.profile.achievements.some((a: any) => a.slug === 'secret_first_code'),
+      'Owner must still see their unlocked secret achievements on their own profile'
+    );
+    assert.ok(
+      ownerBody.profile.allAchievements.some((a: any) => a.slug === 'secret_first_code' && a.is_unlocked),
+      'Owner allAchievements must include unlocked secret achievement'
+    );
+
+    // Owner cannot pin secret achievement onto public showcase
+    const rejectPinRes = await fetch(`${baseUrl}/api/profiles/me`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userBToken}` },
+      body: JSON.stringify({ featured_achievements: ['secret_first_code'] }),
+    });
+    assert.equal(rejectPinRes.status, 400, 'PUT /api/profiles/me must reject pinning secret achievements');
+
+    // Simulate legacy DB row that previously pinned a secret achievement into featured_achievements_json
+    dbMod.db
+      .prepare('UPDATE profiles SET featured_achievements_json = ? WHERE user_id = ?')
+      .run(JSON.stringify(['secret_first_code', 'lyrics_reader']), 'usr_b_test');
+
+    // Non-owner authenticated viewer (alice) requesting bob's profile must get ZERO secret achievements
+    const otherUserRes = await fetch(`${baseUrl}/api/profiles/bob`, {
+      headers: { Authorization: `Bearer ${userAToken}` },
+    });
+    assert.equal(otherUserRes.status, 200);
+    const otherBody = (await otherUserRes.json()) as any;
+
+    const hasAnySecret = (list: any[] = []) =>
+      list.some(
+        (a) =>
+          Boolean(a?.is_secret) ||
+          a?.category === 'secret' ||
+          a?.difficulty_tier === 'secret' ||
+          a?.slug === 'secret_first_code'
+      );
+
+    assert.equal(hasAnySecret(otherBody.profile.achievements), false, 'Non-owner must not see unlocked secret achievements');
+    assert.equal(hasAnySecret(otherBody.profile.allAchievements), false, 'Non-owner allAchievements must exclude all secret achievements');
+    assert.equal(hasAnySecret(otherBody.profile.featuredAchievements), false, 'Non-owner showcase must strip legacy secret achievements');
+    assert.equal(
+      (otherBody.profile.featured_achievements || []).includes('secret_first_code'),
+      false,
+      'Non-owner featured_achievements slugs must not include secret achievements'
+    );
+    assert.ok(
+      (otherBody.profile.featuredAchievements || []).some((a: any) => a.slug === 'lyrics_reader'),
+      'Public pinned achievements must remain visible on non-owner showcase'
+    );
+
+    // Anonymous guest requesting bob's profile must also get ZERO secret achievements
+    const anonRes = await fetch(`${baseUrl}/api/profiles/bob`);
+    assert.equal(anonRes.status, 200);
+    const anonBody = (await anonRes.json()) as any;
+    assert.equal(hasAnySecret(anonBody.profile.achievements), false);
+    assert.equal(hasAnySecret(anonBody.profile.allAchievements), false);
+    assert.equal(hasAnySecret(anonBody.profile.featuredAchievements), false);
+    assert.equal((anonBody.profile.featured_achievements || []).includes('secret_first_code'), false);
+  });
 });
 

@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useI18n } from '../context/I18nContext.js';
 import { authFetch, useAuth } from '../context/AuthContext.js';
 import { ShopModal } from './ShopModal.js';
@@ -91,10 +91,11 @@ export const Navbar: React.FC<NavbarProps> = ({ currentTab, onSelectTab }) => {
   };
 
   const isAdminOrMod = user?.role_id === 'admin' || user?.role_id === 'moderator';
+  const closeShop = useCallback(() => setShopOpen(false), []);
 
   return (
     <>
-      <ShopModal isOpen={shopOpen} onClose={() => setShopOpen(false)} />
+      <ShopModal isOpen={shopOpen} onClose={closeShop} />
 
       <header className="sticky top-0 z-40 w-full bg-[#08080a]/92 backdrop-blur-md border-b border-white/[0.06] transition-colors">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-4">

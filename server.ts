@@ -532,6 +532,16 @@ function parseFeaturedAchievements(raw: unknown): string[] {
   return [];
 }
 
+function isSecretAchievementRow(
+  row: {
+    is_secret?: number | boolean | null;
+    category?: string | null;
+    difficulty_tier?: string | null;
+  } | null | undefined
+): boolean {
+  return Boolean(row?.is_secret) || row?.category === 'secret' || row?.difficulty_tier === 'secret';
+}
+
 function hydrateSessionUserRow(row: any) {
   if (!row) return null;
   const { password_changed_at, featured_achievements_json, ...safeRow } = row;
@@ -6822,7 +6832,7 @@ app.get('/api/profiles/:nickname', (req: Request, res: Response) => {
   }
 
   // Unlocked achievements
-  const unlockedRows = db.prepare(`
+  const rawUnlockedRows = db.prepare(`
     SELECT a.id, a.slug, a.title_ru, a.title_en, a.desc_ru, a.desc_en,
            a.condition_ru, a.condition_en, a.category, a.rarity, a.difficulty_tier, a.is_secret, a.xp_reward, a.icon, ua.unlocked_at
     FROM user_achievements ua
@@ -6831,9 +6841,18 @@ app.get('/api/profiles/:nickname', (req: Request, res: Response) => {
     ORDER BY ua.unlocked_at DESC
   `).all(profile.id) as any[];
 
+  const normalizedUnlockedRows = rawUnlockedRows.map((row) => ({
+    ...row,
+    is_secret: isSecretAchievementRow(row),
+  }));
+
   const unlockedMap = new Map<string, string>();
-  for (const row of unlockedRows) {
+  const publicUnlockedRows: any[] = [];
+  for (const row of normalizedUnlockedRows) {
     unlockedMap.set(row.slug, row.unlocked_at);
+    if (!row.is_secret) {
+      publicUnlockedRows.push(row);
+    }
   }
 
   const achMetrics = collectUserAchievementMetrics(profile.id);
@@ -6849,40 +6868,53 @@ app.get('/api/profiles/:nickname', (req: Request, res: Response) => {
       title_ru ASC
   `).all() as any[];
 
-  const allAchievements = allAchievementsCatalog.map((a) => {
-    const isUnlocked = unlockedMap.has(a.slug);
-    const isSecretLocked = Boolean(a.is_secret) && !isUnlocked;
-    const progress = achMetrics
-      ? getAchievementProgress(a.slug, achMetrics, isUnlocked)
-      : { current: isUnlocked ? 1 : 0, target: 1 };
-    const normalizedTier =
-      a.difficulty_tier === 'medium' || a.difficulty_tier === 'hard'
-        ? a.difficulty_tier
-        : 'easy';
+  const allAchievements = allAchievementsCatalog
+    .filter((a) => isOwnProfile || !isSecretAchievementRow(a))
+    .map((a) => {
+      const isSecret = isSecretAchievementRow(a);
+      const isUnlocked = unlockedMap.has(a.slug);
+      const isSecretLocked = isSecret && !isUnlocked;
+      const progress = achMetrics
+        ? getAchievementProgress(a.slug, achMetrics, isUnlocked)
+        : { current: isUnlocked ? 1 : 0, target: 1 };
+      const normalizedTier =
+        a.difficulty_tier === 'medium' || a.difficulty_tier === 'hard'
+          ? a.difficulty_tier
+          : 'easy';
 
-    return {
-      ...a,
-      is_secret: Boolean(a.is_secret),
-      difficulty_tier: normalizedTier,
-      xp_reward: Number(a.xp_reward || 0),
-      desc_ru: isSecretLocked ? '???' : a.desc_ru,
-      desc_en: isSecretLocked ? '???' : a.desc_en,
-      condition_ru: isSecretLocked ? '???' : a.condition_ru,
-      condition_en: isSecretLocked ? '???' : a.condition_en,
-      progress: isSecretLocked ? { current: 0, target: 1 } : progress,
-      is_unlocked: isUnlocked,
-      unlocked_at: unlockedMap.get(a.slug) || null,
-    };
-  });
+      return {
+        ...a,
+        is_secret: isSecret,
+        difficulty_tier: normalizedTier,
+        xp_reward: Number(a.xp_reward || 0),
+        desc_ru: isSecretLocked ? '???' : a.desc_ru,
+        desc_en: isSecretLocked ? '???' : a.desc_en,
+        condition_ru: isSecretLocked ? '???' : a.condition_ru,
+        condition_en: isSecretLocked ? '???' : a.condition_en,
+        progress: isSecretLocked ? { current: 0, target: 1 } : progress,
+        is_unlocked: isUnlocked,
+        unlocked_at: unlockedMap.get(a.slug) || null,
+      };
+    });
 
-  // Featured showcase achievements (verified to be unlocked by this user)
+  // Security: strictly strip secret achievements from non-owners & public showcase
+  const visibleUnlockedRows = isOwnProfile ? normalizedUnlockedRows : publicUnlockedRows;
+  const achBySlug = new Map<string, any>(allAchievements.map((a) => [a.slug, a]));
+
+  // Featured showcase achievements (secret achievements are ALWAYS hidden from non-owners)
   const savedFeatured = parseFeaturedAchievements(profile.featured_achievements_json);
-  const validFeaturedSlugs = savedFeatured.filter((slug) => unlockedMap.has(slug));
+  const validFeaturedSlugs = savedFeatured.filter((slug) => {
+    if (!unlockedMap.has(slug)) return false;
+    const item = achBySlug.get(slug);
+    if (!item) return false;
+    if (!isOwnProfile && isSecretAchievementRow(item)) return false;
+    return true;
+  });
   const featuredAchievements = validFeaturedSlugs.length > 0
     ? validFeaturedSlugs
-        .map((slug) => allAchievements.find((a) => a.slug === slug))
+        .map((slug) => achBySlug.get(slug))
         .filter(Boolean)
-    : unlockedRows.slice(0, 3);
+    : publicUnlockedRows.slice(0, 3);
 
   // User's recent creations and posts (omitted server-side if community section is hidden from non-owner)
   const recentCreations = hiddenSections.community
@@ -7010,7 +7042,7 @@ app.get('/api/profiles/:nickname', (req: Request, res: Response) => {
         : {}),
       ...safeCounts,
       isFollowing,
-      achievements: unlockedRows,
+      achievements: visibleUnlockedRows,
       allAchievements,
       featuredAchievements,
       featured_achievements: validFeaturedSlugs,
@@ -7172,20 +7204,41 @@ app.put('/api/profiles/me', requireAuth, async (req: AuthRequest, res: Response)
       res.status(400).json({ error: 'featured_achievements must be an array.' });
       return;
     }
-    // Verify user actually unlocked every selected showcase achievement
-    const unlockedSlugs = new Set(
+    const secretRows = db
+      .prepare('SELECT id, slug, is_secret, category, difficulty_tier FROM achievements')
+      .all() as Array<{ id: string; slug: string; is_secret?: number; category?: string; difficulty_tier?: string }>;
+    const secretIdentifiers = new Set<string>();
+    for (const row of secretRows) {
+      if (isSecretAchievementRow(row)) {
+        secretIdentifiers.add(row.slug);
+        secretIdentifiers.add(row.id);
+      }
+    }
+    const requestedHasSecret = featured_achievements.some(
+      (s) => typeof s === 'string' && secretIdentifiers.has(s.trim())
+    );
+    if (requestedHasSecret) {
+      res.status(400).json({ error: 'Секретные достижения нельзя добавлять в публичную витрину.' });
+      return;
+    }
+
+    // Verify user actually unlocked every selected public (non-secret) showcase achievement
+    const unlockedPublicSlugs = new Set(
       (
         db
           .prepare(`
-            SELECT a.slug FROM user_achievements ua
+            SELECT a.slug, a.is_secret, a.category, a.difficulty_tier
+            FROM user_achievements ua
             JOIN achievements a ON a.id = ua.achievement_id
             WHERE ua.user_id = ?
           `)
           .all(userId) as any[]
-      ).map((r) => r.slug)
+      )
+        .filter((r) => !isSecretAchievementRow(r))
+        .map((r) => r.slug)
     );
     const cleaned = featured_achievements
-      .filter((s) => typeof s === 'string' && unlockedSlugs.has(s))
+      .filter((s) => typeof s === 'string' && unlockedPublicSlugs.has(s))
       .slice(0, MAX_FEATURED_ACHIEVEMENTS);
     nextFeaturedJson = JSON.stringify(Array.from(new Set(cleaned)));
   }

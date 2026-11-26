@@ -298,43 +298,48 @@
   }
 }
 
+.aod-preview-isolate {
+  contain: layout paint;
+  isolation: isolate;
+}
+
 .aod-mist-layer-a {
-  will-change: transform, opacity;
+  backface-visibility: hidden;
   animation: aod-mist-drift-a 16s ease-in-out infinite;
 }
 
 .aod-mist-layer-b {
-  will-change: transform, opacity;
+  backface-visibility: hidden;
   animation: aod-mist-drift-b 22s ease-in-out infinite;
 }
 
 .aod-ember-mote {
-  will-change: transform, opacity;
+  backface-visibility: hidden;
   animation: aod-ember-rise 7.5s linear infinite;
 }
 
 .aod-ember-mote-alt {
-  will-change: transform, opacity;
+  backface-visibility: hidden;
   animation: aod-ember-rise-alt 9.2s linear infinite;
 }
 
 .aod-glitch-scanline {
-  will-change: transform, opacity;
+  backface-visibility: hidden;
   animation: aod-glitch-scan 4.8s linear infinite;
 }
 
 .aod-glitch-bar {
-  will-change: transform, opacity;
+  backface-visibility: hidden;
   animation: aod-glitch-slice 5.6s steps(1, end) infinite;
 }
 
 .aod-abyss-core {
-  will-change: transform, opacity;
+  backface-visibility: hidden;
   animation: aod-abyss-breathe 6.5s ease-in-out infinite;
 }
 
 .aod-abyss-ring {
-  will-change: transform, opacity;
+  backface-visibility: hidden;
   animation: aod-abyss-ring 9s ease-in-out infinite;
 }
 

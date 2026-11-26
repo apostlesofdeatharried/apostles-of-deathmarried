@@ -83,6 +83,12 @@ export const ShareCardModal: React.FC<ShareCardModalProps> = ({ isOpen, context,
   const [copiedLink, setCopiedLink] = useState(false);
   const shareAchTrackedRef = useRef<Set<string>>(new Set());
 
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  const contextRef = useRef(context);
+  contextRef.current = context;
+  const contextKey = context ? JSON.stringify(context) : '';
+
   const trackShareCardEvent = async () => {
     if (!user || !context) return;
     const targetKey =
@@ -110,7 +116,8 @@ export const ShareCardModal: React.FC<ShareCardModalProps> = ({ isOpen, context,
   };
 
   useEffect(() => {
-    if (!isOpen || !context) return;
+    const activeContext = contextRef.current;
+    if (!isOpen || !activeContext || !contextKey) return;
     let cancelled = false;
     let createdObjectUrl: string | null = null;
 
@@ -120,7 +127,7 @@ export const ShareCardModal: React.FC<ShareCardModalProps> = ({ isOpen, context,
     setPngBlob(null);
     setPreviewUrl(null);
 
-    renderShareCardToBlob(context, format)
+    renderShareCardToBlob(activeContext, format)
       .then((blob) => {
         if (cancelled) return;
         createdObjectUrl = URL.createObjectURL(blob);
@@ -149,7 +156,7 @@ export const ShareCardModal: React.FC<ShareCardModalProps> = ({ isOpen, context,
         } catch {}
       }
     };
-  }, [isOpen, context, format]);
+  }, [isOpen, contextKey, format]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -157,14 +164,14 @@ export const ShareCardModal: React.FC<ShareCardModalProps> = ({ isOpen, context,
     document.body.style.overflow = 'hidden';
 
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
+      if (e.key === 'Escape') onCloseRef.current();
     };
     window.addEventListener('keydown', onKeyDown);
     return () => {
       document.body.style.overflow = prevOverflow;
       window.removeEventListener('keydown', onKeyDown);
     };
-  }, [isOpen, onClose]);
+  }, [isOpen]);
 
   if (!isOpen || !context) return null;
 

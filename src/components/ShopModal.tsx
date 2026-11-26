@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useAuth, authFetch } from '../context/AuthContext.js';
 import { useI18n } from '../context/I18nContext.js';
 import { ShopItem, ShopCategory, ItemRarity } from '../types/index.js';
@@ -46,8 +46,15 @@ export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
   const [pinnedPreviews, setPinnedPreviews] = useState<PinnedPreviewMap>({});
   const [hoverPreviews, setHoverPreviews] = useState<HoverPreviewMap>({});
 
-  const loadItems = async () => {
-    setLoading(true);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  const itemsCountRef = useRef(0);
+  itemsCountRef.current = items.length;
+
+  const loadItems = useCallback(async (silent: boolean = false) => {
+    if (!silent && itemsCountRef.current === 0) {
+      setLoading(true);
+    }
     try {
       const res = await authFetch('/api/shop/items', { cache: 'no-store' });
       const data = await safeJson<{ items?: ShopItem[] }>(res, { items: [] });
@@ -59,37 +66,51 @@ export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
-    if (isOpen) {
-      loadItems();
-      setErrorMsg(null);
-      setSuccessMsg(null);
-      setPinnedPreviews({});
-      setHoverPreviews({});
-      const onKeyDown = (e: KeyboardEvent) => {
-        if (e.key === 'Escape') onClose();
-      };
-      window.addEventListener('keydown', onKeyDown);
-      return () => window.removeEventListener('keydown', onKeyDown);
+    if (!isOpen) return;
+    loadItems(itemsCountRef.current > 0);
+    setErrorMsg(null);
+    setSuccessMsg(null);
+    setPinnedPreviews({});
+    setHoverPreviews({});
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onCloseRef.current();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isOpen, loadItems]);
+
+  const filteredItems = useMemo(
+    () =>
+      items.filter((it) => {
+        if (it.category !== activeCategory) return false;
+        if (rarityFilter !== 'all' && it.rarity !== rarityFilter) return false;
+        if (ownershipFilter === 'owned' && !it.is_owned) return false;
+        if (ownershipFilter === 'available' && it.is_owned) return false;
+        return true;
+      }),
+    [items, activeCategory, rarityFilter, ownershipFilter]
+  );
+
+  const ownedCount = useMemo(() => items.filter((it) => it.is_owned).length, [items]);
+  const categoryCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const it of items) {
+      counts[it.category] = (counts[it.category] || 0) + 1;
     }
-  }, [isOpen, onClose]);
+    return counts;
+  }, [items]);
+  const pinnedList = useMemo(
+    () =>
+      Object.entries(pinnedPreviews).filter(([, v]) => Boolean(v)) as Array<
+        [ShopCategory, { id: string; value: string; name: string }]
+      >,
+    [pinnedPreviews]
+  );
 
   if (!isOpen) return null;
-
-  const filteredItems = items.filter((it) => {
-    if (it.category !== activeCategory) return false;
-    if (rarityFilter !== 'all' && it.rarity !== rarityFilter) return false;
-    if (ownershipFilter === 'owned' && !it.is_owned) return false;
-    if (ownershipFilter === 'available' && it.is_owned) return false;
-    return true;
-  });
-
-  const ownedCount = items.filter((it) => it.is_owned).length;
-  const pinnedList = Object.entries(pinnedPreviews).filter(([, v]) => Boolean(v)) as Array<
-    [ShopCategory, { id: string; value: string; name: string }]
-  >;
 
   const handleTogglePinPreview = (item: ShopItem) => {
     const label = lang === 'ru' ? item.name_ru : item.name_en;
@@ -134,8 +155,7 @@ export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
             ? `Предмет «${item.name_ru}» добавлен в вашу коллекцию!`
             : `«${item.name_en}» added to your collection!`
         );
-        await refresh();
-        await loadItems();
+        await Promise.all([refresh(), loadItems(true)]);
       }
     } catch (e: any) {
       setErrorMsg(e.message || 'Error occurred');
@@ -177,8 +197,7 @@ export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
           delete next[item.category];
           return next;
         });
-        await refresh();
-        await loadItems();
+        await Promise.all([refresh(), loadItems(true)]);
       }
     } catch (e: any) {
       setErrorMsg(e.message || 'Error occurred');
@@ -203,7 +222,7 @@ export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
 
   return (
     <div
-      className="fixed inset-0 z-[110] flex items-center justify-center p-2.5 sm:p-4 bg-black/82 backdrop-blur-md animate-fadeIn"
+      className="fixed inset-0 z-[110] flex items-center justify-center p-2.5 sm:p-4 bg-black/88"
       role="dialog"
       aria-modal="true"
       aria-label={t('shopTitle')}
@@ -279,8 +298,8 @@ export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
 
         <div className="flex-1 overflow-y-auto p-5 sm:p-6 space-y-5">
           {/* Interactive Live 7-Layer Profile Card Preview */}
-          <div className={`rounded-xl overflow-hidden border transition-all duration-300 ${themeStyle.cardClass}`}>
-            <div className="h-24 sm:h-28 w-full relative overflow-hidden bg-[#0c0b0e]">
+          <div className={`rounded-xl overflow-hidden border transition-colors duration-200 ${themeStyle.cardClass}`}>
+            <div className="aod-preview-isolate h-24 sm:h-28 w-full relative overflow-hidden bg-[#0c0b0e]">
               {renderProfileBanner(activeBanner)}
               {renderProfileEffectOverlay(activeEffect)}
 
@@ -364,7 +383,7 @@ export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
           {/* 7 Category Tabs */}
           <div className="flex flex-wrap items-center gap-1.5 border-b border-white/[0.08] pb-3 font-mono text-[11px]">
             {SHOP_CATEGORIES.map((cat) => {
-              const catCount = items.filter((it) => it.category === cat).length;
+              const catCount = categoryCounts[cat] || 0;
               return (
                 <button
                   type="button"
@@ -460,25 +479,27 @@ export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
                   <div
                     key={item.id}
                     onMouseEnter={() =>
-                      setHoverPreviews((prev) => ({
-                        ...prev,
-                        [item.category]: item.preview_value,
-                      }))
+                      setHoverPreviews((prev) =>
+                        prev[item.category] === item.preview_value
+                          ? prev
+                          : { ...prev, [item.category]: item.preview_value }
+                      )
                     }
                     onMouseLeave={() =>
                       setHoverPreviews((prev) => {
+                        if (prev[item.category] !== item.preview_value) return prev;
                         const next = { ...prev };
                         delete next[item.category];
                         return next;
                       })
                     }
-                    className={`p-4 rounded-xl bg-[#111015] border transition-all duration-200 flex flex-col justify-between ${
+                    className={`p-4 rounded-xl bg-[#111015] border transition-colors duration-150 flex flex-col justify-between ${
                       isPinned
                         ? 'border-[#d49a6a]/75 bg-[#16141b] shadow-[0_0_20px_rgba(212,154,106,0.14)]'
                         : item.is_equipped
                           ? 'border-[#c5c8cf]/45 shadow-[0_0_16px_rgba(197,200,207,0.1)]'
                           : isHovered
-                            ? 'border-white/28 bg-[#15141b] -translate-y-0.5'
+                            ? 'border-white/30 bg-[#15141b]'
                             : `${rarityMeta.borderClass} hover:border-white/25`
                     }`}
                   >
@@ -521,7 +542,7 @@ export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
                       )}
 
                       {item.category === 'banner' && (
-                        <div className="relative h-14 w-full rounded-lg overflow-hidden border border-white/10 bg-[#0b0a0e]">
+                        <div className="aod-preview-isolate relative h-14 w-full rounded-lg overflow-hidden border border-white/10 bg-[#0b0a0e]">
                           {renderProfileBanner(item.preview_value, true)}
                         </div>
                       )}
@@ -574,7 +595,7 @@ export const ShopModal: React.FC<ShopModalProps> = ({ isOpen, onClose }) => {
                       })()}
 
                       {item.category === 'effect' && (
-                        <div className="relative h-12 w-full rounded-lg overflow-hidden bg-gradient-to-r from-[#0e0d12] via-[#1a1722] to-[#0c0b0e] border border-white/[0.08]">
+                        <div className="aod-preview-isolate relative h-12 w-full rounded-lg overflow-hidden bg-gradient-to-r from-[#0e0d12] via-[#1a1722] to-[#0c0b0e] border border-white/[0.08]">
                           {renderProfileEffectOverlay(item.preview_value)}
                         </div>
                       )}

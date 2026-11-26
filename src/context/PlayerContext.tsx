@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useRef, useEffect, useCallback } from 'react';
+import React, { createContext, useContext, useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { Track } from '../types/index.js';
 import { authFetch, getStoredToken } from './AuthContext.js';
 import { dispatchAchievementUnlocked } from '../components/AchievementToast.js';
@@ -227,7 +227,7 @@ export const PlayerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       });
   }, [isMuted, volume]);
 
-  const togglePlay = () => {
+  const togglePlay = useCallback(() => {
     if (!audioRef.current || !currentTrack) return;
     if (isPlaying) {
       audioRef.current.pause();
@@ -245,7 +245,7 @@ export const PlayerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
           setPlaybackError('Audio file unavailable or failed to load');
         });
     }
-  };
+  }, [currentTrack, isPlaying]);
 
   const nextTrack = useCallback(() => {
     if (queue.length === 0 || !currentTrack) return;
@@ -299,15 +299,15 @@ export const PlayerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     }
   }, [queue, currentTrack, playTrack]);
 
-  const seek = (seconds: number) => {
+  const seek = useCallback((seconds: number) => {
     if (!audioRef.current || !Number.isFinite(seconds)) return;
     const maxDur = Number.isFinite(audioRef.current.duration) ? audioRef.current.duration : duration;
     const clamped = Math.max(0, Math.min(seconds, maxDur || seconds));
     audioRef.current.currentTime = clamped;
     setProgress(clamped);
-  };
+  }, [duration]);
 
-  const setVolume = (val: number) => {
+  const setVolume = useCallback((val: number) => {
     const clamped = Math.max(0, Math.min(1, Number.isFinite(val) ? val : 0.8));
     setVolumeState(clamped);
     if (audioRef.current) {
@@ -316,9 +316,9 @@ export const PlayerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     if (clamped > 0 && isMuted) {
       setIsMuted(false);
     }
-  };
+  }, [isMuted]);
 
-  const toggleMute = () => {
+  const toggleMute = useCallback(() => {
     if (!audioRef.current) return;
     if (isMuted) {
       setIsMuted(false);
@@ -327,25 +327,25 @@ export const PlayerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       setIsMuted(true);
       audioRef.current.volume = 0;
     }
-  };
+  }, [isMuted, volume]);
 
-  const toggleShuffle = () => setShuffle((prev) => !prev);
+  const toggleShuffle = useCallback(() => setShuffle((prev) => !prev), []);
 
-  const toggleRepeat = () => {
+  const toggleRepeat = useCallback(() => {
     setRepeatMode((prev) => {
       if (prev === 'none') return 'all';
       if (prev === 'all') return 'one';
       return 'none';
     });
-  };
+  }, []);
 
-  const removeFromQueue = (index: number) => {
+  const removeFromQueue = useCallback((index: number) => {
     setQueue((prev) => prev.filter((_, i) => i !== index));
-  };
+  }, []);
 
-  const clearPlaybackError = () => setPlaybackError(null);
+  const clearPlaybackError = useCallback(() => setPlaybackError(null), []);
 
-  const hidePlayer = () => {
+  const hidePlayer = useCallback(() => {
     if (audioRef.current) {
       audioRef.current.pause();
     }
@@ -353,39 +353,68 @@ export const PlayerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     setIsLoadingAudio(false);
     setPlaybackError(null);
     setIsVisible(false);
-  };
+  }, []);
+
+  const contextValue = useMemo(
+    () => ({
+      currentTrack,
+      isPlaying,
+      isVisible,
+      isLoadingAudio,
+      playbackError,
+      progress,
+      duration,
+      volume,
+      isMuted,
+      shuffle,
+      repeatMode,
+      queue,
+      queueOpen,
+      playTrack,
+      togglePlay,
+      nextTrack,
+      prevTrack,
+      seek,
+      setVolume,
+      toggleMute,
+      toggleShuffle,
+      toggleRepeat,
+      setQueueOpen,
+      removeFromQueue,
+      clearPlaybackError,
+      hidePlayer,
+    }),
+    [
+      currentTrack,
+      isPlaying,
+      isVisible,
+      isLoadingAudio,
+      playbackError,
+      progress,
+      duration,
+      volume,
+      isMuted,
+      shuffle,
+      repeatMode,
+      queue,
+      queueOpen,
+      playTrack,
+      togglePlay,
+      nextTrack,
+      prevTrack,
+      seek,
+      setVolume,
+      toggleMute,
+      toggleShuffle,
+      toggleRepeat,
+      removeFromQueue,
+      clearPlaybackError,
+      hidePlayer,
+    ]
+  );
 
   return (
-    <PlayerContext.Provider
-      value={{
-        currentTrack,
-        isPlaying,
-        isVisible,
-        isLoadingAudio,
-        playbackError,
-        progress,
-        duration,
-        volume,
-        isMuted,
-        shuffle,
-        repeatMode,
-        queue,
-        queueOpen,
-        playTrack,
-        togglePlay,
-        nextTrack,
-        prevTrack,
-        seek,
-        setVolume,
-        toggleMute,
-        toggleShuffle,
-        toggleRepeat,
-        setQueueOpen,
-        removeFromQueue,
-        clearPlaybackError,
-        hidePlayer,
-      }}
-    >
+    <PlayerContext.Provider value={contextValue}>
       {children}
     </PlayerContext.Provider>
   );

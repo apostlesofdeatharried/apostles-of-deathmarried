@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, useMemo } from 'react';
 import { UserProfile } from '../types/index.js';
 import { safeJson } from '../utils/logic.js';
 
@@ -114,7 +114,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return () => window.removeEventListener('aod:achievement-unlocked', handleAchievementUnlock);
   }, [refresh]);
 
-  const saveSession = (authToken?: string, userData?: UserProfile) => {
+  const saveSession = useCallback((authToken?: string, userData?: UserProfile) => {
     if (authToken) {
       setToken(authToken);
       setStoredToken(authToken);
@@ -122,9 +122,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     if (userData) {
       setUser(userData);
     }
-  };
+  }, []);
 
-  const login = async (loginInput: string, password: string) => {
+  const login = useCallback(async (loginInput: string, password: string) => {
     try {
       const res = await fetch('/api/auth/login', {
         method: 'POST',
@@ -142,9 +142,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     } catch (e: any) {
       return { success: false, error: e.message || 'Ошибка соединения.' };
     }
-  };
+  }, [saveSession]);
 
-  const register = async (payload: RegisterPayload) => {
+  const register = useCallback(async (payload: RegisterPayload) => {
     try {
       const res = await fetch('/api/auth/register', {
         method: 'POST',
@@ -162,9 +162,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     } catch (e: any) {
       return { success: false, error: e.message || 'Ошибка соединения.' };
     }
-  };
+  }, [saveSession]);
 
-  const bindAdmin = async () => {
+  const bindAdmin = useCallback(async () => {
     try {
       const res = await authFetch('/api/auth/bind-admin', { method: 'POST' });
       const data = await safeJson(res, { error: 'Invalid response from server' });
@@ -176,41 +176,44 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     } catch (e: any) {
       return { success: false, error: e.message || 'Connection error' };
     }
-  };
+  }, []);
 
-  const logout = async () => {
+  const logout = useCallback(async () => {
     try {
       await authFetch('/api/auth/logout', { method: 'POST' });
     } catch {}
     setStoredToken('');
     setToken(null);
     setUser(null);
-  };
+  }, []);
 
-  const openAuth = (mode: 'login' | 'register' = 'login') => {
+  const openAuth = useCallback((mode: 'login' | 'register' = 'login') => {
     setAuthMode(mode);
     setAuthModalOpen(true);
-  };
+  }, []);
 
-  const closeAuth = () => setAuthModalOpen(false);
+  const closeAuth = useCallback(() => setAuthModalOpen(false), []);
+
+  const contextValue = useMemo(
+    () => ({
+      user,
+      loading,
+      token,
+      login,
+      register,
+      bindAdmin,
+      logout,
+      refresh,
+      authModalOpen,
+      authMode,
+      openAuth,
+      closeAuth,
+    }),
+    [user, loading, token, login, register, bindAdmin, logout, refresh, authModalOpen, authMode, openAuth, closeAuth]
+  );
 
   return (
-    <AuthContext.Provider
-      value={{
-        user,
-        loading,
-        token,
-        login,
-        register,
-        bindAdmin,
-        logout,
-        refresh,
-        authModalOpen,
-        authMode,
-        openAuth,
-        closeAuth,
-      }}
-    >
+    <AuthContext.Provider value={contextValue}>
       {children}
     </AuthContext.Provider>
   );

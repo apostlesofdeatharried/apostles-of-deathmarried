@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 
 export type Language = 'ru' | 'en';
 
@@ -316,20 +316,22 @@ export const I18nProvider: React.FC<{ children: React.ReactNode }> = ({ children
     document.documentElement.lang = lang;
   }, [lang]);
 
-  const setLang = (newLang: Language) => {
+  const setLang = useCallback((newLang: Language) => {
     setLangState(newLang);
     try {
       localStorage.setItem('apostle_lang', newLang);
     } catch {}
-  };
+  }, []);
 
-  const t = (key: string): string => {
+  const t = useCallback((key: string): string => {
     const entry = dictionary[key];
     if (!entry) return key;
     return entry[lang] || entry.ru || key;
-  };
+  }, [lang]);
 
-  return <I18nContext.Provider value={{ lang, setLang, t }}>{children}</I18nContext.Provider>;
+  const contextValue = useMemo(() => ({ lang, setLang, t }), [lang, setLang, t]);
+
+  return <I18nContext.Provider value={contextValue}>{children}</I18nContext.Provider>;
 };
 
 export const useI18n = () => useContext(I18nContext);

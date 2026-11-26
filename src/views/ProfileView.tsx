@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useI18n } from '../context/I18nContext.js';
 import { useAuth, authFetch, setStoredToken } from '../context/AuthContext.js';
 import { ShopModal } from '../components/ShopModal.js';
@@ -149,17 +149,26 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
   const [shareModalOpen, setShareModalOpen] = useState(false);
 
   const avatarInputRef = useRef<HTMLInputElement | null>(null);
+  const loadedNicknameRef = useRef<string | undefined>(undefined);
+  const profileRef = useRef<any>(null);
+  profileRef.current = profile;
 
   const lookupNickname = targetNickname || user?.nickname;
   const isOwnProfile = Boolean(user && profile && user.id === profile.id);
 
-  const fetchProfile = useCallback(async () => {
+  const fetchProfile = useCallback(async (options?: { silent?: boolean }) => {
     if (!lookupNickname) {
+      loadedNicknameRef.current = undefined;
       setLoading(false);
       setProfile(null);
       return;
     }
-    setLoading(true);
+    const isSameProfile =
+      loadedNicknameRef.current?.toLowerCase() === lookupNickname.toLowerCase() &&
+      Boolean(profileRef.current);
+    if (!options?.silent && !isSameProfile) {
+      setLoading(true);
+    }
     setError(null);
     try {
       const res = await authFetch(`/api/profiles/${encodeURIComponent(lookupNickname)}`, {
@@ -171,6 +180,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
         setError(data.error || (lang === 'ru' ? 'Профиль не найден.' : 'Profile not found.'));
       } else {
         const p = data.profile;
+        loadedNicknameRef.current = lookupNickname;
         setProfile(p);
         setEditDisplayName(p.display_name || p.nickname || '');
         setEditUsername(p.nickname || '');
@@ -199,7 +209,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
   useEffect(() => {
     const handleAchUnlocked = () => {
       if (user?.id && (!targetNickname || (profile?.id && user.id === profile.id))) {
-        fetchProfile();
+        fetchProfile({ silent: true });
       }
     };
     window.addEventListener('aod:achievement-unlocked', handleAchUnlocked);
@@ -285,7 +295,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
         if (data.newly_unlocked_achievements?.length) {
           dispatchAchievementUnlocked(data.newly_unlocked_achievements);
         }
-        await fetchProfile();
+        await fetchProfile({ silent: true });
         refresh();
       }
     } finally {
@@ -303,9 +313,18 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
 
   const handleToggleFeaturedAchievement = async (slug: string) => {
     if (!isOwnProfile || !profile || pinSaving) return;
+    const allList: any[] = Array.isArray(profile.allAchievements) ? profile.allAchievements : [];
+    const secretSlugs = new Set(
+      allList
+        .filter((a) => Boolean(a.is_secret) || a.difficulty_tier === 'secret' || a.category === 'secret')
+        .map((a) => a.slug)
+    );
     const current: string[] = Array.isArray(profile.featured_achievements) ? profile.featured_achievements : [];
     const exists = current.includes(slug);
-    const next = exists ? current.filter((s) => s !== slug) : [...current, slug].slice(-3);
+    if (!exists && secretSlugs.has(slug)) return;
+
+    const cleanCurrent = current.filter((s) => !secretSlugs.has(s));
+    const next = exists ? cleanCurrent.filter((s) => s !== slug) : [...cleanCurrent, slug].slice(-3);
 
     setPinSaving(slug);
     try {
@@ -315,7 +334,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
         body: JSON.stringify({ featured_achievements: next }),
       });
       if (res.ok) {
-        await fetchProfile();
+        await fetchProfile({ silent: true });
       }
     } finally {
       setPinSaving(null);
@@ -349,7 +368,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
           dispatchAchievementUnlocked(data.newly_unlocked_achievements);
         }
         await refresh();
-        await fetchProfile();
+        await fetchProfile({ silent: true });
       }
     } catch (err: any) {
       setPromoError(err?.message || 'Error');
@@ -373,7 +392,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
           dispatchAchievementUnlocked(data.newly_unlocked_achievements);
         }
         await refresh();
-        await fetchProfile();
+        await fetchProfile({ silent: true });
       }
     } finally {
       setEquipLoadingId(null);
@@ -446,7 +465,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
         if (data.nickname && data.nickname !== profile.nickname) {
           window.dispatchEvent(new CustomEvent('navigate-profile', { detail: data.nickname }));
         } else {
-          await fetchProfile();
+          await fetchProfile({ silent: true });
         }
       }
     } catch (err: any) {
@@ -474,7 +493,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
           type: 'ok',
           text: lang === 'ru' ? 'Настройки приватности сохранены.' : 'Privacy settings saved.',
         });
-        await fetchProfile();
+        await fetchProfile({ silent: true });
       }
     } catch (err: any) {
       setPrivacyMsg({ type: 'err', text: err?.message || 'Connection error' });
@@ -576,7 +595,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
         setVerifyToken(null);
         setVerifyMsg({ type: 'ok', text: lang === 'ru' ? 'Почта успешно подтверждена.' : 'Email verified.' });
         await refresh();
-        await fetchProfile();
+        await fetchProfile({ silent: true });
       }
     } catch {
       setVerifyMsg({
@@ -587,6 +606,48 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
       setVerifyConfirming(false);
     }
   };
+
+  const closeShop = useCallback(() => {
+    setIsShopOpen(false);
+    refresh().catch(() => {});
+    fetchProfile({ silent: true });
+  }, [refresh, fetchProfile]);
+
+  const closeShareModal = useCallback(() => {
+    setShareModalOpen(false);
+  }, []);
+
+  const profileShareLevel = calculateLevelFromXp(Number(profile?.total_xp || 0)).level;
+  const profileShareHiddenStreak = Boolean(profile?.hidden_sections?.streak);
+  const profileShareStreakDays =
+    !profileShareHiddenStreak && typeof profile?.daily_streak === 'number' ? profile.daily_streak : 0;
+
+  const shareCardContext = useMemo(() => {
+    if (!profile) return null;
+    return {
+      type: 'profile' as const,
+      displayName: profile.display_name || profile.nickname,
+      nickname: profile.nickname,
+      avatarUrl: profile.avatar_url || DEFAULT_AVATAR,
+      shieldTitle: getEquippedTitleLabel(profile.equipped_title, 'ru'),
+      level: profileShareLevel,
+      totalXp: Number(profile.total_xp || 0),
+      streakDays: profileShareStreakDays,
+      favoriteTrack: profile.favorite_track || null,
+      bannerKey: profile.equipped_banner || null,
+      shareUrl: `${window.location.origin}/profile/${encodeURIComponent(profile.nickname)}`,
+    };
+  }, [
+    profile?.display_name,
+    profile?.nickname,
+    profile?.avatar_url,
+    profile?.equipped_title,
+    profileShareLevel,
+    profile?.total_xp,
+    profileShareStreakDays,
+    profile?.favorite_track,
+    profile?.equipped_banner,
+  ]);
 
   // Guest / Not logged in viewing own /profile
   if (!lookupNickname) {
@@ -737,30 +798,14 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
       {isOwnProfile && (
         <ShopModal
           isOpen={isShopOpen}
-          onClose={() => {
-            setIsShopOpen(false);
-            refresh().catch(() => {});
-            fetchProfile();
-          }}
+          onClose={closeShop}
         />
       )}
 
       <ShareCardModal
         isOpen={shareModalOpen}
-        context={{
-          type: 'profile',
-          displayName: profile.display_name || profile.nickname,
-          nickname: profile.nickname,
-          avatarUrl: profile.avatar_url || DEFAULT_AVATAR,
-          shieldTitle: getEquippedTitleLabel(profile.equipped_title, 'ru'),
-          level: levelInfo.level,
-          totalXp: Number(profile.total_xp || 0),
-          streakDays: hidden.streak ? 0 : streakDays,
-          favoriteTrack: profile.favorite_track || null,
-          bannerKey: profile.equipped_banner || null,
-          shareUrl: `${window.location.origin}/profile/${encodeURIComponent(profile.nickname)}`,
-        }}
-        onClose={() => setShareModalOpen(false)}
+        context={shareCardContext}
+        onClose={closeShareModal}
       />
 
       {/* COMPACT PROFILE HERO CARD */}
@@ -770,7 +815,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
         }`}
       >
         {/* Banner */}
-        <div className="relative h-28 sm:h-36 w-full overflow-hidden border-b border-white/[0.07]">
+        <div className="aod-preview-isolate relative h-28 sm:h-36 w-full overflow-hidden border-b border-white/[0.07]">
           {renderProfileBanner(profile.equipped_banner)}
           {renderProfileEffectOverlay(profile.equipped_effect)}
           <div className="absolute inset-0 bg-gradient-to-t from-[#0e0d12] via-[#0e0d12]/35 to-transparent" />
@@ -1280,25 +1325,42 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ targetNickname }) => {
                     <span className="font-mono text-[10px] text-[#6e675e]">
                       {ach.unlocked_at ? new Date(ach.unlocked_at).toLocaleDateString('ru-RU') : ''}
                     </span>
-                    <button
-                      type="button"
-                      disabled={pinSaving === ach.slug}
-                      onClick={() => handleToggleFeaturedAchievement(ach.slug)}
-                      className={`inline-flex items-center gap-1 font-mono text-[10px] px-2 py-0.5 rounded border transition-colors cursor-pointer ${
-                        isPinned
-                          ? 'border-[#d4af68]/45 bg-[#241d11] text-[#f0d599]'
-                          : 'border-white/[0.09] text-[#8e877e] hover:text-white'
-                      }`}
-                    >
-                      <Pin className="w-2.5 h-2.5" />
-                      {isPinned
-                        ? lang === 'ru'
-                          ? 'В витрине'
-                          : 'Pinned'
-                        : lang === 'ru'
-                          ? 'На витрину'
-                          : 'Pin'}
-                    </button>
+                    {!isSecret ? (
+                      <button
+                        type="button"
+                        disabled={pinSaving === ach.slug}
+                        onClick={() => handleToggleFeaturedAchievement(ach.slug)}
+                        className={`inline-flex items-center gap-1 font-mono text-[10px] px-2 py-0.5 rounded border transition-colors cursor-pointer ${
+                          isPinned
+                            ? 'border-[#d4af68]/45 bg-[#241d11] text-[#f0d599]'
+                            : 'border-white/[0.09] text-[#8e877e] hover:text-white'
+                        }`}
+                      >
+                        <Pin className="w-2.5 h-2.5" />
+                        {isPinned
+                          ? lang === 'ru'
+                            ? 'В витрине'
+                            : 'Pinned'
+                          : lang === 'ru'
+                            ? 'На витрину'
+                            : 'Pin'}
+                      </button>
+                    ) : isPinned ? (
+                      <button
+                        type="button"
+                        disabled={pinSaving === ach.slug}
+                        onClick={() => handleToggleFeaturedAchievement(ach.slug)}
+                        className="inline-flex items-center gap-1 font-mono text-[10px] px-2 py-0.5 rounded border border-[#9c5de0]/40 bg-[#1c1329] text-[#d0b4fa] hover:text-white transition-colors cursor-pointer"
+                      >
+                        <Pin className="w-2.5 h-2.5" />
+                        {lang === 'ru' ? 'Скрыть с витрины' : 'Remove from showcase'}
+                      </button>
+                    ) : (
+                      <span className="inline-flex items-center gap-1 font-mono text-[10px] text-[#a78bd6]/80">
+                        <Lock className="w-2.5 h-2.5" />
+                        {lang === 'ru' ? 'Только в личном профиле' : 'Private · not on showcase'}
+                      </span>
+                    )}
                   </div>
                 )}
               </div>

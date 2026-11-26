@@ -1853,13 +1853,16 @@ export const GamesView: React.FC = () => {
     );
   };
 
+  const closeShop = useCallback(() => setIsShopOpen(false), []);
+  const closeShareModal = useCallback(() => setShareContext(null), []);
+
   return (
     <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-10 space-y-8 animate-fadeIn">
-      <ShopModal isOpen={isShopOpen} onClose={() => setIsShopOpen(false)} />
+      <ShopModal isOpen={isShopOpen} onClose={closeShop} />
       <ShareCardModal
         isOpen={shareContext !== null}
         context={shareContext}
-        onClose={() => setShareContext(null)}
+        onClose={closeShareModal}
       />
 
       {/* Header */}
